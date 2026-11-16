@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -48,17 +49,23 @@ func TestRenderNft(t *testing.T) {
 }
 
 func TestRenderGatewayNft(t *testing.T) {
-	got, err := renderGatewayNft([]string{"ens34"}, "ens33", 80)
+	got, err := renderGatewayNft([]string{"ens34"}, "ens33")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(got, `iifname { "ens34" } oifname "ens33" masquerade`) {
 		t.Errorf("unexpected NAT rule:\n%s", got)
 	}
-	if !strings.Contains(got, `iifname "ens33" tcp dport 80 drop`) {
-		t.Errorf("the panel must be closed on the WAN:\n%s", got)
+	wan, err := renderWANNft("ens33", 80)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := renderGatewayNft([]string{"ens34"}, `a" b`, 80); err == nil {
+	for _, rule := range []string{`add table inet atom_wan`, `iifname "ens33" tcp dport { 53, 80 } drop`, `iifname "ens33" udp dport 53 drop`, `tcp dport @tcp_proxy_ports drop`, `udp dport @udp_proxy_ports drop`} {
+		if !strings.Contains(wan, rule) {
+			t.Errorf("missing WAN rule %q in:\n%s", rule, wan)
+		}
+	}
+	if _, err := renderGatewayNft([]string{"ens34"}, `a" b`); err == nil {
 		t.Error("a bad WAN name must be refused")
 	}
 }
@@ -425,6 +432,16 @@ func TestRefreshData(t *testing.T) {
 	write(pkg, "rule/atom_catalog.json", "new-catalog")
 	write(pkg, "rule/geosite_cn.txt", "shipped-geosite")
 	write(pkg, "webinfo/audit_settings.json", "shipped-audit")
+	upstreamFiles := []string{
+		"sub_config/forward_local.yaml",
+		"sub_config/forward_nocn.yaml",
+		"sub_config/forward_nocn_ecs.yaml",
+	}
+	for _, rel := range upstreamFiles {
+		write(pkg, rel, "default "+rel)
+	}
+	const settings = "webinfo/settings.json"
+	write(pkg, settings, `{"upstreams":{}}`)
 	write(pkg, "README.md", "doc")
 	write(pkg, "cache/.gitkeep", "")
 
@@ -440,8 +457,17 @@ func TestRefreshData(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(data, "cache")); err != nil {
 		t.Error("empty directories are created")
 	}
+	for _, rel := range upstreamFiles {
+		if got := read(data, rel); got != "default "+rel {
+			t.Errorf("fresh install of %s: %q", rel, got)
+		}
+		write(data, rel, "custom "+rel)
+		write(pkg, rel, "new default "+rel)
+	}
 
 	// the user changed things, a daily update replaced a list; then the package is applied again
+	const userSettings = `{"upstreams":{"domestic":[{"tag":"lan","addr":"udp://192.168.1.53"}]}}`
+	write(data, settings, userSettings)
 	write(data, "webinfo/audit_settings.json", "user-audit")
 	write(data, "webinfo/atom_rules.json", "user-rules")
 	write(data, "rule/geosite_cn.txt", "updated-geosite")
@@ -457,9 +483,15 @@ func TestRefreshData(t *testing.T) {
 		"sub_config/a.yaml": "newer-a", "rule/atom_catalog.json": "newer-catalog", // product files: replaced
 		"webinfo/audit_settings.json": "user-audit", "webinfo/atom_rules.json": "user-rules", "rule/geosite_cn.txt": "updated-geosite", // data: kept
 		"rule/new_list.txt": "brand-new", // new data files arrive
+		settings:            userSettings,
 	} {
 		if got := read(data, rel); got != want {
 			t.Errorf("%s: %q, want %q", rel, got, want)
+		}
+	}
+	for _, rel := range upstreamFiles {
+		if got := read(data, rel); got != "custom "+rel {
+			t.Errorf("upgrade overwrote %s: %q", rel, got)
 		}
 	}
 	if got := read(data, "config_custom.yaml"); !strings.Contains(got, "0.0.0.0:8080") {
@@ -543,30 +575,156 @@ func TestStateAndChangesRoundTrip(t *testing.T) {
 	if err != nil || got.Version != "0.1.0" || !got.Complete || got.WAN != "b" {
 		t.Errorf("%+v %v", got, err)
 	}
-	ch := loadChanges(p)
-	ch.IPForwardBefore = "0"
+	ch := &Changes{IPForwardBefore: "0"}
 	if err := saveChanges(p, ch); err != nil {
 		t.Fatal(err)
 	}
-	if loadChanges(p).IPForwardBefore != "0" {
+	if ch, err := loadChanges(p); err != nil || ch.IPForwardBefore != "0" {
 		t.Error("changes not kept")
 	}
 }
 
 func TestPruneBackups(t *testing.T) {
 	dir := t.TempDir()
-	for _, n := range []string{"0.1.0-1", "0.1.0-2", "0.1.0-3", "0.1.0-4", "0.1.0-5"} {
-		os.MkdirAll(filepath.Join(dir, n), 0o755)
+	for _, name := range []string{"0.1.9-20261115-100000", "0.1.10-20261115-120000", "reconfigure-20261115-110000", "reconfigure-20261115-130000.000000001", "mine"} {
+		if err := os.Mkdir(filepath.Join(dir, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	pruneBackups(dir, 3)
-	e, _ := os.ReadDir(dir)
-	if len(e) != 3 || e[0].Name() != "0.1.0-3" {
-		t.Errorf("%v", e)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	want := []string{"0.1.10-20261115-120000", "mine", "reconfigure-20261115-110000", "reconfigure-20261115-130000.000000001"}
+	if !slices.Equal(names, want) {
+		t.Errorf("remaining backups %v, want %v", names, want)
+	}
+}
+
+func TestWANProtectionTracksMixedPortChanges(t *testing.T) {
+	p := Paths{Root: t.TempDir()}
+	nft := p.Bin("nft")
+	batchFile := p.Run("batch")
+	t.Setenv("ATOM_TEST_NFT_BATCH", batchFile)
+	if err := os.MkdirAll(p.Run(""), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomic(nft, []byte("#!/bin/sh\ncat > \"$ATOM_TEST_NFT_BATCH\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(p.State(), InstallState{Topology: "gateway", NftBin: nft}); err != nil {
+		t.Fatal(err)
+	}
+	rules, err := renderWANNft("wan0", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomic(p.Etc("atom-wan.nft"), []byte(rules), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, starting := range []bool{true, false} {
+		port := 7890
+		if !starting {
+			port = 9876
+		}
+		path := filepath.Join(p.Data(), "sing-box", "config.json")
+		config := fmt.Sprintf(`{"inbounds":[{"type":"mixed","listen_port":%d},{"type":"redirect","listen_port":7892},{"type":"tproxy","listen_port":7893}]}`, port)
+		if err := writeFileAtomic(path, []byte(config), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := protectWAN(p, starting); err != nil {
+			t.Fatal(err)
+		}
+		batch, err := os.ReadFile(batchFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{fmt.Sprintf("tcp_proxy_ports { %d }", port), fmt.Sprintf("udp_proxy_ports { %d }", port), "tcp_proxy_ports { 7892 }", "udp_proxy_ports { 7893 }"} {
+			if !strings.Contains(string(batch), want) {
+				t.Errorf("missing %q in %s", want, batch)
+			}
+		}
+		if strings.Contains(string(batch), "flush set") != starting {
+			t.Errorf("live reload must retain previously protected ports: %s", batch)
+		}
+	}
+}
+
+func TestUpgradeChecksCandidateBeforeChanges(t *testing.T) {
+	p := Paths{Root: t.TempDir()}
+	pkg := t.TempDir()
+	st := InstallState{Version: "0.1.9", Complete: true, PanelPort: 8080}
+	for _, item := range []struct {
+		path, body string
+		mode       os.FileMode
+	}{
+		{p.Bin("atomdns"), "live binary", 0o755},
+		{filepath.Join(p.Data(), "webinfo", "atom_rules.json"), `{"future_field":1}`, 0o600},
+		{filepath.Join(p.Data(), "config_custom.yaml"), "live config", 0o644},
+		{filepath.Join(pkg, "config", "config_custom.yaml"), "api:\n  http: \"0.0.0.0:80\"\n", 0o644},
+		{filepath.Join(pkg, "bin", "atomdns"), `#!/bin/sh
+set -eu
+test "$1" = check && grep -q future_field "$3/webinfo/atom_rules.json" && grep -q 8080 "$3/config_custom.yaml" || exit 11
+echo 'unknown field future_field'
+exit 12
+`, 0o755},
+	} {
+		if err := writeFileAtomic(item.path, []byte(item.body), item.mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writeJSON(p.State(), st); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveChanges(p, &Changes{}); err != nil {
+		t.Fatal(err)
+	}
+	log := &recLogger{}
+	ins := Installer{Paths: p, PkgDir: pkg, Version: "0.1.8"}
+	if err := ins.upgrade(&st, log); err == nil || !strings.Contains(strings.Join(log.lines, "\n"), "unknown field future_field") {
+		t.Fatalf("candidate should see existing state and packaged configuration: %v, %v", err, log.lines)
+	}
+	if _, err := os.Stat(p.Backup()); !os.IsNotExist(err) {
+		t.Fatalf("preflight failure must precede backup and service changes: %v", err)
+	}
+	for path, want := range map[string]string{p.Bin("atomdns"): "live binary", filepath.Join(p.Data(), "config_custom.yaml"): "live config"} {
+		if got, err := os.ReadFile(path); err != nil || string(got) != want {
+			t.Errorf("live file %s changed: %q, %v", path, got, err)
+		}
+	}
+}
+
+func TestUninstallRefusesLostRecoveryRecords(t *testing.T) {
+	for _, corrupt := range []bool{false, true} {
+		p := Paths{Root: t.TempDir(), UnitDir: t.TempDir()}
+		if err := writeJSON(p.State(), InstallState{Complete: true}); err != nil {
+			t.Fatal(err)
+		}
+		if corrupt {
+			if err := os.WriteFile(p.Changes(), []byte(`{"network":true,`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(p.DNSUnit(), []byte("existing unit"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		log := &recLogger{}
+		if err := uninstall(p, true, log); err == nil || !strings.Contains(err.Error(), p.Changes()) || len(log.lines) != 0 {
+			t.Fatalf("uninstall must stop before cleanup: %v, %v", err, log.lines)
+		}
+		if _, err := os.Stat(p.DNSUnit()); err != nil {
+			t.Fatalf("uninstall removed the unit: %v", err)
+		}
 	}
 }
 
 func TestStateJSONHasNoNulls(t *testing.T) {
-	s := newServer(&Installer{Paths: Paths{Root: t.TempDir()}})
+	s := newServer(&Installer{Paths: Paths{Root: t.TempDir()}}, "012345")
 	data, err := json.Marshal(s.state())
 	if err != nil {
 		t.Fatal(err)
@@ -579,7 +737,7 @@ func TestStateJSONHasNoNulls(t *testing.T) {
 }
 
 func TestWizardRefusesOtherPagesAndHosts(t *testing.T) {
-	s := newServer(&Installer{Paths: Paths{Root: t.TempDir()}})
+	s := newServer(&Installer{Paths: Paths{Root: t.TempDir()}}, "012345")
 	h := s.handler()
 	host, _ := os.Hostname()
 	do := func(method, target, ctype, origin, hostHeader string) int {
@@ -589,6 +747,7 @@ func TestWizardRefusesOtherPagesAndHosts(t *testing.T) {
 		}
 		req := httptest.NewRequest(method, target, body)
 		req.RemoteAddr = "192.168.1.5:4000"
+		req.Header.Set("X-Atom-Install-Code", "012345")
 		if hostHeader != "" {
 			req.Host = hostHeader
 		}
@@ -624,6 +783,55 @@ func TestWizardRefusesOtherPagesAndHosts(t *testing.T) {
 	}
 	if c := do("POST", "/api/validate", "application/json", "http://192.168.1.9:9996", "192.168.1.9:9996"); c != 200 {
 		t.Errorf("the page's own POST: %d", c)
+	}
+}
+
+func TestWizardInstallationCode(t *testing.T) {
+	s := newServer(&Installer{}, "012345")
+	h := s.handler()
+	get := func(path, code string) int {
+		r := httptest.NewRequest("GET", "http://127.0.0.1"+path, nil)
+		r.RemoteAddr = "127.0.0.1:8888"
+		r.Header.Set("X-Atom-Install-Code", code)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	if got := get("/", ""); got != 200 {
+		t.Fatalf("open the code prompt: %d", got)
+	}
+	if got := get("/api/job", ""); got != 401 {
+		t.Fatalf("missing code: %d", got)
+	}
+	if got := get("/api/job", "555555"); got != 401 {
+		t.Fatalf("wrong code: %d", got)
+	}
+	if got := get("/api/job", "555556"); got != 429 {
+		t.Fatalf("rapid guess: %d", got)
+	}
+	s.nextGuess = time.Time{}
+	if got := get("/api/job", "012345"); got != 200 {
+		t.Fatalf("valid code: %d", got)
+	}
+	s.seen = time.Now().Add(-2 * idleLimit)
+	get("/api/job", "012345")
+	if !s.busyOrClosing() || !s.idleClose() {
+		t.Fatal("an authenticated poll must not extend the deadline")
+	}
+}
+
+func TestLegacyTorRefusedBeforeStartup(t *testing.T) {
+	for file, data := range map[string]string{
+		"webinfo/atom_proxy.json": `{"nodes":[{"id":"n-oldtor","outbound":{"type":"tor"}}]}`,
+		"sing-box/config.json":    `{"outbounds":[{"tag":"n-oldtor","type":"tor"}]}`,
+	} {
+		p := Paths{Root: t.TempDir()}
+		if err := writeFileAtomic(filepath.Join(p.Data(), file), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := checkLegacyTor(p); err == nil || !strings.Contains(err.Error(), "n-oldtor") {
+			t.Fatalf("%s: %v", file, err)
+		}
 	}
 }
 
@@ -702,12 +910,13 @@ func TestMakeBackupCoversEverythingTheUpgradeOverwrites(t *testing.T) {
 }
 
 func TestFinishAndInstallDoNotRace(t *testing.T) {
-	s := newServer(&Installer{Paths: Paths{Root: t.TempDir()}})
+	s := newServer(&Installer{Paths: Paths{Root: t.TempDir()}}, "012345")
 	h := s.handler()
 	post := func(path string) int {
 		req := httptest.NewRequest("POST", path, strings.NewReader("{}"))
 		req.RemoteAddr = "127.0.0.1:5000"
 		req.Host = "127.0.0.1:9996"
+		req.Header.Set("X-Atom-Install-Code", "012345")
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -802,19 +1011,20 @@ func TestUninstallFollowsTheOwnershipRecord(t *testing.T) {
 func TestTeardownClearsOwnership(t *testing.T) {
 	p := Paths{Root: t.TempDir()}
 	saveChanges(p, &Changes{Network: true, IPForwardBefore: ""})
-	teardownNetwork(p, &recLogger{})
-	if loadChanges(p).Network {
+	ins := Installer{Paths: p}
+	ins.rollbackNetwork(&recLogger{})
+	if ch, err := loadChanges(p); err != nil || ch.Network {
 		t.Error("after a teardown the network is no longer the installer's")
 	}
 	log := &recLogger{}
-	teardownNetwork(p, log) // a second teardown must not touch anything
+	ins.rollbackNetwork(log) // a second teardown must not touch anything
 	if log.ran("nft") || log.ran("ip ") {
 		t.Errorf("%v", log.lines)
 	}
 }
 
 func TestOneWayToClose(t *testing.T) {
-	s := newServer(&Installer{Paths: Paths{Root: t.TempDir()}})
+	s := newServer(&Installer{Paths: Paths{Root: t.TempDir()}}, "012345")
 	s.job = newJob([]string{"a"})
 	if s.requestClose() {
 		t.Error("a running installation refuses to close")
@@ -826,9 +1036,9 @@ func TestOneWayToClose(t *testing.T) {
 		t.Error("the idle timer must not end a running installation")
 	}
 	s.job.finish(nil, 80)
-	s.mu.Lock()
-	s.seen = time.Now().Add(-2 * afterDoneLimit)
-	s.mu.Unlock()
+	s.job.mu.Lock()
+	s.job.finished = time.Now().Add(-2 * afterDoneLimit)
+	s.job.mu.Unlock()
 	if !s.idleClose() {
 		t.Error("a finished installation that nobody uses closes")
 	}
@@ -839,7 +1049,7 @@ func TestOneWayToClose(t *testing.T) {
 		t.Error("nothing is accepted once closing")
 	}
 
-	s2 := newServer(&Installer{Paths: Paths{Root: t.TempDir()}})
+	s2 := newServer(&Installer{Paths: Paths{Root: t.TempDir()}}, "012345")
 	if s2.idleClose() {
 		t.Error("a wizard that was just used does not close")
 	}
@@ -1228,7 +1438,10 @@ func TestOldChangesFileStillReads(t *testing.T) {
 	p := Paths{Root: t.TempDir()}
 	os.MkdirAll(p.Etc(""), 0o755)
 	os.WriteFile(p.Changes(), []byte(`{"apt_installed": ["nftables"], "pkg_installed": ["iproute2"]}`), 0o644)
-	ch := loadChanges(p)
+	ch, err := loadChanges(p)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if strings.Join(ch.PkgInstalled, ",") != "nftables,iproute2" || len(ch.AptInstalled) != 0 {
 		t.Errorf("%+v", ch)
 	}
@@ -1273,12 +1486,40 @@ func TestUninstallRemovesOpenRCLogs(t *testing.T) {
 		os.WriteFile(filepath.Join(logs, "atom-dns.log"), []byte("x"), 0o644)
 		p := Paths{Root: t.TempDir(), UnitDir: t.TempDir(), OpenRC: true}
 		writeJSON(p.State(), &InstallState{Version: "0.1.0"})
+		saveChanges(p, &Changes{})
 		if err := uninstall(p, purge, &recLogger{}); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := os.Stat(logs); err == nil {
 			t.Errorf("purge=%v: the log directory stays", purge)
 		}
+	}
+}
+
+func TestOpenRCLogRotationConfig(t *testing.T) {
+	root := t.TempDir()
+	p := Paths{Root: root, UnitDir: filepath.Join(root, "init.d"), OpenRC: true}
+	if err := writeFileAtomic(p.Bin("logrotate"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", p.Bin("")+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := configureOpenRCLogs(p, &recLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := os.ReadFile(p.logrotateConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, directive := range []string{logrotateMarker, openRCLogDir + "/*.log", "size 5M", "rotate 3", "copytruncate"} {
+		if !strings.Contains(string(policy), directive) {
+			t.Errorf("missing %q in %s", directive, policy)
+		}
+	}
+	if err := removeOpenRCLogRotation(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p.logrotateConfig()); !os.IsNotExist(err) {
+		t.Fatalf("Atom's rotation policy should be removed: %v", err)
 	}
 }
 
@@ -1391,6 +1632,7 @@ func TestBeginReconfigureBacksUp(t *testing.T) {
 		t.Error("nothing installed")
 	}
 	writeJSON(p.State(), &InstallState{Version: "0.1.0", Complete: true, Topology: "bypass", PanelPort: 80})
+	saveChanges(p, &Changes{})
 	os.WriteFile(p.DNSUnit(), []byte("unit"), 0o644)
 	os.MkdirAll(p.Lib(""), 0o755)
 	os.WriteFile(p.Lib("policy-route.sh"), []byte("#!/bin/sh"), 0o755)
@@ -1537,7 +1779,7 @@ func TestResolvConfLinkIsPutBack(t *testing.T) {
 		t.Error("the copy goes")
 	}
 	saveChanges(p, &Changes{ResolvConfSaved: true, ResolvConfSavedLink: "x"})
-	if loadChanges(p).ResolvConfSavedLink != "x" {
+	if ch, err := loadChanges(p); err != nil || ch.ResolvConfSavedLink != "x" {
 		t.Error("recorded in changes.json")
 	}
 }

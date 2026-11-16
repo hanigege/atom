@@ -83,8 +83,8 @@ FakeIP 流量 ─>│ FakeIP 还原域名 → 绑定的出口 / route.final → 
 - 规则命中"代理 → 组 X"时发 SET X；原判断的结果是国外时发 CLEAR，由 `route.final` 处理。所以大部分域名不会在 sing-box 里留绑定记录。**[定]**
 - CLEAR 的含义（2026-11-12，用户定）**[定]**：走 Final，不经过路由规则。DNS 判定走代理、给了 FakeIP 的连接一定走代理：有绑定走规则指定的组，没有绑定走 Final，sing-box 的路由规则（IP、端口、网络规则）一概不参与。三个入口一样：redirect、TProxy（含 PreMatch）还原 FakeIP 时、mixed 入站 `resolve` 得到 FakeIP 时。原来的补丁是"有绑定才跳过路由规则"，没绑定的 FakeIP 连接会先过路由规则，比如一条端口规则会把没命中规则的国外域名截走；没有改成给每个国外域名发 SET final，那样绑定会越存越多，也挤占绑定账本。见 [singbox-fakeip-outbound.md](singbox-fakeip-outbound.md)。
 - 实现（第 1 步）：在 fork 的 `rust/native-host/src/edns_directive.rs`，挂在 `ForwardCatalog` 发往上游的出口上，所有上游查询都经过这里。发往 `nocnfake` 组的查询：去掉客户端带的 65001，加上 CLEAR（`[1,2]`）；客户端没有 OPT 时补一个 OPT（UDP 大小 1232）。发往其他组的查询：没有 65001 时原样发出；带了就去掉，其他 option（ECS、cookie 等）保留。剥 65001 只按 OPT 的结构逐个遍历选项，不依赖 ECS 等选项的语义校验（比如重复 ECS 时照样剥）；附加记录连结构都解析不了的查询，对所有上游都拒绝，不原样发出。`nocnfake` 的查询还要通过完整的 OPT 校验，过不了就报错，不发给 sing-box。改写过的查询一律用展开后的域名重建问题段，因为原包里的压缩指针可能指向后面会移动的选项字节。
-- 注意：FakeIP 应答会进全局缓存（`cache_all`），命中缓存时不再问 sing-box，也就不会重发 CLEAR/SET。第 1 步只有 CLEAR，不受影响；第 2 步发 SET 以后，规则变化要按 4.5 清缓存。
-- SET 的实现（第 2 步）：规则表插件命中"代理 → 组 X"时，把 X 写进查询状态（`ExecutionState::outbound`，在 `sequence-core`）；`ForwardCatalog` 发往上游时把它交给 `edns_directive.rs`，发往 `nocnfake` 的查询写 SET X，没有 X 时写 CLEAR，其他上游不带。规则表排在 `cache_all` 前面，命中代理规则的查询不经过全局缓存，每次都会把 SET 发给 sing-box；规则每次变化都清空全局缓存（4.5.1 的"清缓存"），所以删掉代理规则后，`cache_all` 里不会留着旧的 FakeIP 挡住 CLEAR。**[定]**
+- 全局缓存按当前 FakeIP 网段排除这类应答，导入旧缓存转储时也执行同样的检查。下一次客户端查询重新向 sing-box 取地址。
+- SET 的实现（第 2 步）：规则表插件命中"代理 → 组 X"时，把 X 写进查询状态（`ExecutionState::outbound`，在 `sequence-core`）；`ForwardCatalog` 发往上游时把它交给 `edns_directive.rs`，发往 `nocnfake` 的查询写 SET X，没有 X 时写 CLEAR，其他上游不带。规则表排在 `cache_all` 前面，命中代理规则的查询不经过全局缓存，每次都会把 SET 发给 sing-box。**[定]**
 - 附加记录的 owner 名（第 2 步修）：先按问题段的规则校验展开后的名字（压缩指针不能越界、不能自指、不能成环），再接受这条记录；以前只是跳过 owner，这类 TYPE=OPT 的记录会被原样发给普通上游。
 
 ## 4. 规则表 **[定]**
@@ -198,7 +198,7 @@ sing-box 的绑定只在收到 DNS 查询时更新，而客户端会缓存 DNS �
   - IP 规则：不影响域名的结论；
   - 改 FakeIP 网段：sing-box 会清空所有映射和绑定，所以账本也清空；
   - sing-box 重启或重载：账本不变，绑定还在 `cache.db` 里（第 4 步验证过）。
-- **清缓存**（2026-11-12，DNS 页补全时用户定的：只清确有必要的）**[定]**。缓存分两类：全局缓存（`cache_all`、`cache_all_noleak`，排在规则表后面，只有没命中规则的查询会查它，里面有 FakeIP 应答）和上游应答缓存（`cache_cn`、`cache_google`、`cache_google_node`、各上游组的 `cache_atom_<组>`，存的是上游的原始应答，和走哪条规则无关，没有 FakeIP）。
+- **清缓存**（2026-11-12，DNS 页补全时用户定的：只清确有必要的）**[定]**。全局缓存（`cache_all`、`cache_all_noleak`）排在规则表后面，由未命中规则的查询使用，保存真实地址和其他合格应答。上游应答缓存（`cache_cn`、`cache_google`、`cache_google_node`、各上游组的 `cache_atom_<组>`）保存上游的原始应答。
   - 规则的增、删、改、拖动、启用、停用，规则集的新建、修改、删除、手动刷新，重写改动：只清全局缓存。规则表和重写都在全局缓存前面，命中它们的查询本来就进不了全局缓存；要清的是加规则或改规则以前留下的旧条目，好让改动立即生效。
   - 规则集每日自动更新（4.9）：不清。旧条目被 lazy 命中时会在后台重跑整条流程，自己就纠正了；没过期的条目要等到过期。
   - 节点、节点组、Final、mixed 端口、TTL 上限（在出口统一压）：不清。删组时的旧绑定由后台单独迁移。
@@ -454,7 +454,8 @@ sing-box 的绑定只在收到 DNS 查询时更新，而客户端会缓存 DNS �
   - 凭据在 `webinfo/atom_auth.json`（0600）：用户名、密码的 PBKDF2-HMAC-SHA256 哈希（10 万次，随机盐，在阻塞线程里算）、一个随机密钥。没有这个文件就不需要登录，和原来一样。
   - 有文件时，除了 UI 文件、`/api/v1/system/health` 和 `auth`、`auth/login` 以外的请求（atom API、`/metrics`、审计、`/plugins`、诊断抓取）都要带会话 Cookie `atom_session`（登录时发，30 天，HttpOnly、SameSite=Strict，内容是"过期时间 + 用密钥算的 HMAC"），或 `Authorization: Bearer <密钥>`（安装器以 root 读这个文件拿密钥，升级、保留数据重装时调接口用），否则 401。
   - 接口：`GET auth`（`{enabled, authenticated, username}`）；`PUT auth {username, password, current_password?}` 设置或修改，换新密钥（所有会话失效），给当前浏览器发新 Cookie；`DELETE auth {current_password?}` 关闭登录；`POST auth/login`（错误时等 1 秒再返回 401）；`POST auth/logout` 清掉 Cookie。已开登录、用会话改的时候要给当前密码。
-  - WebUI：未登录时整个界面换成登录页；顶栏有退出按钮；设置页"面板登录"可以设置、修改、关闭。安装器：网络那一步面板端口下面有可选的用户名和密码，装完最后一步设置。
+  - WebUI：未登录时整个界面换成登录页；顶栏有退出按钮；设置页"面板登录"可以设置、修改、关闭。安装器：网络那一步面板端口下面有可选的用户名和密码，全新安装时在面板启动前写好。
+  - 登录和免登录模式都检查请求的访问地址和浏览器来源。默认可用 IP、`localhost`、本机名及其 `.local` / `.lan` 形式。自定义域名或 HTTPS 反向代理可在 `api.public_origin` 设置面板的完整来源（如 `https://panel.example.net`），代理需保留浏览器发来的 `Host`。脚本可用 `X-Atom-Request: 1` 调用无 JSON 正文的写入接口和旧的插件 `save` / `flush` 接口。
   - 已知限制：退出只清本浏览器的 Cookie，那个会话本身到过期前仍然有效（改密码会让所有会话失效）；登录失败只有 1 秒延迟，没有锁定；面板是 HTTP，局域网里能抓包的人能拿到 Cookie。
 
 ## 9. 部署
@@ -482,7 +483,7 @@ DNS 和代理在同一台 VM 上。客户端的 DNS 指向这台 VM；FakeIP 网
      - 双网卡网关另有"LAN 侧网关"和"客户端网段"（2026-11-12，用户在 atom 测试机上发现）：客户端不在 LAN 网段、经 LAN 侧的路由器过来时，本机的应答（DNS、redirect 和 TProxy 的回包、NAT 回来的包）会沿默认路由从 WAN 出去。向导按本机已有的、经 LAN 网卡的路由预填这两项；安装器在 `policy-route.sh` 里对每个网段写 `ip route replace <网段> via <LAN 侧网关> dev <LAN 网卡>`，随 `atom-dns.service` 每次启动加回。没用连接标记改道：atomdns 的 UDP 监听在通配地址、按路由选源地址，改道改不了已经选成 WAN 地址的源，DNS 仍然不通。都留空表示客户端都在 LAN 网段。
      - 单网卡旁路由可以勾"回包经主路由"（2026-11-14，用户定），填主路由地址（默认是 LAN 网卡默认路由的网关）：导入 sing-box 的连接打连接标记，回包按标记经表 234 交给主路由，主路由能看到两个方向的包；同时关掉 LAN 网卡接收 ICMP 重定向。默认不勾。规则见 deploy-nft.md 3.4。
      - 所有权：网段原来就有同一网关、同一网卡的路由，就算机器自己的，卸载不删；网关不同就拒绝安装。安装器加的记在 `changes.json` 的 `routes`，拆网络时只删这些；重装时不再需要的旧路由当场删掉。
-     - 面板只给 LAN（2026-11-12，用户定）：双网卡网关的 `atom-gateway.nft` 在 WAN 网卡上丢掉发往面板端口的 TCP；atomdns 仍监听所有地址，安装器和升级经 127.0.0.1 调用接口，LAN 地址变了也不受影响。完成页把浏览器带到 LAN 地址。实测（atom 测试机，0.1.3 → 0.1.4 升级）：从 LAN 打开面板 200、从 WAN 被拦，经 WAN 的 SSH 不受影响，客户端路由随升级保留。没处理：DNS 53 和 mixed 代理端口在 WAN 上照样开着。
+     - 面板、DNS 和代理入站只给 LAN 和本机。双网卡网关使用 `atom-wan.nft` 拦截 WAN 发往这些本机端口的流量，同时覆盖 IPv4 和 IPv6。sing-box 启动和重载前先保护生成配置中的端口。为了覆盖重载交接，旧代理端口保留到 sing-box 下次完整启动。安装器仍经 127.0.0.1 调用面板接口，完成页把浏览器带到 LAN 地址。
   3. DNS：国内、国外上游（默认值是产品配置里的，只在和现在的不同时才写）。
   4. sing-box：FakeIP 网段、mixed 端口、可选导入节点（放进"默认代理"组，否则装完国外流量全被拒绝）。
   5. 确认并安装：实时进度，装完自检，倒计时跳转面板。

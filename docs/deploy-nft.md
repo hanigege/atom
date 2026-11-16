@@ -86,9 +86,9 @@ table ip atom_nat {
 }
 ```
 
-`@WAN@` 是外网网卡名（不带引号，文件里已经有）。同时要开转发：`net.ipv4.ip_forward = 1`（安装器由 `atom-dns.service` 的 `ExecStartPre` 设置）。TCP、UDP 都进了 sing-box，这张表现在只给非 TCP、UDP 的包（ping 等）用；安装器写的版本另有一条：WAN 网卡上丢掉发往面板端口的 TCP（design.md 9.2）。
+`@WAN@` 是外网网卡名（不带引号，文件里已经有）。同时要开转发：`net.ipv4.ip_forward = 1`（安装器由 `atom-dns.service` 的 `ExecStartPre` 设置）。TCP、UDP 都进了 sing-box，这张 NAT 表现在只给非 TCP、UDP 的包（ping 等）用。
 
-这份文件不带防火墙：`forward` 链默认放行。VM 本身就是网关时，WAN 侧进来的连接要不要拦，由用户现有的防火墙决定；安装器只提示，不替用户加。**[建议]**
+安装器另外生成 `atom-wan.nft`，在 `inet atom_wan` 中拦截从 WAN 发往本机的面板、DNS、mixed、redirect 和 TProxy 端口。此规则覆盖 IPv4 和 IPv6，sing-box 启动或重载前会把配置中的端口加入规则。其他本机端口和转发流量由现有防火墙管理。
 
 ### 3.3 策略路由（两种形态都要）
 

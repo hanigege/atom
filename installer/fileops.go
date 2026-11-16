@@ -48,10 +48,14 @@ func copyFileAtomic(src, dst string, mode os.FileMode) error {
 	return nil
 }
 
-// productOwned names the files of the shipped configuration an upgrade overwrites; every other file of the
-// configuration root (webinfo/, rules and lists that the daily updates replace, caches) is data and stays.
+// productOwned names the shipped files an upgrade overwrites. Existing DNS upstream YAML, webinfo,
+// downloaded rules and caches are data and stay.
 func productOwned(rel string) bool {
 	rel = filepath.ToSlash(rel)
+	switch rel {
+	case "sub_config/forward_local.yaml", "sub_config/forward_nocn.yaml", "sub_config/forward_nocn_ecs.yaml":
+		return false
+	}
 	return rel == "config_custom.yaml" || strings.HasPrefix(rel, "sub_config/") || rel == "rule/atom_catalog.json"
 }
 
@@ -102,6 +106,8 @@ func refreshData(pkgConfig, dataDir string, panelPort int, reload string) error 
 		if !productOwned(rel) {
 			if _, err := os.Lstat(dst); err == nil {
 				return nil
+			} else if !os.IsNotExist(err) {
+				return err
 			}
 		}
 		return copyFileAtomic(path, dst, 0o644)

@@ -65,16 +65,10 @@ table inet atom {
 `, l, fwmark, ct, out), nil
 }
 
-// renderGatewayNft is deploy-nft.md 3.2: what is neither TCP nor UDP (ping) is forwarded and NATed out of
-// the WAN. The panel is
-// for the LAN only: its port is closed on the WAN (atomdns still listens on every address, so the installer
-// reaches it on 127.0.0.1 and a changed LAN address does not matter).
-func renderGatewayNft(lan []string, wan string, panelPort int) (string, error) {
+// renderGatewayNft is deploy-nft.md 3.2: what is neither TCP nor UDP (ping) is forwarded and NATed out of the WAN.
+func renderGatewayNft(lan []string, wan string) (string, error) {
 	if err := checkIfaceNames(append(append([]string{}, lan...), wan)); err != nil {
 		return "", err
-	}
-	if panelPort < 1 || panelPort > 65535 {
-		return "", fmt.Errorf("invalid panel port %d", panelPort)
 	}
 	return fmt.Sprintf(`#!/usr/sbin/nft -f
 # atom, dual-NIC gateway only: what is neither TCP nor UDP from the LAN is forwarded and NATed out of the WAN. Written by atom-installer.
@@ -85,14 +79,29 @@ table ip atom_nat {
 		type nat hook postrouting priority srcnat; policy accept;
 		iifname { %[1]s } oifname "%[2]s" masquerade
 	}
-
-	# The panel is not reachable from the WAN.
-	chain input {
-		type filter hook input priority filter; policy accept;
-		iifname "%[2]s" tcp dport %[3]d drop
-	}
 }
-`, nftList(lan), wan, panelPort), nil
+`, nftList(lan), wan), nil
+}
+
+// Keep the dynamic set through DNS restarts and sing-box reloads. Only a
+// full sing-box start, with no listener left from the old instance, resets it.
+func renderWANNft(wan string, panelPort int) (string, error) {
+	if err := checkIfaceNames([]string{wan}); err != nil {
+		return "", err
+	}
+	if panelPort < 1 || panelPort > 65535 {
+		return "", fmt.Errorf("invalid panel port %d", panelPort)
+	}
+	return fmt.Sprintf(`add table inet atom_wan
+add set inet atom_wan tcp_proxy_ports { type inet_service; }
+add set inet atom_wan udp_proxy_ports { type inet_service; }
+add chain inet atom_wan input { type filter hook input priority filter; policy accept; }
+flush chain inet atom_wan input
+add rule inet atom_wan input iifname %[1]q tcp dport { 53, %[2]d } drop
+add rule inet atom_wan input iifname %[1]q udp dport 53 drop
+add rule inet atom_wan input iifname %[1]q tcp dport @tcp_proxy_ports drop
+add rule inet atom_wan input iifname %[1]q udp dport @udp_proxy_ports drop
+`, wan, panelPort), nil
 }
 
 func checkIfaceNames(names []string) error {
@@ -152,6 +161,7 @@ func renderDNSUnit(p Paths, nftBin, sysctlBin string, gateway bool, replyDev str
 	var pre strings.Builder
 	fmt.Fprintf(&pre, "ExecStartPre=%s -f %s\n", nftBin, p.Etc("atom.nft"))
 	if gateway {
+		fmt.Fprintf(&pre, "ExecStartPre=%s protect-wan --root %q\n", p.Bin("atom-installer"), p.Root)
 		fmt.Fprintf(&pre, "ExecStartPre=%s -f %s\n", nftBin, p.Etc("atom-gateway.nft"))
 		fmt.Fprintf(&pre, "ExecStartPre=%s -w net.ipv4.ip_forward=1\n", sysctlBin)
 	}
@@ -184,7 +194,9 @@ After=network-online.target
 ConditionPathExists=%[2]s/config.json
 
 [Service]
+ExecStartPre=%[3]s protect-wan --root %[4]q --start
 ExecStart=%[1]s run -D %[2]s -c %[2]s/config.json
+ExecReload=%[3]s protect-wan --root %[4]q
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=1
@@ -192,7 +204,7 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-`, p.Bin("sing-box"), dir)
+`, p.Bin("sing-box"), dir, p.Bin("atom-installer"), p.Root)
 }
 
 var panelPortRe = regexp.MustCompile(`(?m)^(api:[ \t]*\r?\n[ \t]+http:[ \t]*")[^"]*(")`)
@@ -211,6 +223,7 @@ func renderDNSInit(p Paths, nftBin, sysctlBin string, gateway bool, replyDev str
 	var pre strings.Builder
 	fmt.Fprintf(&pre, "\t%s -f %s || return 1\n", nftBin, p.Etc("atom.nft"))
 	if gateway {
+		fmt.Fprintf(&pre, "\t%s protect-wan --root %q || return 1\n", p.Bin("atom-installer"), p.Root)
 		fmt.Fprintf(&pre, "\t%s -f %s || return 1\n", nftBin, p.Etc("atom-gateway.nft"))
 		fmt.Fprintf(&pre, "\t%s -w net.ipv4.ip_forward=1 || return 1\n", sysctlBin)
 	}
@@ -232,6 +245,7 @@ error_log=%[4]s/atom-dns.log
 
 depend() {
 	need net
+	want crond
 }
 
 start_pre() {
@@ -262,15 +276,17 @@ depend() {
 
 start_pre() {
 	[ -f %[2]s/config.json ] || { eerror "no %[2]s/config.json"; return 1; }
+	%[4]s protect-wan --root %[5]q --start || return 1
 	checkpath -d -m 0755 %[3]s
 }
 
 reload() {
+	%[4]s protect-wan --root %[5]q || return 1
 	ebegin "Reloading $RC_SVCNAME"
 	supervise-daemon "$RC_SVCNAME" --signal HUP
 	eend $?
 }
-`, p.Bin("sing-box"), dir, openRCLogDir)
+`, p.Bin("sing-box"), dir, openRCLogDir, p.Bin("atom-installer"), p.Root)
 }
 
 // renderReloadScript is the reload command of atom_rules.yaml on OpenRC: reload sing-box when it runs, else

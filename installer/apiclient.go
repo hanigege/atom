@@ -77,6 +77,7 @@ func (a *apiClient) call(method, path string, body, out any) error {
 		if body != nil {
 			req.Header.Set("Content-Type", "application/json")
 		}
+		req.Header.Set("X-Atom-Request", "1")
 		if key := a.key(); key != "" {
 			req.Header.Set("Authorization", "Bearer "+key)
 		}

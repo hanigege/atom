@@ -1,13 +1,13 @@
 package main
 
 import (
+	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
 	"fmt"
 	"mime"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -24,19 +24,21 @@ const (
 
 // Server is the wizard: a page and a small JSON API. It only answers private and loopback addresses.
 type Server struct {
-	ins  *Installer
-	mu   sync.Mutex
-	job  *Job
-	seen time.Time
-	quit chan struct{}
-	once sync.Once
+	ins       *Installer
+	mu        sync.Mutex
+	job       *Job
+	seen      time.Time
+	code      string
+	nextGuess time.Time
+	quit      chan struct{}
+	once      sync.Once
 
 	closing bool       // finish was accepted: no new job
 	opMu    sync.Mutex // one free action at a time, and not while a job starts
 }
 
-func newServer(ins *Installer) *Server {
-	return &Server{ins: ins, seen: time.Now(), quit: make(chan struct{})}
+func newServer(ins *Installer, code string) *Server {
+	return &Server{ins: ins, code: code, seen: time.Now(), quit: make(chan struct{})}
 }
 
 func isPrivateRemote(remoteAddr string) bool {
@@ -75,11 +77,9 @@ func hostAllowed(host string) bool {
 // changes something must be JSON (which a cross-site page cannot send without a preflight the server never
 // grants) and must not name another origin.
 func sameOriginRequest(r *http.Request) bool {
-	if o := r.Header.Get("Origin"); o != "" {
-		u, err := url.Parse(o)
-		if err != nil || u.Host != r.Host {
-			return false
-		}
+	if origins := r.Header.Values("Origin"); len(origins) != 0 &&
+		(len(origins) != 1 || origins[0] != "http://"+r.Host) {
+		return false
 	}
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		return true
@@ -88,11 +88,29 @@ func sameOriginRequest(r *http.Request) bool {
 	return ct == "application/json"
 }
 
+func (s *Server) authorize(code string) int {
+	if len(code) != 6 {
+		return http.StatusUnauthorized
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	if now.Before(s.nextGuess) {
+		return http.StatusTooManyRequests
+	}
+	if subtle.ConstantTimeCompare([]byte(code), []byte(s.code)) != 1 {
+		s.nextGuess = now.Add(2 * time.Second)
+		return http.StatusUnauthorized
+	}
+	return http.StatusOK
+}
+
 func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Frame-Options", "DENY")
 		w.Write(indexHTML)
 	})
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) { writeResp(w, 200, s.state()) })
@@ -106,9 +124,18 @@ func (s *Server) handler() http.Handler {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		s.mu.Lock()
-		s.seen = time.Now()
-		s.mu.Unlock()
+		if r.URL.Path != "/" {
+			w.Header().Set("Cache-Control", "no-store")
+			switch s.authorize(r.Header.Get("X-Atom-Install-Code")) {
+			case http.StatusUnauthorized:
+				writeErr(w, http.StatusUnauthorized, "请输入启动终端上显示的安装码")
+				return
+			case http.StatusTooManyRequests:
+				w.Header().Set("Retry-After", "2")
+				writeErr(w, http.StatusTooManyRequests, "请等两秒再试")
+				return
+			}
+		}
 		mux.ServeHTTP(w, r)
 	})
 }
@@ -352,7 +379,7 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 func (s *Server) busyOrClosing() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.closing || (s.job != nil && !s.job.view(0).Done)
+	return s.closing || time.Since(s.seen) >= idleLimit || (s.job != nil && !s.job.view(0).Done)
 }
 
 func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
@@ -410,19 +437,23 @@ func (s *Server) stop(cleanup bool) {
 	})
 }
 
-// idleClose ends the wizard when nobody uses it any more: after the idle limit, or the shorter one once an
-// installation has finished. It reports whether it did.
+// idleClose ends the wizard after the startup deadline, or shortly after success.
+// A running installation can finish even if it outlives the deadline.
 func (s *Server) idleClose() bool {
 	s.mu.Lock()
-	idle := time.Since(s.seen)
+	expired := time.Since(s.seen) >= idleLimit
 	var done, ok bool
+	var sinceFinish time.Duration
 	if s.job != nil {
 		v := s.job.view(0)
 		done, ok = v.Done, v.OK
+		if done {
+			sinceFinish = time.Since(s.job.finishedAt())
+		}
 	}
 	running := s.job != nil && !done
 	s.mu.Unlock()
-	if running || !(idle > idleLimit || (done && ok && idle > afterDoneLimit)) {
+	if running || (done && sinceFinish < afterDoneLimit) || !(expired || (done && ok)) {
 		return false
 	}
 	if !s.requestClose() { // an installation started in the meantime

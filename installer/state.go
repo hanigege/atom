@@ -69,7 +69,7 @@ func writeJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(path, append(data, '\n'), 0o644)
+	return writeFile(path, append(data, '\n'), 0o644, true)
 }
 
 func readJSON(path string, v any) error {
@@ -91,14 +91,24 @@ func loadState(p Paths) (*InstallState, error) {
 	return &st, nil
 }
 
-func loadChanges(p Paths) *Changes {
-	var c Changes
-	_ = readJSON(p.Changes(), &c)
+func loadChanges(p Paths) (*Changes, error) {
+	var c *Changes
+	if err := readJSON(p.Changes(), &c); err != nil {
+		if os.IsNotExist(err) {
+			if _, err := os.Lstat(p.State()); os.IsNotExist(err) {
+				return &Changes{}, nil
+			}
+		}
+		return nil, fmt.Errorf("无法读取恢复记录 %s：%w", p.Changes(), err)
+	}
+	if c == nil {
+		return nil, fmt.Errorf("恢复记录 %s 为空", p.Changes())
+	}
 	if len(c.AptInstalled) > 0 { // written by an installer before apk support
 		c.PkgInstalled = append(c.AptInstalled, c.PkgInstalled...)
 		c.AptInstalled = nil
 	}
-	return &c
+	return c, nil
 }
 
 func saveChanges(p Paths, c *Changes) error { return writeJSON(p.Changes(), c) }
@@ -106,7 +116,13 @@ func saveChanges(p Paths, c *Changes) error { return writeJSON(p.Changes(), c) }
 // writeFileAtomic writes next to the target and renames, so a reader never sees half a file and a running
 // executable is replaced rather than overwritten.
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	return writeFile(path, data, mode, false)
+}
+
+func writeFile(path string, data []byte, mode os.FileMode, durable bool) error {
+	dir := filepath.Dir(path)
+	_, dirErr := os.Stat(dir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
@@ -114,23 +130,41 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	name := tmp.Name()
+	defer os.Remove(name)
+	defer tmp.Close()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(name)
 		return err
 	}
 	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		os.Remove(name)
 		return err
 	}
+	if durable {
+		if err := tmp.Sync(); err != nil {
+			return err
+		}
+	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(name)
 		return err
 	}
 	if err := os.Rename(name, path); err != nil {
-		os.Remove(name)
 		return err
 	}
+	if durable {
+		if err := syncDir(dir); err != nil {
+			return err
+		}
+		if os.IsNotExist(dirErr) {
+			return syncDir(filepath.Dir(dir))
+		}
+	}
 	return nil
+}
+
+func syncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }

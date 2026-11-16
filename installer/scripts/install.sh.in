@@ -113,11 +113,12 @@ if [ "$INIT" = systemd ]; then STOP_HINT="systemctl stop atom-installer"; else S
 # (systemd: the unit; OpenRC: the process in the pidfile).
 # No answer, any other answer, or a process that does not exit: nothing is touched, the wizard is left to the user.
 stop_wizard() {
-  local wport code
+  local wport code install_code
   wizard_active || return 0
   wport="$(sed -n 's/.*"port": *\([0-9]*\).*/\1/p' "$ROOT/run/installer.json" 2>/dev/null || true)"
   [ -n "$wport" ] || die "安装器在运行但找不到它的端口。确认没有安装在进行后执行：$STOP_HINT"
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -X POST -H 'Content-Type: application/json' -d '{}' "http://127.0.0.1:${wport}/api/finish" || true)"
+  install_code="$(sed -n 's/.*"code": *"\([0-9]\{6\}\)".*/\1/p' "$ROOT/run/installer.json" 2>/dev/null || true)"
+  code="$(printf 'X-Atom-Install-Code: %s\n' "$install_code" | curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 15 -X POST -H @- -H 'Content-Type: application/json' -d '{}' "http://127.0.0.1:${wport}/api/finish" || true)"
   case "$code" in
     200) ;;
     409) die "安装正在进行，等它完成后再运行" ;;
@@ -243,13 +244,13 @@ fi
 rm -f "$ROOT/run/installer.json"
 if [ "$INIT" = systemd ]; then
   systemctl reset-failed atom-installer.service 2>/dev/null || true
-  systemd-run --quiet --unit=atom-installer --collect "$PKG/bin/atom-installer" serve --pkg "$PKG" $WIZARD_ARGS \
+  systemd-run --quiet --unit=atom-installer --collect --setenv=ATOM_WIZARD_BACKGROUND=1 "$PKG/bin/atom-installer" serve --pkg "$PKG" $WIZARD_ARGS \
     || die "启动安装器失败"
 else
   mkdir -p "$ROOT/run"
   rm -f "$PIDFILE"
   start-stop-daemon --start --background --make-pidfile --pidfile "$PIDFILE" --exec /bin/sh -- \
-    -c "exec \"$PKG/bin/atom-installer\" serve --pkg \"$PKG\" $WIZARD_ARGS >> \"$ROOT/run/installer.log\" 2>&1" \
+    -c "export ATOM_WIZARD_BACKGROUND=1; exec \"$PKG/bin/atom-installer\" serve --pkg \"$PKG\" $WIZARD_ARGS >> \"$ROOT/run/installer.log\" 2>&1" \
     || die "启动安装器失败"
 fi
 for _ in $(seq 1 40); do

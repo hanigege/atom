@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -23,7 +22,11 @@ func (ins *Installer) beginReconfigure(log Logger) (*reconfigureRun, error) {
 	if err != nil || !st.Complete {
 		return nil, fmt.Errorf("没有已完成的安装")
 	}
-	rc := &reconfigureRun{dir: filepath.Join(ins.Paths.Backup(), "reconfigure-"+time.Now().Format("20060102-150405")), oldSt: *st, oldCh: *loadChanges(ins.Paths)}
+	ch, err := loadChanges(ins.Paths)
+	if err != nil {
+		return nil, err
+	}
+	rc := &reconfigureRun{dir: backupPath(ins.Paths, "reconfigure"), oldSt: *st, oldCh: *ch}
 	if err := ins.makeBackup(rc.dir); err != nil {
 		return nil, fmt.Errorf("备份: %w", err)
 	}
@@ -36,7 +39,11 @@ func (ins *Installer) beginReconfigure(log Logger) (*reconfigureRun, error) {
 // nft rules and routing again). It never takes the network down.
 func (rc *reconfigureRun) restore(ins *Installer, log Logger) {
 	log.Logf("恢复备份")
-	newCh := loadChanges(ins.Paths)
+	newCh, err := loadChanges(ins.Paths)
+	if err != nil {
+		log.Logf("无法撤销新网络设置：%v（备份在 %s）", err, rc.dir)
+		return
+	}
 	rc.quiesce(ins.Paths.Init(), log)
 	// first what the new state added (ip_forward back to its old value resets accept_redirects of the
 	// interfaces, which the old services then turn off again when they start)

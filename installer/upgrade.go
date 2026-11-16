@@ -3,10 +3,13 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -59,7 +62,16 @@ func fileSHA256(path string) string {
 // backup when the new version does not come up.
 func (ins *Installer) upgrade(st *InstallState, log Logger) error {
 	p := ins.Paths
-	backup := filepath.Join(p.Backup(), fmt.Sprintf("%s-%s", st.Version, time.Now().Format("20060102-150405")))
+	if _, err := loadChanges(p); err != nil {
+		return err
+	}
+	if err := checkLegacyTor(p); err != nil {
+		return err
+	}
+	if err := ins.checkUpgradeConfig(st.PanelPort, log); err != nil {
+		return err
+	}
+	backup := backupPath(p, st.Version)
 	log.Logf("备份到 %s", backup)
 	if err := ins.makeBackup(backup); err != nil {
 		return fmt.Errorf("备份: %w", err)
@@ -87,8 +99,83 @@ func (ins *Installer) upgrade(st *InstallState, log Logger) error {
 	return nil
 }
 
+func (ins *Installer) checkUpgradeConfig(panelPort int, log Logger) error {
+	root, err := os.MkdirTemp("", "atom-check-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(root)
+	// Stage the same overlay as the upgrade. The checker only reads retained
+	// data, so link it instead of copying large lists and caches.
+	data, err := filepath.Abs(ins.Paths.Data())
+	if err != nil {
+		return err
+	}
+	if err := filepath.WalkDir(data, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(data, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(root, rel)
+		if entry.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		return os.Symlink(path, target)
+	}); err != nil {
+		return fmt.Errorf("准备升级检查：%w", err)
+	}
+	if err := ins.refreshConfig(root, panelPort); err != nil {
+		return fmt.Errorf("准备升级检查：%w", err)
+	}
+	if err := runCmd(log, 2*time.Minute, filepath.Join(ins.PkgDir, "bin", "atomdns"), "check", "-d", root, "-c", "config_custom.yaml"); err != nil {
+		return fmt.Errorf("候选版本无法读取现有配置，当前服务继续运行：%w", err)
+	}
+	return nil
+}
+
+// Check both the saved nodes and the config sing-box can start from on its own.
+func checkLegacyTor(p Paths) error {
+	type outbound struct {
+		Type string `json:"type"`
+		Tag  string `json:"tag"`
+	}
+	for _, path := range []string{filepath.Join(p.Data(), "webinfo", "atom_proxy.json"), filepath.Join(p.Data(), "sing-box", "config.json")} {
+		var config struct {
+			Nodes []struct {
+				ID       string   `json:"id"`
+				Outbound outbound `json:"outbound"`
+			} `json:"nodes"`
+			Outbounds []outbound `json:"outbounds"`
+		}
+		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err == nil {
+			err = json.Unmarshal(data, &config)
+		}
+		if err != nil {
+			return fmt.Errorf("检查旧节点 %s：%w", path, err)
+		}
+		for _, node := range config.Nodes {
+			if node.Outbound.Type == "tor" {
+				return fmt.Errorf("%s 中有 Tor 节点 %q，请先从旧面板移除后再继续", path, node.ID)
+			}
+		}
+		for _, item := range config.Outbounds {
+			if item.Type == "tor" {
+				return fmt.Errorf("%s 中仍有 Tor 节点 %q，请先移除后再继续", path, item.Tag)
+			}
+		}
+	}
+	return nil
+}
+
 func (ins *Installer) applyUpgrade(st *InstallState, oldSingBox string, log Logger) error {
-	if err := ins.installBinaries(log); err != nil {
+	if err := ins.installBinaries(log, compareVersions(ins.Version, st.Version) < 0); err != nil {
 		return err
 	}
 	if err := ins.installData(st.PanelPort, log); err != nil {
@@ -128,9 +215,10 @@ type backupItem struct {
 // backed up: programs, the state and network files, the shipped configuration (not the data), the WebUI, the panel login.
 func (ins *Installer) backupItems() []backupItem {
 	p := ins.Paths
-	return []backupItem{
+	items := []backupItem{
 		{path: filepath.Join(p.Root, "bin"), name: "bin"},
 		{path: filepath.Join(p.Root, "etc"), name: "etc"},
+		{path: p.Etc("atom-wan.nft"), name: "gateway/atom-wan.nft", file: true},
 		{path: filepath.Join(p.Root, "lib"), name: "lib"},
 		{path: filepath.Join(p.Data(), "sub_config"), name: "data/sub_config", exact: true},
 		{path: filepath.Join(p.Data(), "ui", "main"), name: "data/ui/main", exact: true},
@@ -140,6 +228,10 @@ func (ins *Installer) backupItems() []backupItem {
 		{path: p.DNSUnit(), name: "units/" + filepath.Base(p.DNSUnit()), file: true, mode: p.unitMode()},
 		{path: p.SingBoxUnit(), name: "units/" + filepath.Base(p.SingBoxUnit()), file: true, mode: p.unitMode()},
 	}
+	if p.OpenRC {
+		items = append(items, backupItem{path: p.logrotateConfig(), name: "logrotate/atom-installer", file: true})
+	}
+	return items
 }
 
 const absentList = "absent.txt"
@@ -205,6 +297,13 @@ func (ins *Installer) restoreBackup(dir string, panelPort int, log Logger) error
 			return err
 		}
 	}
+	if absent["gateway/atom-wan.nft"] {
+		if _, err := quietCmd("nft", "list", "table", "inet", "atom_wan"); err == nil {
+			if err := runCmd(log, 15*time.Second, "nft", "delete", "table", "inet", "atom_wan"); err != nil {
+				return err
+			}
+		}
+	}
 	init := ins.Paths.Init()
 	if err := init.Reload(log); err != nil {
 		return err
@@ -222,20 +321,30 @@ func (ins *Installer) restoreBackup(dir string, panelPort int, log Logger) error
 	return nil
 }
 
+const backupTimeFormat = "20060102-150405"
+
+var backupName = regexp.MustCompile(`^(?:reconfigure|dev|v?\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.+-]+)?)-(\d{8}-\d{6}(?:\.\d{9})?)$`)
+
+func backupPath(p Paths, prefix string) string {
+	return filepath.Join(p.Backup(), prefix+"-"+time.Now().Format(backupTimeFormat+".000000000"))
+}
+
 func pruneBackups(dir string, keep int) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
-	var names []string
+	type backup struct{ name, timestamp string }
+	var backups []backup
 	for _, e := range entries {
-		if e.IsDir() {
-			names = append(names, e.Name())
+		if stamp := backupName.FindStringSubmatch(e.Name()); e.IsDir() && stamp != nil {
+			if _, err := time.Parse(backupTimeFormat, stamp[1]); err == nil {
+				backups = append(backups, backup{e.Name(), stamp[1]})
+			}
 		}
 	}
-	sort.Strings(names)
-	for len(names) > keep {
-		os.RemoveAll(filepath.Join(dir, names[0]))
-		names = names[1:]
+	sort.SliceStable(backups, func(i, j int) bool { return backups[i].timestamp > backups[j].timestamp })
+	for _, backup := range backups[min(keep, len(backups)):] {
+		os.RemoveAll(filepath.Join(dir, backup.name))
 	}
 }

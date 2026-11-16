@@ -25,7 +25,10 @@ func freeResolvedStub(p Paths, log Logger) error {
 	if data, err := os.ReadFile(resolvedDropIn); err == nil && !strings.HasPrefix(string(data), resolvedMark) {
 		return fmt.Errorf("%s 已经存在，不是安装器写的；请手动处理 systemd-resolved", resolvedDropIn)
 	}
-	ch := loadChanges(p)
+	ch, err := loadChanges(p)
+	if err != nil {
+		return err
+	}
 	if target, err := os.Readlink("/etc/resolv.conf"); err == nil && strings.Contains(target, resolvedStubTarget) && ch.ResolvConfLink == "" {
 		ch.ResolvConfLink = target
 	}
@@ -33,7 +36,7 @@ func freeResolvedStub(p Paths, log Logger) error {
 	if err := saveChanges(p, ch); err != nil {
 		return err
 	}
-	err := func() error {
+	err = func() error {
 		if err := os.MkdirAll(filepath.Dir(resolvedDropIn), 0o755); err != nil {
 			return err
 		}
@@ -100,7 +103,10 @@ func freeUnit(p Paths, unit string, log Logger) error {
 		return fmt.Errorf("不能停用 %q", unit)
 	}
 	sd := systemdInit{}
-	ch := loadChanges(p)
+	ch, err := loadChanges(p)
+	if err != nil {
+		return err
+	}
 	known := false
 	for _, u := range ch.DisabledUnits {
 		known = known || u.Unit == unit
@@ -270,7 +276,10 @@ func freeOpenRCService(p Paths, svc string, log Logger) error {
 			return err
 		}
 	}
-	ch := loadChanges(p)
+	ch, err := loadChanges(p)
+	if err != nil {
+		return err
+	}
 	known := false
 	for _, u := range ch.DisabledUnits {
 		known = known || u.Unit == svc

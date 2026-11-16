@@ -22,7 +22,11 @@ func hasRecords(p Paths) bool {
 // When something the installer changed cannot be put back, the records and the program stay so that the
 // command can be run again once the cause is fixed.
 func uninstall(p Paths, purge bool, log Logger) error {
-	teardownNetwork(p, log)
+	ch, err := loadChanges(p)
+	if err != nil {
+		return err
+	}
+	teardownNetwork(p, ch, log)
 	if _, err := os.Stat(p.State()); err == nil { // the units are written after install.json
 		for _, f := range []string{p.DNSUnit(), p.SingBoxUnit()} {
 			os.Remove(f)
@@ -30,7 +34,6 @@ func uninstall(p Paths, purge bool, log Logger) error {
 		p.Init().Forget(log, dnsUnitName, singBoxUnitName)
 	}
 
-	ch := loadChanges(p)
 	var failed []string
 	if err := restoreResolved(p, ch, log); err != nil {
 		log.Logf("还原 systemd-resolved 失败：%v", err)
@@ -56,6 +59,9 @@ func uninstall(p Paths, purge bool, log Logger) error {
 		return fmt.Errorf("没有还原：%s。记录和程序都还在，处理好之后可以再运行一次 uninstall", strings.Join(failed, "、"))
 	}
 	if p.OpenRC {
+		if err := removeOpenRCLogRotation(p); err != nil {
+			return fmt.Errorf("移除日志轮转配置：%w", err)
+		}
 		os.RemoveAll(openRCLogDir) // logs are not data: gone with or without purge
 	}
 	if len(ch.PkgInstalled) > 0 {

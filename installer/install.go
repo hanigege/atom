@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -28,6 +30,7 @@ type Job struct {
 	steps    []stepState
 	log      []string
 	done     bool
+	finished time.Time
 	ok       bool
 	errMsg   string
 	warnings []string
@@ -102,12 +105,19 @@ func (j *Job) finish(err error, panel int) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.done = true
+	j.finished = time.Now()
 	j.ok = err == nil
 	if err != nil {
 		j.errMsg = err.Error()
 	} else {
 		j.panel = panel
 	}
+}
+
+func (j *Job) finishedAt() time.Time {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.finished
 }
 
 const defaultGroup = "g-default"
@@ -126,6 +136,10 @@ var installSteps = []string{"依赖", "程序", "配置", "网络", "启动", "�
 // runInstall performs the installation. A failure after the network files were written takes the live
 // network changes back (nft tables, policy routing, ip_forward) so the machine is left reachable.
 func (ins *Installer) runInstall(cfg Config, j *Job) {
+	if err := checkLegacyTor(ins.Paths); err != nil {
+		j.finish(err, 0)
+		return
+	}
 	hints := jobHints{Topology: cfg.Topology, FakeIPRange: cfg.FakeIPRange}
 	for _, i := range listInterfaces() {
 		if len(cfg.LAN) > 0 && i.Name == cfg.LAN[0] {
@@ -136,6 +150,7 @@ func (ins *Installer) runInstall(cfg Config, j *Job) {
 	j.hints = hints
 	j.mu.Unlock()
 	netStarted := false // a refusal before the network step leaves an earlier installation as it is
+	removeNewLogin := false
 	var rc *reconfigureRun
 	if ins.Reconfigure {
 		var err error
@@ -157,7 +172,16 @@ func (ins *Installer) runInstall(cfg Config, j *Job) {
 				netStarted = true
 				return ins.stepNetwork(cfg, j)
 			},
-			func() error { return ins.stepStart(cfg, j) },
+			func() error {
+				if !cfg.keepData && strings.TrimSpace(cfg.PanelUser) != "" && cfg.PanelPassword != "" {
+					_, err := os.Stat(filepath.Join(ins.Paths.Data(), "webinfo", "atom_auth.json"))
+					removeNewLogin = os.IsNotExist(err)
+					if err := ins.initPanelLogin(cfg); err != nil {
+						return err
+					}
+				}
+				return ins.stepStart(cfg, j)
+			},
 			func() error { return ins.stepSettings(cfg, j) },
 			func() error { return ins.stepCheck(cfg, j) },
 		}
@@ -181,9 +205,17 @@ func (ins *Installer) runInstall(cfg Config, j *Job) {
 			rc.restore(ins, j)
 		case netStarted:
 			ins.rollbackNetwork(j)
+			if removeNewLogin {
+				if err := os.Remove(filepath.Join(ins.Paths.Data(), "webinfo", "atom_auth.json")); err != nil && !os.IsNotExist(err) {
+					j.warn("清理面板登录设置失败：%v", err)
+				}
+			}
 		}
 		j.finish(err, 0)
 		return
+	}
+	if rc != nil {
+		pruneBackups(ins.Paths.Backup(), 3)
 	}
 	j.finish(nil, cfg.PanelPort)
 }
@@ -238,6 +270,10 @@ func missingDeps(alpine, needSysctl bool, haveBin func(string) bool, havePkg fun
 
 // ensureDeps installs what is missing and records it, so that it is known what the installer brought.
 func ensureDeps(p Paths, needSysctl bool, j Logger) error {
+	ch, err := loadChanges(p)
+	if err != nil {
+		return err
+	}
 	alpine := isAlpine()
 	need := missingDeps(alpine, needSysctl,
 		func(n string) bool { _, err := exec.LookPath(n); return err == nil },
@@ -261,7 +297,6 @@ func ensureDeps(p Paths, needSysctl bool, j Logger) error {
 			return err
 		}
 	}
-	ch := loadChanges(p)
 	for _, n := range need {
 		if !slices.Contains(ch.PkgInstalled, n) {
 			ch.PkgInstalled = append(ch.PkgInstalled, n)
@@ -277,9 +312,18 @@ func (ins *Installer) stepDeps(cfg Config, j *Job) error {
 // atom-installer first: once anything is installed, the uninstaller is there too.
 var installedBinaries = []string{"atom-installer", "atomdns", "sing-box"}
 
-func (ins *Installer) installBinaries(log Logger) error {
+func (ins *Installer) installBinaries(log Logger, retainInstaller bool) error {
 	for _, name := range installedBinaries {
 		src := filepath.Join(ins.PkgDir, "bin", name)
+		if retainInstaller && name == "atom-installer" {
+			// The freshly generated units call this installer's WAN hook,
+			// which a downgraded package may not implement.
+			var err error
+			src, err = os.Executable()
+			if err != nil {
+				return err
+			}
+		}
 		if err := copyFileAtomic(src, ins.Paths.Bin(name), 0o755); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
@@ -293,15 +337,19 @@ func (ins *Installer) stepBinaries(j *Job) error {
 		j.Logf("程序已经是 %s", ins.Version) // the upgrade that precedes a reconfigure installed them
 		return nil
 	}
-	return ins.installBinaries(j)
+	return ins.installBinaries(j, false)
 }
 
-func (ins *Installer) installData(panelPort int, log Logger) error {
+func (ins *Installer) refreshConfig(target string, panelPort int) error {
 	reload := ""
 	if ins.Paths.OpenRC {
 		reload = ins.Paths.Lib("reload-sing-box.sh")
 	}
-	if err := refreshData(filepath.Join(ins.PkgDir, "config"), ins.Paths.Data(), panelPort, reload); err != nil {
+	return refreshData(filepath.Join(ins.PkgDir, "config"), target, panelPort, reload)
+}
+
+func (ins *Installer) installData(panelPort int, log Logger) error {
+	if err := ins.refreshConfig(ins.Paths.Data(), panelPort); err != nil {
 		return fmt.Errorf("配置: %w", err)
 	}
 	log.Logf("配置 → %s", ins.Paths.Data())
@@ -325,15 +373,23 @@ func (ins *Installer) writeNetworkFiles(st *InstallState, log Logger) error {
 		return err
 	}
 	if st.Topology == "gateway" {
-		gw, err := renderGatewayNft(st.LAN, st.WAN, st.PanelPort)
+		gw, err := renderGatewayNft(st.LAN, st.WAN)
 		if err != nil {
 			return err
 		}
 		if err := writeFileAtomic(p.Etc("atom-gateway.nft"), []byte(gw), 0o644); err != nil {
 			return err
 		}
+		wan, err := renderWANNft(st.WAN, st.PanelPort)
+		if err != nil {
+			return err
+		}
+		if err := writeFileAtomic(p.Etc("atom-wan.nft"), []byte(wan), 0o644); err != nil {
+			return err
+		}
 	} else {
 		os.Remove(p.Etc("atom-gateway.nft"))
+		os.Remove(p.Etc("atom-wan.nft"))
 	}
 	var reply *ClientRoute
 	replyDev := ""
@@ -348,7 +404,7 @@ func (ins *Installer) writeNetworkFiles(st *InstallState, log Logger) error {
 	if err := writeFileAtomic(p.Lib("policy-route.sh"), []byte(pr), 0o755); err != nil {
 		return err
 	}
-	for _, f := range []string{"atom.nft", "atom-gateway.nft"} {
+	for _, f := range []string{"atom.nft", "atom-gateway.nft", "atom-wan.nft"} {
 		if _, err := os.Stat(p.Etc(f)); err != nil {
 			continue
 		}
@@ -359,6 +415,9 @@ func (ins *Installer) writeNetworkFiles(st *InstallState, log Logger) error {
 	dnsDef, sbDef := renderDNSUnit, renderSingBoxUnit
 	if p.OpenRC {
 		dnsDef, sbDef = renderDNSInit, renderSingBoxInit
+		if err := configureOpenRCLogs(p, log); err != nil {
+			return fmt.Errorf("配置日志轮转：%w", err)
+		}
 		if err := writeFileAtomic(p.Lib("reload-sing-box.sh"), []byte(renderReloadScript()), 0o755); err != nil {
 			return err
 		}
@@ -432,7 +491,11 @@ func (ins *Installer) checkRouteTable(cfg Config) error {
 	}
 	if cfg.Topology == "bypass" && cfg.ReplyVia {
 		routes := tableRoutes(quietCmd("ip", "route", "show", "table", replyTable))
-		if c := replyConflict(rules, routes, loadChanges(ins.Paths).Reply); c != "" {
+		ch, err := loadChanges(ins.Paths)
+		if err != nil {
+			return err
+		}
+		if c := replyConflict(rules, routes, ch.Reply); c != "" {
 			return fmt.Errorf("策略路由表 %s 已经被其他配置使用（%s），安装器不会动它", replyTable, c)
 		}
 	}
@@ -455,7 +518,10 @@ func (ins *Installer) stepNetwork(cfg Config, j *Job) error {
 	if old, err := loadState(ins.Paths); err == nil { // a reconfigure keeps what the first installation recorded
 		st.InstalledAt, st.Complete = old.InstalledAt, old.Complete
 	}
-	ch := loadChanges(ins.Paths)
+	ch, err := loadChanges(ins.Paths)
+	if err != nil {
+		return err
+	}
 	if st.ReplyVia != "" {
 		if ch.RedirectsBefore == nil {
 			ch.RedirectsBefore = map[string]string{}
@@ -553,7 +619,6 @@ func (ins *Installer) stepSettings(cfg Config, j *Job) error {
 		setLogin(api, cfg, j)
 		return nil
 	}
-	defer setLogin(api, cfg, j)
 	warn := func(what string, err error) { j.warn("%s 没有应用（可以在面板里改）：%v", what, err) }
 	for _, g := range []struct {
 		tag, what, text string
@@ -607,7 +672,20 @@ func (ins *Installer) stepSettings(cfg Config, j *Job) error {
 	return nil
 }
 
-// setLogin sets the panel login the wizard was given (last: from then on every request needs the key).
+func (ins *Installer) initPanelLogin(cfg Config) error {
+	data, err := json.Marshal(map[string]string{"username": cfg.PanelUser, "password": cfg.PanelPassword})
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(ins.Paths.Bin("atomdns"), "set-panel-login", ins.Paths.Data())
+	cmd.Stdin = bytes.NewReader(data)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("设置面板登录：%w（%s）", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// setLogin updates the running panel during reconfiguration or retained-data installation.
 func setLogin(api *apiClient, cfg Config, j *Job) {
 	if cfg.PanelLoginOff {
 		if err := api.call("DELETE", "/auth", map[string]any{}, nil); err != nil {
@@ -730,12 +808,18 @@ func lookupVia(server, name string) ([]net.IP, error) {
 
 // rollbackNetwork takes the live network changes back after a failed installation (files stay, so a retry or
 // the uninstaller finds them). It does nothing when the installer has not changed the network.
-func (ins *Installer) rollbackNetwork(log Logger) { teardownNetwork(ins.Paths, log) }
+func (ins *Installer) rollbackNetwork(log Logger) {
+	ch, err := loadChanges(ins.Paths)
+	if err != nil {
+		log.Logf("无法撤销网络：%v", err)
+		return
+	}
+	teardownNetwork(ins.Paths, ch, log)
+}
 
 // teardownNetwork stops the services and removes nft tables, policy routing and ip_forward changes, when the
 // record says they are the installer's, and then clears that record.
-func teardownNetwork(p Paths, log Logger) {
-	ch := loadChanges(p)
+func teardownNetwork(p Paths, ch *Changes, log Logger) {
 	if !ch.Network {
 		log.Logf("网络部分不是安装器装的（或已经撤销），不动")
 		return
@@ -750,6 +834,7 @@ func teardownNetwork(p Paths, log Logger) {
 		log.Logf("  （忽略）%v", err)
 	}
 	ignore("nft", "delete", "table", "inet", "atom")
+	ignore("nft", "delete", "table", "inet", "atom_wan")
 	ignore("nft", "delete", "table", "ip", "atom_nat")
 	ignore("ip", "rule", "del", "fwmark", fwmark, "lookup", routeTable, "priority", routePriority)
 	ignore("ip", "route", "flush", "table", routeTable)
@@ -772,6 +857,9 @@ func teardownNetwork(p Paths, log Logger) {
 
 // undoGateway takes back what the dual-NIC gateway added: the NAT table and the ip_forward value.
 func undoGateway(ch *Changes, log Logger) {
+	if err := runCmd(log, 30*time.Second, "nft", "delete", "table", "inet", "atom_wan"); err != nil {
+		log.Logf("  （忽略）%v", err)
+	}
 	if err := runCmd(log, 30*time.Second, "nft", "delete", "table", "ip", "atom_nat"); err != nil {
 		log.Logf("  （忽略）%v", err)
 	}

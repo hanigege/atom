@@ -5,8 +5,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -41,6 +44,16 @@ func main() {
 		os.Exit(cmdServe(args))
 	case "urls":
 		os.Exit(cmdURLs())
+	case "protect-wan":
+		fs := flag.NewFlagSet("protect-wan", flag.ExitOnError)
+		paths := defaultPaths()
+		fs.StringVar(&paths.Root, "root", paths.Root, "installation root")
+		start := fs.Bool("start", false, "replace old port protections before sing-box starts")
+		fs.Parse(args)
+		if err := protectWAN(paths, *start); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	case "upgrade":
 		os.Exit(cmdUpgrade(args))
 	case "uninstall":
@@ -70,8 +83,9 @@ func newInstaller(pkg string) (*Installer, error) {
 }
 
 type listenInfo struct {
-	Port int `json:"port"`
-	PID  int `json:"pid"`
+	Port int    `json:"port"`
+	PID  int    `json:"pid"`
+	Code string `json:"code"`
 }
 
 func cmdServe(args []string) int {
@@ -99,19 +113,30 @@ func cmdServe(args []string) int {
 		return 1
 	}
 	ins.InstallerPort = ln.Addr().(*net.TCPAddr).Port
+	defer ln.Close()
+	n, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	li := listenInfo{Port: ins.InstallerPort, PID: os.Getpid(), Code: fmt.Sprintf("%06d", n.Int64())}
 	runFile := ins.Paths.Run("installer.json")
-	if err := writeJSON(runFile, listenInfo{ins.InstallerPort, os.Getpid()}); err != nil {
+	data, err := json.MarshalIndent(li, "", "  ")
+	if err == nil {
+		err = writeFileAtomic(runFile, data, 0o600)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	defer os.Remove(runFile)
 
-	s := newServer(ins)
+	s := newServer(ins, li.Code)
 	srv := &http.Server{Handler: s.handler(), ReadHeaderTimeout: 10 * time.Second}
 	go srv.Serve(ln)
 	go s.watchIdle()
-	for _, u := range wizardURLs(ins.InstallerPort) {
-		fmt.Println(u)
+	if os.Getenv("ATOM_WIZARD_BACKGROUND") != "1" {
+		printWizardAccess(li)
 	}
 	<-s.quit
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -137,10 +162,17 @@ func cmdURLs() int {
 		fmt.Fprintln(os.Stderr, "the wizard is not running")
 		return 1
 	}
+	printWizardAccess(li)
+	return 0
+}
+
+func printWizardAccess(li listenInfo) {
 	for _, u := range wizardURLs(li.Port) {
 		fmt.Println(u)
 	}
-	return 0
+	if li.Code != "" {
+		fmt.Printf("\n=======================================\n  安装码  %s\n  请在浏览器输入此码。仅本次启动有效。\n=======================================\n", li.Code)
+	}
 }
 
 type stdoutLogger struct{}

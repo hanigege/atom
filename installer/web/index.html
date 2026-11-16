@@ -234,8 +234,11 @@ pre.out{margin:0 6px 6px;background:var(--log);color:var(--log-ink);border-radiu
 <div class="page"><div class="frame" id="app"><div class="boot"><span class="spin"></span></div></div></div>
 <script>
 const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let installCode = '';
 async function api(method, path, body) {
-  const r = await fetch(path, { method, headers: method === 'GET' ? undefined : { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const headers = { 'X-Atom-Install-Code': installCode };
+  if (method !== 'GET') headers['Content-Type'] = 'application/json';
+  const r = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
   let data = null;
   try { data = await r.json(); } catch (e) {}
   if (!r.ok) { const err = new Error((data && data.error) || ('HTTP ' + r.status)); err.data = data; throw err; }
@@ -687,16 +690,37 @@ function prefillRoutes() {
   c.client_nets = rs.filter(r => r.via === c.lan_gateway).map(r => r.net).join('\n');
 }
 
-(async function () {
+async function startWizard() {
+  await loadState();
+  const j = await api('GET', '/api/job?since=0');
+  if (!j.idle) { S.phase = 'progress'; S.job = j; S.log = j.log; S.jobNext = j.next; render(); if (j.done && j.ok) { S.phase = 'done'; render(); watchPanel(); } else if (!j.done) pollJob(); else render(); return; }
+  render();
+}
+
+const app = document.getElementById('app');
+app.innerHTML = `<section class="body"><div class="content">
+  <h1>输入安装码</h1>
+  <p>请查看启动安装器的终端。安装码就在网址下方。</p>
+  <form id="unlockWizard">
+    <label for="installCode">6 位数字安装码</label>
+    <input id="installCode" class="short" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" required autofocus>
+    <button class="btn pri" type="submit">继续</button>
+    <p id="unlockError" role="alert"></p>
+  </form>
+</div></section>`;
+document.getElementById('unlockWizard').onsubmit = async e => {
+  e.preventDefault();
+  const button = e.currentTarget.querySelector('button');
+  button.disabled = true;
+  installCode = document.getElementById('installCode').value;
   try {
-    await loadState();
-    const j = await api('GET', '/api/job?since=0');
-    if (!j.idle) { S.phase = 'progress'; S.job = j; S.log = j.log; S.jobNext = j.next; render(); if (j.done && j.ok) { S.phase = 'done'; render(); watchPanel(); } else if (!j.done) pollJob(); else render(); return; }
-    render();
-  } catch (e) {
-    document.getElementById('app').innerHTML = `<section class="body"><div class="content"><div class="alert bad">${I.warn}<div class="grow">${esc(e.message)}</div></div></div></section>`;
+    await startWizard();
+  } catch (error) {
+    installCode = '';
+    document.getElementById('unlockError').textContent = error.message;
+    button.disabled = false;
   }
-})();
+};
 </script>
 </body>
 </html>
