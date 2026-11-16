@@ -14,12 +14,12 @@ AtomDNS 决定域名走哪个出口，把结果放在发给 sing-box FakeIP DNS 
 |---|---|
 | `adapter/inbound.go` | `InboundContext` 增加 `FakeIPOutbound` |
 | `adapter/fakeip.go` | `FakeIPStore` 增加 `StoreOutbound`/`LookupOutbound`，`FakeIPStorage` 增加 `FakeIPStoreOutbound`/`FakeIPLoadOutbound` |
-| `dns/transport/fakeip/fakeip.go` | 解析 EDNS0 65001，在分配或复用地址前更新绑定；绑定保存失败时这次查询报错；写绑定和分配地址在一把锁里做完（`bindAccess`） |
+| `dns/transport/fakeip/fakeip.go` | 解析 EDNS0 65001，在分配或复用地址前更新绑定；绑定保存失败时这次查询报错；写绑定和分配地址在一把锁里做完（`bindAccess`）；已有地址且绑定未变化的查询直接返回 |
 | `dns/transport/fakeip/store.go` | 绑定读写转发到存储；地址被回收给别的域名时删掉旧域名的绑定（`dropReclaimedOutbound`） |
 | `dns/transport/fakeip/memory.go` | 内存存储增加 `outboundCache`，`FakeIPReset` 一并清空 |
 | `experimental/cachefile/fakeip.go` | 新 bucket `fakeip_outbound`，`FakeIPReset` 一并删除 |
 | `cmd/sing-box/cmd_run.go` | 重载循环提成 `runLoop`；新配置启动失败时用上一份配置重建实例，进程不退出（见下文） |
-| `experimental/clashapi/cache.go` | `/cache/fakeip/flush` 经 FakeIP store 的 `Reset()` 清（拿同一把锁），不再绕过它直接清 cache file；store 不用 cache file 时照上游另清 cache file（2026-11-12，codex 第 3 轮） |
+| `experimental/clashapi/cache.go` | `/cache/fakeip/flush` 经 FakeIP store 的 `Reset()` 清（拿同一把锁），不再绕过它直接清 cache file；store 不用 cache file 时照上游另清 cache file；经鉴权的 `POST /cache/fakeip/group/{group}/final` 迁移已删除组的绑定 |
 | `route/route.go` | 还原 FakeIP 时查绑定；FakeIP 连接一律跳过 `route.rules`：有绑定时 TCP/UDP 严格按标签选出口，没有绑定走 `route.final`，PreMatch 交回常规路径；`resolve` 动作解析出 FakeIP 时按域名查绑定（`resolvedToFakeIP`，见下文"代理入站"） |
 
 上游 v1.14.4 已经对 FakeIP transport 关闭了 DNS client 缓存（`dns/router.go` 中 `isFakeIP` 时 `DisableCache = true`），所以不需要 PR15 契约里对 `dns/client.go` 的改动。
@@ -43,10 +43,10 @@ AtomDNS 决定域名走哪个出口，把结果放在发给 sing-box FakeIP DNS 
   - 没有绑定（CLEAR 过，或从没带过指令）：直接走 `route.final`。原来（到 `e7b78640`）没有绑定的连接照常走 `route.rules` 和 `route.final`，一条能匹配它的路由规则（比如端口规则）会把它截走；2026-11-12 用户定为不参与（atom design.md 3.3）。mixed 入站的 `resolvedToFakeIP` 本来就是这样，三个入口现在一致。
   - 所以 atom 生成的 IP、端口、网络规则只对真实 IP 的连接生效。
 - 已建立的连接不会因为绑定变化而迁移。
-- 规则变化后，AtomDNS 的绑定账本会主动给有变化的域名发 SET 或 CLEAR（不用等客户端重新查询，见 [design.md](design.md) 4.5.1）；sing-box 这边不用改。
+- 规则变化后，AtomDNS 在后台给有变化的域名发 SET 或 CLEAR（见 [design.md](design.md) 4.5.1）。删组时，sing-box 确认组已从运行配置移除，再把指向该组的绑定迁到 Final。迁移保留域名和 FakeIP 地址，发往已删组的迟到 SET 会报错。
 - 绑定写失败时（比如 cache file 写不进去），这次查询不返回应答（报错，客户端看到的是 SERVFAIL 或超时），已有绑定保持不变。原来是只记 warning、照常应答，但 AtomDNS 的绑定账本把正常应答当作"绑定已生效"，之后不会再发；改成报错后，账本保留旧值，下次重算再发（atom 第 5 步 codex 第 2 轮复审后改）。不带指令的查询不受影响。
 - 开启 `experimental.cache_file` 的 `store_fakeip` 后，绑定可以跨重启保留。
-- 地址回收（2026-11-12）：FakeIP 地址池循环复用、把某个地址分给新域名时，删掉原来占着这个地址的旧域名的绑定（内存和 cache file 都一样）。只删映射到这个地址的旧域名；旧域名还有另一族的地址（A 和 AAAA 共用一个绑定）时不删。为了不误删正在写的绑定，FakeIP DNS 处理一次查询时，写绑定和分配地址在同一把锁里做完：否则另一个查询可能在"旧域名刚写好 SET"和"旧域名重新分配地址"之间回收它的地址、删掉刚写的绑定，旧域名就会拿着地址却没有绑定（走 Final 而不是规则指定的组）。代价是 FakeIP DNS 的查询串行处理；所以和现有绑定一样的指令（大多数是给没有绑定的域名发 CLEAR）不再写存储，cache file 的事务只发生在绑定真的变化时（2026-11-12 自查后改，`TestUnchangedBindingIsNotWritten`）。清空（`Store.Reset()`，包括 Clash API 的 `/cache/fakeip/flush`）也拿这把锁，不会落在一次查询的"写绑定"和"分配地址"之间。原来 flush 直接清 cache file；现在没开 `store_fakeip` 时 flush 也会清内存里的映射和绑定（atom 一直开着）。旧域名的客户端下一次查询时，AtomDNS 照常带指令（代理规则的查询不经过缓存），绑定随新地址重建；AtomDNS 的绑定账本不知道这次删除，账本里的旧值最多让下一次重算少发一次相同的指令，不影响新查询。
+- 地址回收（2026-11-12）：FakeIP 地址池循环复用、把某个地址分给新域名时，删掉原来占着这个地址的旧域名的绑定（内存和 cache file 都一样）。只删映射到这个地址的旧域名；旧域名还有另一族的地址（A 和 AAAA 共用一个绑定）时不删。为了不误删正在写的绑定，FakeIP DNS 处理一次查询时，写绑定和分配地址在同一把锁里做完：否则另一个查询可能在"旧域名刚写好 SET"和"旧域名重新分配地址"之间回收它的地址、删掉刚写的绑定，旧域名就会拿着地址却没有绑定（走 Final 而不是规则指定的组）。需要修改绑定或分配地址的查询串行处理。已有地址且无需修改绑定的查询直接用存储的同一份快照返回。只有绑定发生变化才用 `Update` 直接提交绑定写入，省去 `Batch` 的等待时间。清空（`Store.Reset()`，包括 Clash API 的 `/cache/fakeip/flush`）也拿这把锁，不会落在一次查询的"写绑定"和"分配地址"之间。原来 flush 直接清 cache file；现在没开 `store_fakeip` 时 flush 也会清内存里的映射和绑定（atom 一直开着）。旧域名的客户端下一次查询时，AtomDNS 照常带指令（代理规则的查询不经过缓存），绑定随新地址重建；AtomDNS 的绑定账本不知道这次删除，账本里的旧值最多让下一次重算少发一次相同的指令，不影响新查询。
 
 ## 代理入站（mixed 7890）
 
