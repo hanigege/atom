@@ -59,6 +59,20 @@ func main() {
 		os.Exit(cmdUpgrade(args))
 	case "uninstall":
 		os.Exit(cmdUninstall(args))
+	case "maintenance", "apply-panel-upgrade", "update-public-key", "sign-update":
+		var err error
+		switch os.Args[1] {
+		case "maintenance":
+			err = serveMaintenance(defaultPaths())
+		case "apply-panel-upgrade":
+			err = cmdApplyPanelUpgrade(args)
+		default:
+			err = releaseSigningCommand(os.Args[1], args)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	case "version":
 		fmt.Println(version)
 	default:
@@ -99,6 +113,15 @@ func cmdServe(args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
+	}
+	lock, err := cliOperationLock(ins.Paths)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer lock.Close()
+	if ins.Paths.managedPackage(ins.PkgDir) && ins.PkgDir != ins.Paths.Pkg() {
+		defer os.RemoveAll(ins.PkgDir)
 	}
 	ins.Reconfigure = *reconf
 	if st, err := loadState(ins.Paths); *reconf && (err != nil || !st.Complete) {
@@ -186,16 +209,21 @@ func cmdUpgrade(args []string) int {
 	force := fs.Bool("force", false, "upgrade to the same or an older version")
 	keep := fs.Bool("keep-pkg", false, "leave the unpacked package (a reconfigure uses it next)")
 	fs.Parse(args)
-	cleanup := func() {
-		if !*keep {
-			os.RemoveAll(defaultPaths().Pkg())
-		}
-	}
 	ins, err := newInstaller(*pkg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	lock, err := cliOperationLock(ins.Paths)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer lock.Close()
+	if !*keep && ins.Paths.managedPackage(ins.PkgDir) {
+		defer os.RemoveAll(ins.PkgDir)
+	}
+
 	st, err := loadState(ins.Paths)
 	if err != nil || !st.Complete {
 		fmt.Fprintln(os.Stderr, "没有已完成的安装；先安装")
@@ -204,18 +232,25 @@ func cmdUpgrade(args []string) int {
 	switch c := compareVersions(ins.Version, st.Version); {
 	case c == 0 && !*force:
 		fmt.Printf("已经是 %s\n", st.Version)
-		cleanup()
+		if ins.Paths.Init().IsActive(maintenanceUnitName) != "active" {
+			if err := ins.Paths.enableMaintenance(stdoutLogger{}); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+		}
 		return 0
 	case c < 0 && !*force:
 		fmt.Fprintf(os.Stderr, "包的版本 %s 比已装的 %s 旧；要降级请加 --force\n", ins.Version, st.Version)
-		cleanup()
 		return 1
 	}
 	fmt.Printf("升级 %s → %s\n", st.Version, ins.Version)
 	err = ins.upgrade(st, stdoutLogger{})
-	cleanup()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "升级失败：", err)
+		return 1
+	}
+	if err := ins.Paths.enableMaintenance(stdoutLogger{}); err != nil {
+		fmt.Fprintln(os.Stderr, "启动面板维护服务失败：", err)
 		return 1
 	}
 	fmt.Printf("升级完成，面板端口 %d\n", st.PanelPort)
@@ -244,6 +279,12 @@ func cmdUninstall(args []string) int {
 			return 1
 		}
 	}
+	lock, err := cliOperationLock(p)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer lock.Close()
 	if err := uninstall(p, *purge, stdoutLogger{}); err != nil {
 		fmt.Fprintln(os.Stderr, "卸载时有错误：", err)
 		return 1

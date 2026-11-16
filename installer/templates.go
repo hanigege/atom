@@ -190,6 +190,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Environment="ATOM_MAINTENANCE_SOCKET=%[4]s"
 %[1]sExecStart=%[2]s start -d %[3]s -c config_custom.yaml
 Restart=on-failure
 RestartSec=2
@@ -197,7 +198,7 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-`, pre.String(), p.Bin("atomdns"), p.Data())
+`, pre.String(), p.Bin("atomdns"), p.Data(), p.Run(maintenanceSocket))
 }
 
 // renderSingBoxUnit is design 6: started and reloaded by atomdns (systemctl reload-or-restart).
@@ -251,6 +252,7 @@ description="atom DNS"
 supervisor=supervise-daemon
 command=%[2]s
 command_args="start -d %[3]s -c config_custom.yaml"
+export ATOM_MAINTENANCE_SOCKET=%[5]q
 respawn_delay=2
 respawn_max=0
 rc_ulimit="-n 1048576"
@@ -265,7 +267,7 @@ depend() {
 start_pre() {
 	checkpath -d -m 0755 %[4]s
 %[1]s}
-`, pre.String(), p.Bin("atomdns"), p.Data(), openRCLogDir)
+`, pre.String(), p.Bin("atomdns"), p.Data(), openRCLogDir, p.Run(maintenanceSocket))
 }
 
 // renderSingBoxInit is renderSingBoxUnit for OpenRC: reload sends SIGHUP; without config.json it does not start.

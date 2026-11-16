@@ -58,6 +58,14 @@ type apiStatus struct {
 
 // call does one request. A 409 or 503 means a configuration is being published: it is retried a few times.
 func (a *apiClient) call(method, path string, body, out any) error {
+	return a.callAttempts(method, path, body, out, 6)
+}
+
+func (a *apiClient) callOnce(method, path string, body, out any) error {
+	return a.callAttempts(method, path, body, out, 1)
+}
+
+func (a *apiClient) callAttempts(method, path string, body, out any, attempts int) error {
 	var payload []byte
 	if body != nil {
 		var err error
@@ -66,7 +74,7 @@ func (a *apiClient) call(method, path string, body, out any) error {
 		}
 	}
 	var last error
-	for attempt := 0; attempt < 6; attempt++ {
+	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
 			time.Sleep(2 * time.Second)
 		}

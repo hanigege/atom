@@ -195,11 +195,21 @@ func (ins *Installer) runInstall(cfg Config, j *Job) {
 		}
 		return nil
 	}()
+	maintenanceStarted := false
+	if err == nil && rc == nil {
+		maintenanceStarted = true
+		err = ins.Paths.enableMaintenance(j)
+	}
 	if err == nil {
 		err = ins.finalize()
 	}
 	if err != nil {
 		j.Logf("安装失败：%v", err)
+		if maintenanceStarted {
+			if cleanupErr := ins.Paths.removeMaintenance(j); cleanupErr != nil {
+				j.warn("清理维护服务失败：%v", cleanupErr)
+			}
+		}
 		switch {
 		case rc != nil:
 			rc.restore(ins, j)

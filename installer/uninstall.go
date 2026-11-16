@@ -26,6 +26,9 @@ func uninstall(p Paths, purge bool, log Logger) error {
 	if err != nil {
 		return err
 	}
+	if err := p.removeMaintenance(log); err != nil {
+		return err
+	}
 	teardownNetwork(p, ch, log)
 	if _, err := os.Stat(p.State()); err == nil { // the units are written after install.json
 		for _, f := range []string{p.DNSUnit(), p.SingBoxUnit()} {

@@ -219,14 +219,17 @@ func (ins *Installer) backupItems() []backupItem {
 		{path: filepath.Join(p.Root, "bin"), name: "bin"},
 		{path: filepath.Join(p.Root, "etc"), name: "etc"},
 		{path: p.Etc("atom-wan.nft"), name: "gateway/atom-wan.nft", file: true},
+		{path: p.Etc("atom-gateway.nft"), name: "gateway/atom-gateway.nft", file: true},
 		{path: filepath.Join(p.Root, "lib"), name: "lib"},
 		{path: filepath.Join(p.Data(), "sub_config"), name: "data/sub_config", exact: true},
 		{path: filepath.Join(p.Data(), "ui", "main"), name: "data/ui/main", exact: true},
 		{path: filepath.Join(p.Data(), "config_custom.yaml"), name: "data/config_custom.yaml", file: true},
+		{path: filepath.Join(p.Data(), "sing-box", "config.json"), name: "data/sing-box/config.json", file: true, mode: 0o600},
 		{path: filepath.Join(p.Data(), "rule", "atom_catalog.json"), name: "data/rule/atom_catalog.json", file: true},
 		{path: filepath.Join(p.Data(), "webinfo", "atom_auth.json"), name: "data/webinfo/atom_auth.json", file: true, mode: 0o600}, // the panel login: a failed reconfigure puts it back
 		{path: p.DNSUnit(), name: "units/" + filepath.Base(p.DNSUnit()), file: true, mode: p.unitMode()},
 		{path: p.SingBoxUnit(), name: "units/" + filepath.Base(p.SingBoxUnit()), file: true, mode: p.unitMode()},
+		{path: p.unitFile(maintenanceUnitName), name: "units/" + filepath.Base(p.unitFile(maintenanceUnitName)), file: true, mode: p.unitMode()},
 	}
 	if p.OpenRC {
 		items = append(items, backupItem{path: p.logrotateConfig(), name: "logrotate/atom-installer", file: true})
@@ -237,16 +240,16 @@ func (ins *Installer) backupItems() []backupItem {
 const absentList = "absent.txt"
 
 func (ins *Installer) makeBackup(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
 	var absent []string
-	defer func() {
-		if len(absent) > 0 {
-			os.WriteFile(filepath.Join(dir, absentList), []byte(strings.Join(absent, "\n")+"\n"), 0o644)
-		}
-	}()
 	for _, it := range ins.backupItems() {
-		if _, err := os.Stat(it.path); err != nil {
+		if _, err := os.Stat(it.path); os.IsNotExist(err) {
 			absent = append(absent, it.name)
 			continue
+		} else if err != nil {
+			return err
 		}
 		var err error
 		if it.file {
@@ -262,7 +265,7 @@ func (ins *Installer) makeBackup(dir string) error {
 			return err
 		}
 	}
-	return nil
+	return writeFileAtomic(filepath.Join(dir, absentList), []byte(strings.Join(absent, "\n")+"\n"), 0o644)
 }
 
 func (ins *Installer) restoreBackup(dir string, panelPort int, log Logger) error {
@@ -274,11 +277,19 @@ func (ins *Installer) restoreBackup(dir string, panelPort int, log Logger) error
 	}
 	for _, it := range ins.backupItems() {
 		src := filepath.Join(dir, it.name)
-		if _, err := os.Stat(src); err != nil {
-			if absent[it.name] && (it.file || it.exact) {
-				os.RemoveAll(it.path) // the failed upgrade created it
+		if _, err := os.Stat(src); os.IsNotExist(err) {
+			if !absent[it.name] {
+				// An older backup may not have tracked this item.
+				continue
+			}
+			if it.file || it.exact {
+				if err := os.RemoveAll(it.path); err != nil {
+					return err
+				}
 			}
 			continue
+		} else if err != nil {
+			return err
 		}
 		var err error
 		if it.file {
@@ -289,7 +300,9 @@ func (ins *Installer) restoreBackup(dir string, panelPort int, log Logger) error
 			err = copyFileAtomic(src, it.path, mode)
 		} else {
 			if it.exact {
-				os.RemoveAll(it.path)
+				if err := os.RemoveAll(it.path); err != nil {
+					return err
+				}
 			}
 			err = copyTree(src, it.path)
 		}
@@ -308,10 +321,13 @@ func (ins *Installer) restoreBackup(dir string, panelPort int, log Logger) error
 	if err := init.Reload(log); err != nil {
 		return err
 	}
-	if err := init.Restart(log, dnsUnitName); err != nil {
-		return err
+	// Bring the backed-up generated proxy config up before DNS reconciles it.
+	if _, err := os.Stat(filepath.Join(ins.Paths.Data(), "sing-box", "config.json")); err == nil {
+		if err := init.Restart(log, singBoxUnitName); err != nil {
+			return err
+		}
 	}
-	if err := init.Restart(log, singBoxUnitName); err != nil {
+	if err := init.Restart(log, dnsUnitName); err != nil {
 		return err
 	}
 	if _, err := newAPIClient(panelPort, ins.Paths.Data()).waitStatus(60*time.Second, func(s *apiStatus) bool { return s.SingBox.Running && s.SingBox.InSync }); err != nil {

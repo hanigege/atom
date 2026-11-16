@@ -63,12 +63,13 @@ func (p Paths) unitMode() os.FileMode {
 }
 
 const (
-	dnsUnitName     = "atom-dns.service"
-	singBoxUnitName = "atom-sing-box.service"
-	defaultPort     = 9996
-	fwmark          = "0x233"
-	routeTable      = "233"
-	routePriority   = "9233"
+	maintenanceUnitName = "atom-maintenance.service"
+	dnsUnitName         = "atom-dns.service"
+	singBoxUnitName     = "atom-sing-box.service"
+	defaultPort         = 9996
+	fwmark              = "0x233"
+	routeTable          = "233"
+	routePriority       = "9233"
 	// the single-NIC option that sends the answers to the LAN through the main router (deploy-nft.md 3.4)
 	replyMark     = "0x234"
 	replyTable    = "234"

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -143,8 +144,14 @@ func (s *Server) handler() http.Handler {
 func writeResp(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
+	data, err := json.Marshal(v)
+	if err != nil {
+		http.Error(w, "cannot encode response", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(data)
 }
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
@@ -429,8 +436,8 @@ func (s *Server) stop(cleanup bool) {
 			s.mu.Lock()
 			ok := s.job != nil && s.job.view(0).OK
 			s.mu.Unlock()
-			if ok {
-				os.RemoveAll(s.ins.Paths.Pkg())
+			if ok && s.ins.Paths.managedPackage(s.ins.PkgDir) {
+				os.RemoveAll(s.ins.PkgDir)
 			}
 		}
 		close(s.quit)

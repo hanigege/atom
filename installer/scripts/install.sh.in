@@ -8,7 +8,7 @@
 # of its own (Docker and LXC containers are refused). The package is picked by architecture and libc
 # (Debian/Ubuntu: glibc, Alpine: musl). On Alpine run it with bash: apk add bash curl && curl -fsSL <address> | bash
 # It downloads the matching atom package (GitHub first, then the accelerators below when GitHub is
-# slow or not reachable), unpacks it under /opt/atom and starts the installation wizard, whose address
+# slow or not reachable), unpacks it into a private staging directory under /opt/atom and starts the installation wizard, whose address
 # it prints.
 #
 # Environment (all optional):
@@ -137,10 +137,7 @@ installed_version() { sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$ROOT/etc/ins
 # Edit this text for each version.
 upgrade_news() {
   say ""
-  say "本版本新增，升级不会改动你的设置，需要「重新配置」才能开启："
-  say "  · 单网卡旁路由的「回包经主路由」"
-  say "  · 在向导里设置面板登录（也可以在面板的设置页里设）"
-  say "重新配置：再运行同一条命令，选 2。"
+  say "后续升级与网络调整可在 Atom 面板的设置页完成。"
 }
 
 ACTION=""
@@ -179,7 +176,15 @@ if grep -qs '"complete": true' "$ROOT/etc/install.json"; then
 fi
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+PKG=""
+WIZARD_OWNS_PKG=""
+cleanup() {
+  rm -rf "$TMP"
+  if [ -n "$PKG" ] && [ -z "$WIZARD_OWNS_PKG" ]; then
+    rm -rf "$PKG"
+  fi
+}
+trap cleanup EXIT
 PKGFILE="$TMP/$ASSET"
 
 fetch() { # url dest: gives up when the connection takes 6s or the speed stays under 50 KB/s for 10s
@@ -213,10 +218,9 @@ else
   download || die "所有来源都下载失败。可以设置 ATOM_MIRRORS（加速前缀）或 ATOM_PKG（本地包或地址）后重试"
 fi
 
-PKG="$ROOT/pkg"
 stop_wizard
-rm -rf "$PKG"
-mkdir -p "$PKG"
+mkdir -p "$ROOT"
+PKG="$(mktemp -d "$ROOT/pkg.XXXXXX")"
 tar -xzf "$PKGFILE" -C "$PKG" --strip-components=1 || die "解包失败"
 [ -x "$PKG/bin/atom-installer" ] || die "包里没有 atom-installer"
 
@@ -259,6 +263,7 @@ for _ in $(seq 1 40); do
 done
 [ -s "$ROOT/run/installer.json" ] || die "安装器没有起来，查看：$([ "$INIT" = systemd ] && echo "journalctl -u atom-installer" || echo "$ROOT/run/installer.log")"
 
+WIZARD_OWNS_PKG=1
 say ""
 say "atom 安装器已就绪，请在浏览器打开："
 "$PKG/bin/atom-installer" urls | sed 's/^/  /'

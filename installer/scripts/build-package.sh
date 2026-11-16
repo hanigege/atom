@@ -5,7 +5,7 @@
 #
 #   installer/scripts/build-package.sh --version 0.1.0 --atomdns-dir DIR \
 #       [--webui FILE] [--atomdns-version STR] [--config DIR] [--sing-box-dir DIR] [--sing-box-version STR] \
-#       [--repo owner/name] [--out DIR]
+#       [--repo owner/name] [--out DIR] [--signing-key FILE]
 #
 # DIR holds atomdns-linux-<variant>.tar.gz (each with an `atomdns` program in it) and atom-webui.tar.gz.
 # Package <- atomdns variant:  amd64 <- amd64,  arm64 <- arm64-gnu,  amd64-musl <- amd64-musl,  arm64-musl <- arm64
@@ -18,6 +18,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$(cd "$HERE/.." && pwd)"
 ATOM_ROOT="$(cd "$INSTALLER/.." && pwd)"
+SIGNING_KEY="${ATOM_RELEASE_SIGNING_KEY_FILE:-}"
 VERSION="" ATOMDNS_DIR="" WEBUI="" ATOMDNS_VERSION="unknown" SINGBOX_VERSION=""
 CONFIG="$ATOM_ROOT/atomdns/config" SINGBOX_DIR="$ATOM_ROOT/sing-box" REPO="jasonxtt/atom" OUT="$INSTALLER/dist"
 
@@ -32,6 +33,7 @@ while [ $# -gt 0 ]; do
     --sing-box-version) SINGBOX_VERSION="$2"; shift 2 ;;
     --repo) REPO="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
+    --signing-key) SIGNING_KEY="$2"; shift 2 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -57,6 +59,13 @@ commit() { git -C "$1" rev-parse --short HEAD 2>/dev/null || echo unknown; }
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
+UPDATE_PUBLIC_KEY=""
+if [ -n "$SIGNING_KEY" ]; then
+  SIGNING_KEY="$(cd "$(dirname "$SIGNING_KEY")" && pwd)/$(basename "$SIGNING_KEY")"
+  UPDATE_PUBLIC_KEY="$(cd "$INSTALLER" && go run . update-public-key "$SIGNING_KEY")"
+fi
+rm -f "$OUT/atom-update-manifest.json"
 
 # Check every atomdns before anything is built: right architecture (ELF e_machine: x86_64 0x3e, aarch64 0xb7),
 # glibc packages need nothing newer than Ubuntu 22.04's glibc 2.35, musl packages must not reference glibc at all.
@@ -82,7 +91,7 @@ done
 (cd "$INSTALLER" && go vet ./... && go test ./... >/dev/null)
 for arch in amd64 arm64; do
   mkdir -p "$STAGE/build/$arch"
-  (cd "$INSTALLER" && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
+  (cd "$INSTALLER" && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$VERSION -X main.updatePublicKey=$UPDATE_PUBLIC_KEY" \
     -o "$STAGE/build/$arch/atom-installer" .)
   (cd "$SINGBOX_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
     -tags "$(cat release/DEFAULT_BUILD_TAGS_OTHERS)" \
@@ -138,3 +147,9 @@ bash -n "$OUT/install.sh"
  for p in $PACKAGES; do f="atom-$VERSION-linux-${p%%:*}.tar.gz"; printf '%s  %s\n' "$(sha256 "$f")" "$f" >> SHA256SUMS; done
  printf '%s  %s\n' "$(sha256 install.sh)" install.sh >> SHA256SUMS)
 echo "wrote $OUT/install.sh, $OUT/SHA256SUMS"
+
+if [ -n "$SIGNING_KEY" ]; then
+  (cd "$INSTALLER" && go run . sign-update "$SIGNING_KEY" "$OUT" "$VERSION")
+  (cd "$OUT" && printf '%s  %s\n' "$(sha256 atom-update-manifest.json)" atom-update-manifest.json >> SHA256SUMS)
+  echo "wrote $OUT/atom-update-manifest.json"
+fi

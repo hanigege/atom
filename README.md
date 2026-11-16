@@ -29,7 +29,7 @@ Debian 12+ 或 Ubuntu 22.04+（systemd）、Alpine 3.19+（OpenRC），x86_64 �
 curl -fsSL https://github.com/jasonxtt/atom/releases/latest/download/install.sh | sudo bash
 ```
 
-脚本下载配套包（GitHub 不通时依次换加速前缀）、校验 sha256，起一个网页向导并打印地址；在浏览器里选拓扑、配 DNS 和 sing-box，装完自动跳到面板。Alpine 上先 `apk add bash curl`，命令里的 `sudo bash` 换成 `bash`。已经装过的机器上再运行同一条命令就是升级（降级：`… | sudo bash -s -- --force`）。卸载：`/opt/atom/bin/atom-installer uninstall [--purge]`。详见 [installer/README.md](installer/README.md)。
+脚本下载配套包（GitHub 不通时依次换加速前缀）、校验 sha256，起一个网页向导并打印地址；在浏览器里选拓扑、配 DNS 和 sing-box，装完自动跳到面板。Alpine 上先 `apk add bash curl`，命令里的 `sudo bash` 换成 `bash`。安装后在面板「设置 → 系统更新」升级 Atom，在「设置 → 网络」调整拓扑、网卡、路由和面板端口。旧版设备第一次需要用同一条安装命令升级到支持面板维护的版本。安装命令也可用于应急恢复和降级（`… | sudo bash -s -- --force`）。卸载用 `/opt/atom/bin/atom-installer uninstall [--purge]`。详见 [installer/README.md](installer/README.md)。
 
 ## 仓库
 
@@ -52,7 +52,7 @@ git clone --recursive https://github.com/jasonxtt/atom.git && cd atom
 installer/scripts/build-package.sh --version 0.1.0 --atomdns-dir DIR
 ```
 
-产物在 `installer/dist/`：四个包 `atom-<版本>-linux-{amd64,arm64,amd64-musl,arm64-musl}.tar.gz`、写好版本和四个 sha256 的 `install.sh`、`SHA256SUMS`。本地包可以用 `ATOM_PKG=<包> bash install.sh` 安装。
+产物在 `installer/dist/`，包括四个架构和 libc 组合的 tar.gz 包、`install.sh` 和 `SHA256SUMS`。本地包可以用 `ATOM_PKG=<包> bash install.sh` 安装。正式发布包用 `--signing-key` 生成面板升级清单，详见 [安装器发布步骤](installer/README.md#发布支持在线升级的版本)。
 
 ## 许可证
 
