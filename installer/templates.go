@@ -40,10 +40,15 @@ func renderNft(lan []string, reply bool) (string, error) {
 	}`, replyMark, replyTable)
 	}
 	return fmt.Sprintf(`#!/usr/sbin/nft -f
-# atom: send TCP and UDP from the LAN to sing-box. Written by atom-installer.
+# atom: send LAN traffic and local FakeIP traffic to sing-box. Written by atom-installer.
 table inet atom
 delete table inet atom
 table inet atom {
+	set output_fakeip4 {
+		type ipv4_addr
+		flags interval
+	}
+
 	# TCP: redirect to sing-box redirect-in (7892).
 	chain prerouting_tcp {
 		type nat hook prerouting priority dstnat; policy accept;
@@ -56,10 +61,21 @@ table inet atom {
 	# replies of a flow opened from elsewhere (the WAN) are forwarded as they are.
 	chain prerouting_udp {
 		type filter hook prerouting priority mangle; policy accept;
+		iifname "lo" meta mark %[2]s ip daddr @output_fakeip4 meta l4proto udp ct direction original counter tproxy ip to :7893 accept
 		iifname != { %[1]s } return
 		fib daddr type { local, broadcast, multicast } return
 		ct direction reply return
 		meta nfproto ipv4 meta l4proto udp %[3]stproxy ip to :7893 meta mark set %[2]s accept
+	}
+
+	chain output_tcp {
+		type nat hook output priority dstnat; policy accept;
+		ip daddr @output_fakeip4 meta l4proto tcp ct direction original counter redirect to :7892
+	}
+
+	chain output_udp {
+		type route hook output priority mangle - 1; policy accept;
+		ip daddr @output_fakeip4 meta l4proto udp ct direction original counter meta mark set %[2]s
 	}%[4]s
 }
 `, l, fwmark, ct, out), nil
@@ -159,9 +175,8 @@ func (r ClientRoute) check() error {
 // the LAN interface that must not take ICMP redirects from the main router.
 func renderDNSUnit(p Paths, nftBin, sysctlBin string, gateway bool, replyDev string) string {
 	var pre strings.Builder
-	fmt.Fprintf(&pre, "ExecStartPre=%s -f %s\n", nftBin, p.Etc("atom.nft"))
+	fmt.Fprintf(&pre, "ExecStartPre=%s sync-nft --root %q --load-atom\n", p.Bin("atom-installer"), p.Root)
 	if gateway {
-		fmt.Fprintf(&pre, "ExecStartPre=%s protect-wan --root %q\n", p.Bin("atom-installer"), p.Root)
 		fmt.Fprintf(&pre, "ExecStartPre=%s -f %s\n", nftBin, p.Etc("atom-gateway.nft"))
 		fmt.Fprintf(&pre, "ExecStartPre=%s -w net.ipv4.ip_forward=1\n", sysctlBin)
 	}
@@ -194,9 +209,9 @@ After=network-online.target
 ConditionPathExists=%[2]s/config.json
 
 [Service]
-ExecStartPre=%[3]s protect-wan --root %[4]q --start
+ExecStartPre=%[3]s sync-nft --root %[4]q --start
 ExecStart=%[1]s run -D %[2]s -c %[2]s/config.json
-ExecReload=%[3]s protect-wan --root %[4]q
+ExecReload=%[3]s sync-nft --root %[4]q
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=1
@@ -221,9 +236,8 @@ func setPanelPort(yaml string, port int) (string, error) {
 // and what the unit does in ExecStartPre happens in start_pre.
 func renderDNSInit(p Paths, nftBin, sysctlBin string, gateway bool, replyDev string) string {
 	var pre strings.Builder
-	fmt.Fprintf(&pre, "\t%s -f %s || return 1\n", nftBin, p.Etc("atom.nft"))
+	fmt.Fprintf(&pre, "\t%s sync-nft --root %q --load-atom || return 1\n", p.Bin("atom-installer"), p.Root)
 	if gateway {
-		fmt.Fprintf(&pre, "\t%s protect-wan --root %q || return 1\n", p.Bin("atom-installer"), p.Root)
 		fmt.Fprintf(&pre, "\t%s -f %s || return 1\n", nftBin, p.Etc("atom-gateway.nft"))
 		fmt.Fprintf(&pre, "\t%s -w net.ipv4.ip_forward=1 || return 1\n", sysctlBin)
 	}
@@ -276,12 +290,12 @@ depend() {
 
 start_pre() {
 	[ -f %[2]s/config.json ] || { eerror "no %[2]s/config.json"; return 1; }
-	%[4]s protect-wan --root %[5]q --start || return 1
+	%[4]s sync-nft --root %[5]q --start || return 1
 	checkpath -d -m 0755 %[3]s
 }
 
 reload() {
-	%[4]s protect-wan --root %[5]q || return 1
+	%[4]s sync-nft --root %[5]q || return 1
 	ebegin "Reloading $RC_SVCNAME"
 	supervise-daemon "$RC_SVCNAME" --signal HUP
 	eend $?

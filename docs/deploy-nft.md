@@ -20,7 +20,7 @@
 | 其他（ping 等） | 单网卡：不处理；双网卡：转发并 NAT 到 WAN（3.2） |
 
 - 只看从局域网网卡进来的包（`iifname`）。目标是本机地址的包一律放过（`fib daddr type local return`），所以客户端问 VM 的 DNS（53）、管理接口和面板不会被导进 sing-box。广播和组播（DHCP、mDNS、SSDP 之类）也放过。
-- **sing-box 自己发出的流量不会被导回来**：nft 只挂在 `prerouting` 上，本机进程（sing-box 的出站、atomdns 的上游查询）发出的包走 `output`，不经过这两条链。所以不需要给 sing-box 设 `routing_mark` 再在 nft 里排除。代价是本机进程访问 FakeIP 不会被处理（本机不需要：atomdns 的国外 DNS 走 7890，见 design.md 7.1）。
+- 本机进程访问 FakeIP 时，`output` 只捕获目的地址在当前 FakeIP 池内的 IPv4 TCP 和 UDP。TCP redirect 到 7892，UDP 打 `0x233`，经策略路由走 `lo` 回到 `prerouting`，TProxy 到 7893。节点、DNS 上游和需要直连的真实地址应避开 FakeIP 池，节点域名继续由独立的 `resolver` 解析。本机应用需要使用 AtomDNS 才能按域名拿到 FakeIP。
 - IPv6：v0 不做 IPv6 FakeIP；规则只匹配 IPv4（`meta nfproto ipv4`），IPv6 的包照常转发或丢弃，IPv6 的 IP 规则只对 7890 入站有效。
 
 ## 2. 端口、标记、路由表
@@ -43,10 +43,15 @@
 
 ```nft
 #!/usr/sbin/nft -f
-# atom: send TCP and UDP from the LAN to sing-box.
+# atom: send LAN traffic and local FakeIP traffic to sing-box.
 table inet atom
 delete table inet atom
 table inet atom {
+	set output_fakeip4 {
+		type ipv4_addr
+		flags interval
+	}
+
 	# TCP: redirect to sing-box redirect-in (7892).
 	chain prerouting_tcp {
 		type nat hook prerouting priority dstnat; policy accept;
@@ -58,15 +63,26 @@ table inet atom {
 	# UDP: TProxy to sing-box tproxy-in (7893); the mark sends it to table 233 (local).
 	chain prerouting_udp {
 		type filter hook prerouting priority mangle; policy accept;
+		iifname "lo" meta mark 0x233 ip daddr @output_fakeip4 meta l4proto udp ct direction original counter tproxy ip to :7893 accept
 		iifname != { @LAN@ } return
 		fib daddr type { local, broadcast, multicast } return
 		ct direction reply return
 		meta nfproto ipv4 meta l4proto udp tproxy ip to :7893 meta mark set 0x233 accept
 	}
+
+	chain output_tcp {
+		type nat hook output priority dstnat; policy accept;
+		ip daddr @output_fakeip4 meta l4proto tcp ct direction original counter redirect to :7892
+	}
+
+	chain output_udp {
+		type route hook output priority mangle - 1; policy accept;
+		ip daddr @output_fakeip4 meta l4proto udp ct direction original counter meta mark set 0x233
+	}
 }
 ```
 
-- 开头的 `table inet atom` + `delete table inet atom` 让文件可以重复加载：每次都整表替换，不会叠出重复规则。表里没有集合，加载完就生效，不用等 atomdns。
+- 开头的 `table inet atom` + `delete table inet atom` 让文件可以重复加载。AtomDNS 启动前通过安装器的 `sync-nft --load-atom` 整表替换并填入当前网段。sing-box 启动或重载前，`sync-nft` 读取生成配置中的 FakeIP 网段并原子替换集合内容。全新安装还没有 sing-box 配置时集合为空，首次启动前会填入网段。
 - 链名不能用 `redirect`、`tproxy`（nft 的关键字），所以叫 `prerouting_tcp` / `prerouting_udp`。
 - `meta nfproto ipv4`：`inet` 表也看 IPv6，sing-box 的 redirect、TProxy 入站只监听 IPv4。
 - `ct direction reply return`（UDP，codex 复审后加）：别处（比如双网卡时 WAN 那边）发起、经过这台机器的 UDP 流，LAN 里回过来的包不导进 sing-box，照常转发。TCP 的 redirect 在 nat 链里，只看新连接的第一个包，不受影响。

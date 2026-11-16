@@ -30,12 +30,15 @@ func TestRenderNft(t *testing.T) {
 		"meta nfproto ipv4 meta l4proto tcp redirect to :7892\n",
 		"ct direction reply return\n\t\tmeta nfproto ipv4 meta l4proto udp tproxy ip to :7893 meta mark set 0x233 accept\n",
 		"delete table inet atom",
+		`iifname "lo" meta mark 0x233 ip daddr @output_fakeip4 meta l4proto udp ct direction original counter tproxy ip to :7893 accept`,
+		"ip daddr @output_fakeip4 meta l4proto tcp ct direction original counter redirect to :7892",
+		"ip daddr @output_fakeip4 meta l4proto udp ct direction original counter meta mark set 0x233",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("nft rules lack %q", want)
 		}
 	}
-	for _, unwanted := range []string{"set fakeip4", "set iprule4", "@fakeip4", "@iprule4", "ip daddr"} {
+	for _, unwanted := range []string{"set fakeip4", "set iprule4", "@fakeip4", "@iprule4"} {
 		if strings.Contains(got, unwanted) {
 			t.Errorf("nft rules still pick destinations: %q", unwanted)
 		}
@@ -76,7 +79,7 @@ func TestRenderUnits(t *testing.T) {
 	if strings.Contains(bypass, "atom-gateway.nft") || strings.Contains(bypass, "ip_forward") {
 		t.Errorf("the single-NIC unit must not touch NAT or ip_forward:\n%s", bypass)
 	}
-	for _, want := range []string{"ExecStartPre=/usr/sbin/nft -f /opt/atom/etc/atom.nft", "ExecStartPre=/opt/atom/lib/policy-route.sh", "ExecStart=/opt/atom/bin/atomdns start -d /opt/atom/data -c config_custom.yaml"} {
+	for _, want := range []string{`ExecStartPre=/opt/atom/bin/atom-installer sync-nft --root "/opt/atom" --load-atom`, "ExecStartPre=/opt/atom/lib/policy-route.sh", "ExecStart=/opt/atom/bin/atomdns start -d /opt/atom/data -c config_custom.yaml"} {
 		if !strings.Contains(bypass, want) {
 			t.Errorf("DNS unit lacks %q", want)
 		}
@@ -87,7 +90,7 @@ func TestRenderUnits(t *testing.T) {
 			t.Errorf("gateway unit lacks %q", want)
 		}
 	}
-	if strings.Index(gw, "atom.nft") > strings.Index(gw, "policy-route.sh") {
+	if strings.Index(gw, "--load-atom") > strings.Index(gw, "policy-route.sh") {
 		t.Error("rules are loaded before the policy routing")
 	}
 	sb := renderSingBoxUnit(p)
@@ -606,7 +609,7 @@ func TestPruneBackups(t *testing.T) {
 	}
 }
 
-func TestWANProtectionTracksMixedPortChanges(t *testing.T) {
+func TestNftTracksFakeIPRangeAndMixedPortChanges(t *testing.T) {
 	p := Paths{Root: t.TempDir()}
 	nft := p.Bin("nft")
 	batchFile := p.Run("batch")
@@ -629,15 +632,17 @@ func TestWANProtectionTracksMixedPortChanges(t *testing.T) {
 	}
 	for _, starting := range []bool{true, false} {
 		port := 7890
+		pool := "28.0.0.0/8"
 		if !starting {
 			port = 9876
+			pool = "198.18.0.0/18"
 		}
 		path := filepath.Join(p.Data(), "sing-box", "config.json")
-		config := fmt.Sprintf(`{"inbounds":[{"type":"mixed","listen_port":%d},{"type":"redirect","listen_port":7892},{"type":"tproxy","listen_port":7893}]}`, port)
+		config := fmt.Sprintf(`{"dns":{"servers":[{"type":"fakeip","inet4_range":"%s"}]},"inbounds":[{"type":"mixed","listen_port":%d},{"type":"redirect","listen_port":7892},{"type":"tproxy","listen_port":7893}]}`, pool, port)
 		if err := writeFileAtomic(path, []byte(config), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := protectWAN(p, starting); err != nil {
+		if err := syncNft(p, starting, false); err != nil {
 			t.Fatal(err)
 		}
 		batch, err := os.ReadFile(batchFile)
@@ -649,7 +654,10 @@ func TestWANProtectionTracksMixedPortChanges(t *testing.T) {
 				t.Errorf("missing %q in %s", want, batch)
 			}
 		}
-		if strings.Contains(string(batch), "flush set") != starting {
+		if !strings.Contains(string(batch), "flush set inet atom output_fakeip4\nadd element inet atom output_fakeip4 { "+pool+" }\n") {
+			t.Errorf("expected atomic replacement of the FakeIP range: %s", batch)
+		}
+		if strings.Contains(string(batch), "flush set inet atom_wan") != starting {
 			t.Errorf("live reload must retain previously protected ports: %s", batch)
 		}
 	}
@@ -1247,7 +1255,7 @@ func TestRenderOpenRCServices(t *testing.T) {
 	dns := renderDNSInit(p, "/usr/sbin/nft", "/sbin/sysctl", false, "")
 	for _, want := range []string{"#!/sbin/openrc-run", "supervisor=supervise-daemon", "respawn_max=0", "command=/opt/atom/bin/atomdns",
 		`command_args="start -d /opt/atom/data -c config_custom.yaml"`, "need net", "/var/log/atom/atom-dns.log", "start_pre()",
-		"/usr/sbin/nft -f /opt/atom/etc/atom.nft || return 1", "/opt/atom/lib/policy-route.sh || return 1"} {
+		`/opt/atom/bin/atom-installer sync-nft --root "/opt/atom" --load-atom || return 1`, "/opt/atom/lib/policy-route.sh || return 1"} {
 		if !strings.Contains(dns, want) {
 			t.Errorf("DNS init script lacks %q:\n%s", want, dns)
 		}
@@ -1259,7 +1267,7 @@ func TestRenderOpenRCServices(t *testing.T) {
 	if !strings.Contains(gw, "/sbin/sysctl -w net.ipv4.ip_forward=1") || !strings.Contains(gw, "atom-gateway.nft") || !strings.Contains(gw, "conf/eth0/accept_redirects=0") {
 		t.Errorf("gateway script:\n%s", gw)
 	}
-	if strings.Index(gw, "atom.nft") > strings.Index(gw, "policy-route.sh") {
+	if strings.Index(gw, "--load-atom") > strings.Index(gw, "policy-route.sh") {
 		t.Error("rules are loaded before the policy routing")
 	}
 	sb := renderSingBoxInit(p)
