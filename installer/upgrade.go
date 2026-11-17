@@ -76,10 +76,11 @@ func (ins *Installer) upgrade(st *InstallState, log Logger) error {
 	if err := ins.makeBackup(backup); err != nil {
 		return fmt.Errorf("备份: %w", err)
 	}
-	oldSingBox := fileSHA256(p.Bin("sing-box"))
+	backend, _, _ := p.proxyService()
+	oldProxy := fileSHA256(p.Bin(backend))
 
 	oldVersion := st.Version
-	err := ins.applyUpgrade(st, oldSingBox, log)
+	err := ins.applyUpgrade(st, oldProxy, log)
 	if err == nil {
 		st.Version, st.UpdatedAt = ins.Version, time.Now()
 		if err = writeJSON(p.State(), st); err != nil {
@@ -174,7 +175,7 @@ func checkLegacyTor(p Paths) error {
 	return nil
 }
 
-func (ins *Installer) applyUpgrade(st *InstallState, oldSingBox string, log Logger) error {
+func (ins *Installer) applyUpgrade(st *InstallState, oldProxy string, log Logger) error {
 	if err := ins.installBinaries(log, compareVersions(ins.Version, st.Version) < 0); err != nil {
 		return err
 	}
@@ -191,9 +192,10 @@ func (ins *Installer) applyUpgrade(st *InstallState, oldSingBox string, log Logg
 	if _, err := api.waitStatus(60*time.Second, func(*apiStatus) bool { return true }); err != nil {
 		return fmt.Errorf("atomdns 的管理接口没有起来: %w", err)
 	}
-	if fileSHA256(ins.Paths.Bin("sing-box")) != oldSingBox {
-		log.Logf("sing-box 程序变了，重启它")
-		if err := ins.Paths.Init().Restart(log, singBoxUnitName); err != nil {
+	backend, unit, _ := ins.Paths.proxyService()
+	if fileSHA256(ins.Paths.Bin(backend)) != oldProxy {
+		log.Logf("%s 程序变了，重启它", backend)
+		if err := ins.Paths.Init().Restart(log, unit); err != nil {
 			return err
 		}
 	}
@@ -224,10 +226,12 @@ func (ins *Installer) backupItems() []backupItem {
 		{path: filepath.Join(p.Data(), "sub_config"), name: "data/sub_config", exact: true},
 		{path: filepath.Join(p.Data(), "ui", "main"), name: "data/ui/main", exact: true},
 		{path: filepath.Join(p.Data(), "config_custom.yaml"), name: "data/config_custom.yaml", file: true},
+		{path: filepath.Join(p.Data(), "mihomo", "config.yaml"), name: "data/mihomo/config.yaml", file: true, mode: 0o600},
 		{path: filepath.Join(p.Data(), "sing-box", "config.json"), name: "data/sing-box/config.json", file: true, mode: 0o600},
 		{path: filepath.Join(p.Data(), "rule", "atom_catalog.json"), name: "data/rule/atom_catalog.json", file: true},
 		{path: filepath.Join(p.Data(), "webinfo", "atom_auth.json"), name: "data/webinfo/atom_auth.json", file: true, mode: 0o600}, // the panel login: a failed reconfigure puts it back
 		{path: p.DNSUnit(), name: "units/" + filepath.Base(p.DNSUnit()), file: true, mode: p.unitMode()},
+		{path: p.MihomoUnit(), name: "units/" + filepath.Base(p.MihomoUnit()), file: true, mode: p.unitMode()},
 		{path: p.SingBoxUnit(), name: "units/" + filepath.Base(p.SingBoxUnit()), file: true, mode: p.unitMode()},
 		{path: p.unitFile(maintenanceUnitName), name: "units/" + filepath.Base(p.unitFile(maintenanceUnitName)), file: true, mode: p.unitMode()},
 	}
@@ -322,8 +326,9 @@ func (ins *Installer) restoreBackup(dir string, panelPort int, log Logger) error
 		return err
 	}
 	// Bring the backed-up generated proxy config up before DNS reconciles it.
-	if _, err := os.Stat(filepath.Join(ins.Paths.Data(), "sing-box", "config.json")); err == nil {
-		if err := init.Restart(log, singBoxUnitName); err != nil {
+	_, unit, config := ins.Paths.proxyService()
+	if _, err := os.Stat(config); err == nil {
+		if err := init.Restart(log, unit); err != nil {
 			return err
 		}
 	}

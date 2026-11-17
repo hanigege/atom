@@ -245,7 +245,7 @@ type Occupant struct {
 
 func isOurUnit(unit string) bool {
 	unit = rcName(unit)
-	return unit == rcName(dnsUnitName) || unit == rcName(singBoxUnitName)
+	return unit == rcName(dnsUnitName) || unit == rcName(singBoxUnitName) || unit == rcName(mihomoUnitName)
 }
 
 // openrcServiceOf is the OpenRC service a process belongs to: the service whose pidfile (named in

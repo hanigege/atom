@@ -642,7 +642,7 @@ func TestNftTracksFakeIPRangeAndMixedPortChanges(t *testing.T) {
 		if err := writeFileAtomic(path, []byte(config), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := syncNft(p, starting, false); err != nil {
+		if err := syncNft(p, starting, false, ""); err != nil {
 			t.Fatal(err)
 		}
 		batch, err := os.ReadFile(batchFile)
@@ -659,6 +659,43 @@ func TestNftTracksFakeIPRangeAndMixedPortChanges(t *testing.T) {
 		}
 		if strings.Contains(string(batch), "flush set inet atom_wan") != starting {
 			t.Errorf("live reload must retain previously protected ports: %s", batch)
+		}
+	}
+}
+
+func TestMihomoHookUsesItsCandidateBeforeBackendIsSaved(t *testing.T) {
+	p := Paths{Root: t.TempDir()}
+	batchFile := p.Run("test-batch")
+	t.Setenv("ATOM_TEST_NFT_BATCH", batchFile)
+	nft := p.Bin("test-nft")
+	if err := writeFileAtomic(nft, []byte("#!/bin/sh\ncat > \"$ATOM_TEST_NFT_BATCH\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(p.State(), InstallState{Topology: "gateway", NftBin: nft}); err != nil {
+		t.Fatal(err)
+	}
+	rules, err := renderWANNft("wan0", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomic(p.Etc("atom-wan.nft"), []byte(rules), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(p.Data(), "mihomo", "config.yaml")
+	value := []byte(`{"mixed-port":8123,"redir-port":7892,"tproxy-port":7893,"dns":{"fake-ip-range":"198.18.0.0/16"}}`)
+	if err := writeFileAtomic(path, value, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncNft(p, true, false, "mihomo"); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := os.ReadFile(batchFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"output_fakeip4 { 198.18.0.0/16 }", "tcp_proxy_ports { 8123 }", "udp_proxy_ports { 8123 }", "udp_proxy_ports { 7892 }", "tcp_proxy_ports { 7893 }"} {
+		if !strings.Contains(string(batch), want) {
+			t.Errorf("missing %q in %s", want, batch)
 		}
 	}
 }
@@ -1807,7 +1844,7 @@ func (f *fakeInit) Stop(_ Logger, n string) error      { f.stopped = append(f.st
 func TestReconfigureRollbackStopsTheNewServicesFirst(t *testing.T) {
 	f := &fakeInit{}
 	(&reconfigureRun{}).quiesce(f, &recLogger{})
-	if strings.Join(f.stopped, ",") != "atom-dns.service,atom-sing-box.service" {
+	if strings.Join(f.stopped, ",") != "atom-dns.service,atom-sing-box.service,atom-mihomo.service" {
 		t.Errorf("%v", f.stopped)
 	}
 }

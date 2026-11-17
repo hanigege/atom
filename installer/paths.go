@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 )
@@ -38,6 +39,20 @@ func (p Paths) State() string          { return p.Etc("install.json") }
 func (p Paths) Changes() string        { return p.Etc("changes.json") }
 func (p Paths) DNSUnit() string        { return p.unitFile(dnsUnitName) }
 func (p Paths) SingBoxUnit() string    { return p.unitFile(singBoxUnitName) }
+func (p Paths) MihomoUnit() string     { return p.unitFile(mihomoUnitName) }
+
+func (p Paths) proxyService() (binary, unit, config string) {
+	var state struct {
+		Settings struct {
+			Backend string `json:"backend"`
+		} `json:"settings"`
+	}
+	data, err := os.ReadFile(filepath.Join(p.Data(), "webinfo", "atom_proxy.json"))
+	if err == nil && json.Unmarshal(data, &state) == nil && state.Settings.Backend == "mihomo" {
+		return "mihomo", mihomoUnitName, filepath.Join(p.Data(), "mihomo", "config.yaml")
+	}
+	return "sing-box", singBoxUnitName, filepath.Join(p.Data(), "sing-box", "config.json")
+}
 
 // unitFile is the service definition: <name>.service for systemd, the script <name> for OpenRC.
 func (p Paths) unitFile(name string) string {
@@ -66,6 +81,7 @@ const (
 	maintenanceUnitName = "atom-maintenance.service"
 	dnsUnitName         = "atom-dns.service"
 	singBoxUnitName     = "atom-sing-box.service"
+	mihomoUnitName      = "atom-mihomo.service"
 	defaultPort         = 9996
 	fwmark              = "0x233"
 	routeTable          = "233"

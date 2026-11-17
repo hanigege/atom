@@ -243,7 +243,7 @@ func maintenanceHealthy(p Paths, port int, log Logger) error {
 	}); err != nil {
 		return fmt.Errorf("DNS 管理接口未就绪或代理配置未同步：%w", err)
 	}
-	for _, name := range []string{dnsUnitName, singBoxUnitName} {
+	for _, name := range []string{dnsUnitName, singBoxUnitName, mihomoUnitName} {
 		if p.Init().IsActive(name) != "active" {
 			return fmt.Errorf("%s 没有运行", name)
 		}
@@ -301,7 +301,7 @@ func (ins *Installer) restoreMaintenanceBackup(backup string, network bool, log 
 		return err
 	}
 	p := ins.Paths
-	for _, name := range []string{dnsUnitName, singBoxUnitName} {
+	for _, name := range []string{dnsUnitName, singBoxUnitName, mihomoUnitName} {
 		if p.Init().IsActive(name) == "active" {
 			if err := p.Init().Stop(log, name); err != nil {
 				return err

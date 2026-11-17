@@ -320,11 +320,19 @@ func (ins *Installer) stepDeps(cfg Config, j *Job) error {
 }
 
 // atom-installer first: once anything is installed, the uninstaller is there too.
-var installedBinaries = []string{"atom-installer", "atomdns", "sing-box"}
+var installedBinaries = []string{"atom-installer", "atomdns", "sing-box", "mihomo"}
 
 func (ins *Installer) installBinaries(log Logger, retainInstaller bool) error {
 	for _, name := range installedBinaries {
 		src := filepath.Join(ins.PkgDir, "bin", name)
+		if name == "mihomo" {
+			if _, err := os.Stat(src); os.IsNotExist(err) {
+				if backend, _, _ := ins.Paths.proxyService(); backend == "mihomo" {
+					return fmt.Errorf("目标版本没有 mihomo，请先切换到 sing-box")
+				}
+				continue
+			}
+		}
 		if retainInstaller && name == "atom-installer" {
 			// The freshly generated units call this installer's WAN hook,
 			// which a downgraded package may not implement.
@@ -422,11 +430,14 @@ func (ins *Installer) writeNetworkFiles(st *InstallState, log Logger) error {
 			return fmt.Errorf("nft 规则检查没通过: %w", err)
 		}
 	}
-	dnsDef, sbDef := renderDNSUnit, renderSingBoxUnit
+	dnsDef, sbDef, mhDef := renderDNSUnit, renderSingBoxUnit, renderMihomoUnit
 	if p.OpenRC {
-		dnsDef, sbDef = renderDNSInit, renderSingBoxInit
+		dnsDef, sbDef, mhDef = renderDNSInit, renderSingBoxInit, renderMihomoInit
 		if err := configureOpenRCLogs(p, log); err != nil {
 			return fmt.Errorf("配置日志轮转：%w", err)
+		}
+		if err := writeFileAtomic(p.Lib("reload-mihomo.sh"), []byte(renderReloadScript("atom-mihomo")), 0o755); err != nil {
+			return err
 		}
 		if err := writeFileAtomic(p.Lib("reload-sing-box.sh"), []byte(renderReloadScript()), 0o755); err != nil {
 			return err
@@ -436,6 +447,9 @@ func (ins *Installer) writeNetworkFiles(st *InstallState, log Logger) error {
 		return err
 	}
 	if err := writeFileAtomic(p.SingBoxUnit(), []byte(sbDef(p)), p.unitMode()); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(p.MihomoUnit(), []byte(mhDef(p)), p.unitMode()); err != nil {
 		return err
 	}
 	return p.Init().Reload(log)
@@ -587,17 +601,10 @@ func (ins *Installer) stepNetwork(cfg Config, j *Job) error {
 
 func (ins *Installer) stepStart(cfg Config, j *Job) error {
 	init := ins.Paths.Init()
-	if err := init.Enable(j, singBoxUnitName, dnsUnitName); err != nil {
+	if err := init.Enable(j, dnsUnitName); err != nil {
 		return err
 	}
-	// A configuration left by an earlier installation is in sync with the settings atomdns finds, so atomdns
-	// would not start sing-box: start it here. Without one, atomdns applies the first configuration and starts it.
-	if _, err := os.Stat(filepath.Join(ins.Paths.Data(), "sing-box", "config.json")); err == nil {
-		if err := init.Restart(j, singBoxUnitName); err != nil {
-			ins.journal(j, singBoxUnitName)
-			return err
-		}
-	}
+
 	if err := init.Restart(j, dnsUnitName); err != nil {
 		ins.journal(j, dnsUnitName)
 		return err
@@ -755,7 +762,7 @@ func (ins *Installer) stepCheck(cfg Config, j *Job) error {
 		}
 		return fmt.Errorf("%s", msg)
 	}
-	for _, u := range []string{dnsUnitName, singBoxUnitName} {
+	for _, u := range []string{dnsUnitName, singBoxUnitName, mihomoUnitName} {
 		if out := ins.Paths.Init().IsActive(u); out != "active" {
 			return fmt.Errorf("%s 不是 active（%s）", u, out)
 		}
@@ -838,6 +845,11 @@ func teardownNetwork(p Paths, ch *Changes, log Logger) {
 	ignore := func(name string, args ...string) {
 		if err := runCmd(log, 60*time.Second, name, args...); err != nil {
 			log.Logf("  （忽略）%v", err)
+		}
+	}
+	if _, err := os.Stat(p.MihomoUnit()); err == nil {
+		if err := p.Init().Stop(log, mihomoUnitName); err != nil {
+			log.Logf("停止 mihomo 失败：%v", err)
 		}
 	}
 	if err := p.Init().DisableNow(log, dnsUnitName, singBoxUnitName); err != nil {

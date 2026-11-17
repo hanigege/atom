@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Assembles the four atom packages from parts that are already built (atomdns, WebUI), builds sing-box and
+# Assembles the four atom packages from parts that are already built (atomdns, WebUI), builds sing-box, mihomo and
 # atom-installer for both architectures, and writes the install.sh that goes with them. Nothing is published.
 # atomdns is built on the Linux build host (release-build.yml); its artifacts are read from --atomdns-dir.
 #
@@ -20,7 +20,7 @@ INSTALLER="$(cd "$HERE/.." && pwd)"
 ATOM_ROOT="$(cd "$INSTALLER/.." && pwd)"
 SIGNING_KEY="${ATOM_RELEASE_SIGNING_KEY_FILE:-}"
 VERSION="" ATOMDNS_DIR="" WEBUI="" ATOMDNS_VERSION="unknown" SINGBOX_VERSION=""
-CONFIG="$ATOM_ROOT/atomdns/config" SINGBOX_DIR="$ATOM_ROOT/sing-box" REPO="jasonxtt/atom" OUT="$INSTALLER/dist"
+CONFIG="$ATOM_ROOT/atomdns/config" SINGBOX_DIR="$ATOM_ROOT/sing-box" MIHOMO_DIR="$ATOM_ROOT/mihomo" REPO="jasonxtt/atom" OUT="$INSTALLER/dist"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -44,6 +44,8 @@ done
 [ -f "$SINGBOX_DIR/release/LDFLAGS" ] || { echo "no sing-box source at $SINGBOX_DIR (git submodule update --init)" >&2; exit 2; }
 [ -n "$SINGBOX_VERSION" ] || SINGBOX_VERSION="$(git -C "$SINGBOX_DIR" describe --tags 2>/dev/null | sed 's/^v//' || true)"
 [ -n "$SINGBOX_VERSION" ] || SINGBOX_VERSION=unknown
+[ -f "$MIHOMO_DIR/go.mod" ] || { echo "no mihomo source at $MIHOMO_DIR (git submodule update --init)" >&2; exit 2; }
+MIHOMO_VERSION="$(git -C "$MIHOMO_DIR" describe --tags --always)"
 [ -f "$CONFIG/config_custom.yaml" ] || { echo "no configuration at $CONFIG" >&2; exit 2; }
 
 # package name -> GOARCH, atomdns variant
@@ -97,6 +99,9 @@ for arch in amd64 arm64; do
     -tags "$(cat release/DEFAULT_BUILD_TAGS_OTHERS)" \
     -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$SINGBOX_VERSION $(cat release/LDFLAGS)" \
     -o "$STAGE/build/$arch/sing-box" ./cmd/sing-box)
+  (cd "$MIHOMO_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+    -ldflags "-s -w -X github.com/metacubex/mihomo/constant.Version=$MIHOMO_VERSION" \
+    -o "$STAGE/build/$arch/mihomo" .)
 done
 
 if tar --version 2>/dev/null | grep -q GNU; then
@@ -113,7 +118,7 @@ for p in $PACKAGES; do
   PKG="$STAGE/$pkgname/$NAME"
   mkdir -p "$PKG/bin" "$PKG/config"
   cp "$STAGE/x-$variant/atomdns" "$PKG/bin/atomdns"
-  cp "$STAGE/build/$arch/sing-box" "$STAGE/build/$arch/atom-installer" "$PKG/bin/"
+  cp "$STAGE/build/$arch/sing-box" "$STAGE/build/$arch/mihomo" "$STAGE/build/$arch/atom-installer" "$PKG/bin/"
   cp "$WEBUI" "$PKG/atom-webui.tar.gz"
   chmod 0755 "$PKG"/bin/*
   (cd "$CONFIG" && tar -cf - --exclude README.md --exclude .DS_Store .) | (cd "$PKG/config" && tar -xf -)
@@ -125,6 +130,7 @@ for p in $PACKAGES; do
   "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "atomdns": {"version": "$ATOMDNS_VERSION", "commit": "$(commit "$ATOM_ROOT/atomdns")", "sha256": "$(sha256 "$PKG/bin/atomdns")"},
   "sing-box": {"commit": "$(commit "$SINGBOX_DIR")", "sha256": "$(sha256 "$PKG/bin/sing-box")"},
+  "mihomo": {"commit": "$(commit "$MIHOMO_DIR")", "sha256": "$(sha256 "$PKG/bin/mihomo")"},
   "webui": {"sha256": "$(sha256 "$PKG/atom-webui.tar.gz")"},
   "installer": {"commit": "$(commit "$ATOM_ROOT")", "sha256": "$(sha256 "$PKG/bin/atom-installer")"}
 }

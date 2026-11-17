@@ -56,7 +56,7 @@ func (rc *reconfigureRun) restore(ins *Installer, log Logger) {
 // quiesce stops the new services (and with them any restart the service manager still has pending for them), so
 // that nothing recreates what is undone next.
 func (rc *reconfigureRun) quiesce(init initSystem, log Logger) {
-	for _, n := range []string{dnsUnitName, singBoxUnitName} {
+	for _, n := range []string{dnsUnitName, singBoxUnitName, mihomoUnitName} {
 		if err := init.Stop(log, n); err != nil {
 			log.Logf("  （忽略）%v", err)
 		}

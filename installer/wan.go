@@ -12,8 +12,8 @@ import (
 )
 
 // syncNft takes the FakeIP CIDR and WAN listener ports from the same generated
-// config sing-box will load. Keep old WAN ports until a full sing-box restart.
-func syncNft(p Paths, starting, loadAtom bool) error {
+// config the proxy will load. Keep old WAN ports until a full proxy restart.
+func syncNft(p Paths, starting, loadAtom bool, backend string) error {
 	state, err := loadState(p)
 	if err != nil {
 		return err
@@ -32,9 +32,11 @@ func syncNft(p Paths, starting, loadAtom bool) error {
 		return err
 	}
 
-	path := filepath.Join(p.Data(), "sing-box", "config.json")
-	var config proxyNftConfig
-	if err := readJSON(path, &config); err != nil && !os.IsNotExist(err) {
+	if backend == "" {
+		backend, _, _ = p.proxyService()
+	}
+	config, err := readProxyNftConfig(p, backend)
+	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	var batch strings.Builder
@@ -73,17 +75,50 @@ func syncNft(p Paths, starting, loadAtom bool) error {
 	return nil
 }
 
+type proxyDNS struct {
+	Type  string `json:"type"`
+	Range string `json:"inet4_range"`
+}
+
+type proxyInbound struct {
+	Type string `json:"type"`
+	Port uint16 `json:"listen_port"`
+}
+
 type proxyNftConfig struct {
 	DNS struct {
-		Servers []struct {
-			Type  string `json:"type"`
-			Range string `json:"inet4_range"`
-		} `json:"servers"`
+		Servers []proxyDNS `json:"servers"`
 	} `json:"dns"`
-	Inbounds []struct {
-		Type string `json:"type"`
-		Port uint16 `json:"listen_port"`
-	} `json:"inbounds"`
+	Inbounds []proxyInbound `json:"inbounds"`
+}
+
+func readProxyNftConfig(p Paths, backend string) (proxyNftConfig, error) {
+	var config proxyNftConfig
+	switch backend {
+	case "sing-box":
+		err := readJSON(filepath.Join(p.Data(), "sing-box", "config.json"), &config)
+		return config, err
+	case "mihomo":
+		var source struct {
+			DNS struct {
+				Range string `json:"fake-ip-range"`
+			} `json:"dns"`
+			MixedPort  uint16 `json:"mixed-port"`
+			RedirPort  uint16 `json:"redir-port"`
+			TProxyPort uint16 `json:"tproxy-port"`
+		}
+		if err := readJSON(filepath.Join(p.Data(), "mihomo", "config.yaml"), &source); err != nil {
+			return config, err
+		}
+		config.DNS.Servers = []proxyDNS{{Type: "fakeip", Range: source.DNS.Range}}
+		for _, port := range []uint16{source.MixedPort, source.RedirPort, source.TProxyPort} {
+			// The generated Mihomo listeners use both TCP and UDP.
+			config.Inbounds = append(config.Inbounds, proxyInbound{Type: "mixed", Port: port})
+		}
+		return config, nil
+	default:
+		return config, fmt.Errorf("未知代理内核 %q", backend)
+	}
 }
 
 func (config proxyNftConfig) appendFakeIP(batch *strings.Builder) error {

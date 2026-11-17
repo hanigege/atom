@@ -6,3 +6,7 @@
 	path = sing-box
 	url = https://github.com/jasonxtt/sing-box.git
 	branch = atom/fakeip-outbound
+[submodule "mihomo"]
+	path = mihomo
+	url = https://github.com/jasonxtt/mihomo.git
+	branch = atom/fakeip-outbound

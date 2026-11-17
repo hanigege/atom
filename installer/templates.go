@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -186,7 +187,7 @@ func renderDNSUnit(p Paths, nftBin, sysctlBin string, gateway bool, replyDev str
 	fmt.Fprintf(&pre, "ExecStartPre=%s\n", p.Lib("policy-route.sh"))
 	return fmt.Sprintf(`[Unit]
 Description=atom DNS (AtomDNS fork: rules, FakeIP and the control plane)
-After=network-online.target
+After=network-online.target atom-sing-box.service atom-mihomo.service
 Wants=network-online.target
 
 [Service]
@@ -203,16 +204,24 @@ WantedBy=multi-user.target
 
 // renderSingBoxUnit is design 6: started and reloaded by atomdns (systemctl reload-or-restart).
 func renderSingBoxUnit(p Paths) string {
-	dir := p.Data() + "/sing-box"
+	return renderProxyUnit(p, "sing-box", "config.json", "run -D", "-c")
+}
+
+func renderMihomoUnit(p Paths) string {
+	return renderProxyUnit(p, "mihomo", "config.yaml", "-d", "-f")
+}
+
+func renderProxyUnit(p Paths, backend, config, workArg, configArg string) string {
+	dir := filepath.Join(p.Data(), backend)
 	return fmt.Sprintf(`[Unit]
-Description=atom sing-box (FakeIP outbound fork), configured by atom-dns
+Description=atom %[5]s (FakeIP outbound fork), configured by atom-dns
 After=network-online.target
-ConditionPathExists=%[2]s/config.json
+ConditionPathExists=%[2]s/%[6]s
 
 [Service]
-ExecStartPre=%[3]s sync-nft --root %[4]q --start
-ExecStart=%[1]s run -D %[2]s -c %[2]s/config.json
-ExecReload=%[3]s sync-nft --root %[4]q
+ExecStartPre=%[3]s sync-nft --root %[4]q --backend %[5]s --start
+ExecStart=%[1]s %[7]s %[2]s %[8]s %[2]s/%[6]s
+ExecReload=%[3]s sync-nft --root %[4]q --backend %[5]s
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=1
@@ -220,7 +229,7 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-`, p.Bin("sing-box"), dir, p.Bin("atom-installer"), p.Root)
+`, p.Bin(backend), dir, p.Bin("atom-installer"), p.Root, backend, config, workArg, configArg)
 }
 
 var panelPortRe = regexp.MustCompile(`(?m)^(api:[ \t]*\r?\n[ \t]+http:[ \t]*")[^"]*(")`)
@@ -261,6 +270,7 @@ error_log=%[4]s/atom-dns.log
 
 depend() {
 	need net
+	after atom-sing-box atom-mihomo
 	want crond
 }
 
@@ -272,18 +282,26 @@ start_pre() {
 
 // renderSingBoxInit is renderSingBoxUnit for OpenRC: reload sends SIGHUP; without config.json it does not start.
 func renderSingBoxInit(p Paths) string {
-	dir := p.Data() + "/sing-box"
+	return renderProxyInit(p, "sing-box", "config.json", "run -D", "-c")
+}
+
+func renderMihomoInit(p Paths) string {
+	return renderProxyInit(p, "mihomo", "config.yaml", "-d", "-f")
+}
+
+func renderProxyInit(p Paths, backend, config, workArg, configArg string) string {
+	dir := filepath.Join(p.Data(), backend)
 	return fmt.Sprintf(`#!/sbin/openrc-run
-# atom sing-box (FakeIP outbound fork), configured by atom-dns. Written by atom-installer.
-description="atom sing-box"
+# atom %[6]s (FakeIP outbound fork), configured by atom-dns. Written by atom-installer.
+description="atom %[6]s"
 supervisor=supervise-daemon
 command=%[1]s
-command_args="run -D %[2]s -c %[2]s/config.json"
+command_args="%[8]s %[2]s %[9]s %[2]s/%[7]s"
 respawn_delay=1
 respawn_max=0
 rc_ulimit="-n 1048576"
-output_log=%[3]s/atom-sing-box.log
-error_log=%[3]s/atom-sing-box.log
+output_log=%[3]s/atom-%[6]s.log
+error_log=%[3]s/atom-%[6]s.log
 extra_started_commands="reload"
 
 depend() {
@@ -291,38 +309,46 @@ depend() {
 }
 
 start_pre() {
-	[ -f %[2]s/config.json ] || { eerror "no %[2]s/config.json"; return 1; }
-	%[4]s sync-nft --root %[5]q --start || return 1
+	[ -f %[2]s/%[7]s ] || { eerror "no %[2]s/%[7]s"; return 1; }
+	%[4]s sync-nft --root %[5]q --backend %[6]s --start || return 1
 	checkpath -d -m 0755 %[3]s
 }
 
 reload() {
-	%[4]s sync-nft --root %[5]q || return 1
+	%[4]s sync-nft --root %[5]q --backend %[6]s || return 1
 	ebegin "Reloading $RC_SVCNAME"
 	supervise-daemon "$RC_SVCNAME" --signal HUP
 	eend $?
 }
-`, p.Bin("sing-box"), dir, openRCLogDir, p.Bin("atom-installer"), p.Root)
+`, p.Bin(backend), dir, openRCLogDir, p.Bin("atom-installer"), p.Root, backend, config, workArg, configArg)
 }
 
 // renderReloadScript is the reload command of atom_rules.yaml on OpenRC: reload sing-box when it runs, else
 // start it (what systemctl reload-or-restart does).
-func renderReloadScript() string {
-	return `#!/bin/sh
-# atom: reload sing-box when it runs, else start it. Written by atom-installer.
-if rc-service atom-sing-box status >/dev/null 2>&1; then
-	exec rc-service atom-sing-box reload
+func renderReloadScript(service ...string) string {
+	name := "atom-sing-box"
+	if len(service) > 0 {
+		name = service[0]
+	}
+	return fmt.Sprintf(`#!/bin/sh
+# atom: reload the proxy when it runs, else start it. Written by atom-installer.
+if rc-service %[1]s status >/dev/null 2>&1; then
+	exec rc-service %[1]s reload
 fi
-exec rc-service atom-sing-box start
-`
+exec rc-service %[1]s start
+`, name)
 }
 
-var reloadCmdRe = regexp.MustCompile(`(?m)^([ \t]+reload:[ \t]*)\[[^\]\n]*\]`)
+var reloadCmdRe = regexp.MustCompile(`(?m)^([ 	]+reload:[ 	]*)\[[^\]\n]*atom-sing-box\.service\]`)
 
-// setReloadCommand rewrites the reload command of atom_rules.yaml (singbox.reload) to run cmd.
 func setReloadCommand(yaml, cmd string) (string, error) {
 	if !reloadCmdRe.MatchString(yaml) {
-		return "", fmt.Errorf("atom_rules.yaml has no reload command")
+		return "", fmt.Errorf("atom_rules.yaml has no sing-box reload command")
 	}
-	return reloadCmdRe.ReplaceAllString(yaml, "${1}["+strings.ReplaceAll(cmd, "$", "$$")+"]"), nil
+	yaml = reloadCmdRe.ReplaceAllString(yaml, "${1}["+strings.ReplaceAll(cmd, "$", "$$")+"]")
+	yaml = strings.ReplaceAll(yaml, "[systemctl, reload-or-restart, atom-mihomo.service]", "["+filepath.Join(filepath.Dir(cmd), "reload-mihomo.sh")+"]")
+	for _, backend := range []string{"sing-box", "mihomo"} {
+		yaml = strings.ReplaceAll(yaml, "[systemctl, stop, atom-"+backend+".service]", "[rc-service, --ifstarted, atom-"+backend+", stop]")
+	}
+	return yaml, nil
 }

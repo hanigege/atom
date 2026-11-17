@@ -48,10 +48,11 @@ func main() {
 		fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
 		paths := defaultPaths()
 		fs.StringVar(&paths.Root, "root", paths.Root, "installation root")
-		start := fs.Bool("start", false, "replace old port protections before sing-box starts")
+		start := fs.Bool("start", false, "replace old port protections before the proxy starts")
+		backend := fs.String("backend", "", "proxy backend this hook is preparing")
 		loadAtom := fs.Bool("load-atom", false, "load the base Atom rules before AtomDNS starts")
 		fs.Parse(args)
-		if err := syncNft(paths, *start, *loadAtom); err != nil {
+		if err := syncNft(paths, *start, *loadAtom, *backend); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

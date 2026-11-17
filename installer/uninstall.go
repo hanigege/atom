@@ -31,10 +31,10 @@ func uninstall(p Paths, purge bool, log Logger) error {
 	}
 	teardownNetwork(p, ch, log)
 	if _, err := os.Stat(p.State()); err == nil { // the units are written after install.json
-		for _, f := range []string{p.DNSUnit(), p.SingBoxUnit()} {
+		for _, f := range []string{p.DNSUnit(), p.SingBoxUnit(), p.MihomoUnit()} {
 			os.Remove(f)
 		}
-		p.Init().Forget(log, dnsUnitName, singBoxUnitName)
+		p.Init().Forget(log, dnsUnitName, singBoxUnitName, mihomoUnitName)
 	}
 
 	var failed []string
