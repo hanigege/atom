@@ -38,12 +38,13 @@ In the usual DNS-plus-proxy setup, DNS decides domestic or foreign once, then th
 ## How it works
 
 ```text
-client DNS     ──> atomdns: rule table ─┬─ direct → domestic DNS → real IP
-                                        ├─ proxy  → group X → FakeIP, tells the core "this name goes to X"
-                                        ├─ block  → empty answer
-                                        └─ no match → domestic/foreign split → real IP or FakeIP (Final group)
+client DNS ──> atomdns checks the rule table
+                 ├─ direct   → domestic DNS → real IP
+                 ├─ proxy    → group X → FakeIP, and tells the core to use X
+                 ├─ block    → empty answer
+                 └─ no match → domestic/foreign split → real IP, or FakeIP via Final
 
-client traffic ──> nft (TCP redirect / UDP TProxy) ──> sing-box or mihomo ──> node / direct
+client traffic ──> nft transparent proxy ──> sing-box or mihomo ──> node / direct
 ```
 
 Each FakeIP answer carries the chosen group to the proxy core in an EDNS0 option. When the connection arrives, the core maps the FakeIP back to the name and uses that binding directly, without running its own route rules. See the [core patch](docs/singbox-fakeip-outbound.md) (Chinese).

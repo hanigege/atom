@@ -36,12 +36,13 @@
 ## 怎么工作
 
 ```text
-客户端 DNS  ──> atomdns：规则表 ─┬─ 直连 → 国内 DNS → 真实 IP
-                                ├─ 代理 → 组 X → FakeIP，并通知内核“这个域名走组 X”
-                                ├─ 屏蔽 → 空应答
-                                └─ 没命中 → 国内外判断 → 真实 IP 或 FakeIP（走兜底分组）
+客户端 DNS ──> atomdns 查规则表
+                 ├─ 直连   → 国内 DNS → 真实 IP
+                 ├─ 代理   → 组 X → FakeIP，并告诉内核走组 X
+                 ├─ 屏蔽   → 空应答
+                 └─ 没命中 → 国内外判断 → 真实 IP，或 FakeIP 走兜底分组
 
-客户端流量  ──> nft（TCP redirect / UDP TProxy）──> sing-box 或 mihomo ──> 节点 / 直连
+客户端流量 ──> nft 透明代理 ──> sing-box 或 mihomo ──> 节点 / 直连
 ```
 
 atomdns 每次返回 FakeIP 时，都会通过 EDNS0 选项把这个域名该走哪个组告诉代理内核。连接到达时，内核由 FakeIP 还原出域名，直接按这个绑定出站，不会再过一遍自己的路由规则。细节见 [设计文档](docs/design.md) 和 [内核补丁](docs/singbox-fakeip-outbound.md)。
