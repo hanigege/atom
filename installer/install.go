@@ -378,7 +378,45 @@ func (ins *Installer) installData(panelPort int, log Logger) error {
 	return nil
 }
 
-func (ins *Installer) stepConfig(cfg Config, j *Job) error { return ins.installData(cfg.PanelPort, j) }
+func (ins *Installer) stepConfig(cfg Config, j *Job) error {
+	if err := ins.installData(cfg.PanelPort, j); err != nil {
+		return err
+	}
+	if cfg.keepData {
+		return nil
+	}
+	if err := writeInitialProxyState(ins.Paths, cfg); err != nil {
+		return fmt.Errorf("代理设置: %w", err)
+	}
+	j.Logf("代理内核 → %s", cfg.Backend)
+	return nil
+}
+
+// writeInitialProxyState saves the first proxy state of a new installation, which is atomdns's own default
+// (no nodes, the empty built-in default group, Final on it) with the chosen kernel, so that atomdns starts
+// that kernel the first time. The file holds node credentials later: owner-only.
+func writeInitialProxyState(p Paths, cfg Config) error {
+	state := map[string]any{
+		"version": 0,
+		"nodes":   []any{},
+		"groups": []any{map[string]any{
+			"id": defaultGroup, "name": "默认代理", "type": "selector", "members": []string{},
+		}},
+		"final": map[string]any{"members": []string{defaultGroup}, "selected": defaultGroup},
+		"settings": map[string]any{
+			"backend": cfg.Backend, "fakeip_range": strings.TrimSpace(cfg.FakeIPRange), "mixed_port": cfg.MixedPort,
+		},
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(p.Data(), "webinfo", "atom_proxy.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return writeFileAtomic(path, append(data, '\n'), 0o600)
+}
 
 // writeNetworkFiles renders the nft rules, the policy-route script and the two units from the state.
 func (ins *Installer) writeNetworkFiles(st *InstallState, log Logger) error {
@@ -678,12 +716,31 @@ func (ins *Installer) stepSettings(cfg Config, j *Job) error {
 			}
 		}
 	}
-	if strings.TrimSpace(cfg.Nodes) != "" {
-		ids, err := importNodes(api, cfg.Nodes)
+	var providers []string
+	if sub := strings.TrimSpace(cfg.SubscriptionURL); sub != "" && cfg.Backend == "mihomo" {
+		id, err := addSubscription(api, sub)
 		if err != nil {
-			warn("节点", err)
+			warn("订阅", err)
 		} else {
-			j.Logf("已导入 %d 个节点，放进「默认代理」组", len(ids))
+			providers = []string{id}
+			j.Logf("已添加订阅")
+		}
+	}
+	var ids []string
+	if strings.TrimSpace(cfg.Nodes) != "" {
+		var err error
+		if ids, err = importNodes(api, cfg.Nodes); err != nil {
+			warn("节点", err)
+			ids = nil
+		} else {
+			j.Logf("已导入 %d 个节点", len(ids))
+		}
+	}
+	if len(ids) > 0 || len(providers) > 0 {
+		if err := fillDefaultGroup(api, ids, providers); err != nil {
+			warn("默认代理组", err)
+		} else {
+			j.Logf("节点和订阅已放进「默认代理」组")
 		}
 	}
 	return nil
@@ -723,8 +780,8 @@ func setLogin(api *apiClient, cfg Config, j *Job) {
 	j.Logf("已设置面板登录，用户名 %s", user)
 }
 
-// importNodes imports the pasted nodes and makes them the members of the built-in default group; a node that
-// is in no group carries no traffic, and the default group is what Final selects.
+// importNodes imports the pasted nodes and returns their IDs; a node that is in no group carries no traffic,
+// see fillDefaultGroup.
 func importNodes(api *apiClient, text string) ([]string, error) {
 	var out struct {
 		Nodes []struct {
@@ -738,18 +795,43 @@ func importNodes(api *apiClient, text string) ([]string, error) {
 	for i, n := range out.Nodes {
 		ids[i] = n.ID
 	}
+	return ids, nil
+}
+
+// addSubscription saves one subscription and returns its ID.
+func addSubscription(api *apiClient, url string) (string, error) {
+	var out struct {
+		Provider struct {
+			ID string `json:"id"`
+		} `json:"provider"`
+	}
+	if err := api.call("POST", "/providers", map[string]any{"name": "订阅", "url": url}, &out); err != nil {
+		return "", err
+	}
+	return out.Provider.ID, nil
+}
+
+// fillDefaultGroup makes the nodes and subscriptions the members of the built-in default group, which is
+// what Final selects.
+func fillDefaultGroup(api *apiClient, ids, providers []string) error {
 	var g struct {
 		Name string `json:"name"`
 		Type string `json:"type"`
 	}
 	if err := api.call("GET", "/groups/"+defaultGroup, nil, &g); err != nil {
-		return ids, fmt.Errorf("节点已导入，但读不到默认组：%w", err)
+		return fmt.Errorf("读不到默认组：%w", err)
+	}
+	if ids == nil {
+		ids = []string{}
 	}
 	body := map[string]any{"name": g.Name, "type": g.Type, "members": ids}
-	if err := api.call("PUT", "/groups/"+defaultGroup, body, nil); err != nil {
-		return ids, fmt.Errorf("节点已导入，但没能放进默认组：%w", err)
+	if len(providers) > 0 {
+		body["providers"] = providers
 	}
-	return ids, nil
+	if err := api.call("PUT", "/groups/"+defaultGroup, body, nil); err != nil {
+		return fmt.Errorf("没能放进默认组：%w", err)
+	}
+	return nil
 }
 
 func (ins *Installer) stepCheck(cfg Config, j *Job) error {

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -27,6 +28,11 @@ type Config struct {
 	FakeIPRange   string   `json:"fakeip_range"`
 	MixedPort     int      `json:"mixed_port"`
 	Nodes         string   `json:"nodes"` // share links, Clash YAML or sing-box JSON; may be empty
+	// Backend is the proxy kernel of a new installation: "sing-box" or "mihomo", no default. An installation
+	// that keeps its data (a reinstall, a reconfigure) keeps the saved choice and ignores both fields.
+	Backend string `json:"backend"`
+	// SubscriptionURL is one subscription for the built-in default group; only with the mihomo kernel.
+	SubscriptionURL string `json:"subscription_url"`
 
 	// keepData is set by the server, not the client: the data of an earlier installation is there, and its
 	// settings, rules and nodes win over the DNS and sing-box answers.
@@ -155,6 +161,24 @@ func (c *Config) Validate(ifaces []Iface, installerPort int, busy func(port int)
 
 	if c.keepData {
 		return errs
+	}
+	switch c.Backend {
+	case "sing-box", "mihomo":
+	case "":
+		add("backend", "选择代理内核")
+	default:
+		add("backend", "代理内核只能是 sing-box 或 mihomo")
+	}
+	if sub := strings.TrimSpace(c.SubscriptionURL); sub != "" {
+		u, err := url.Parse(sub)
+		switch {
+		case c.Backend != "mihomo":
+			add("subscription_url", "订阅只能在 mihomo 内核下使用")
+		case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
+			add("subscription_url", "订阅地址要 http:// 或 https:// 开头")
+		case len(sub) > 8192:
+			add("subscription_url", "订阅地址最长 8192 字节")
+		}
 	}
 	if _, err := parseUpstreams(c.Domestic, false, "d"); err != nil {
 		add("domestic", "%v", err)

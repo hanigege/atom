@@ -188,7 +188,7 @@ func TestCheckFakeIPRange(t *testing.T) {
 func TestValidatePanelLogin(t *testing.T) {
 	ifs := []Iface{{Name: "eth0"}}
 	free := func(int) string { return "" }
-	base := Config{Topology: "bypass", LAN: []string{"eth0"}, PanelPort: 80, Domestic: defaultDomestic, Foreign: defaultForeign, FakeIPRange: defaultFakeIP, MixedPort: 7890}
+	base := Config{Topology: "bypass", LAN: []string{"eth0"}, PanelPort: 80, Domestic: defaultDomestic, Foreign: defaultForeign, FakeIPRange: defaultFakeIP, MixedPort: 7890, Backend: "sing-box"}
 	for _, tc := range []struct {
 		user, password, field string
 	}{
@@ -239,7 +239,7 @@ func TestAPIClientSendsTheLoginKey(t *testing.T) {
 func TestValidate(t *testing.T) {
 	ifs := []Iface{{Name: "eth0"}, {Name: "eth1"}}
 	free := func(int) string { return "" }
-	base := Config{Topology: "bypass", LAN: []string{"eth0"}, PanelPort: 80, Domestic: defaultDomestic, Foreign: defaultForeign, FakeIPRange: defaultFakeIP, MixedPort: 7890}
+	base := Config{Topology: "bypass", LAN: []string{"eth0"}, PanelPort: 80, Domestic: defaultDomestic, Foreign: defaultForeign, FakeIPRange: defaultFakeIP, MixedPort: 7890, Backend: "sing-box"}
 	if errs := base.Validate(ifs, 9996, free); len(errs) != 0 {
 		t.Fatalf("a good configuration: %+v", errs)
 	}
@@ -1139,7 +1139,7 @@ func TestClientRoutes(t *testing.T) {
 			t.Errorf("%q %q: want an error on %s, got %v", c.gw, c.nets, c.field, errs)
 		}
 	}
-	cfg := Config{Topology: "gateway", LAN: lan, WAN: "ens34", AcceptGateway: true, LANGateway: "10.0.3.1", ClientNets: "10.0.0.0/24", PanelPort: 80, Domestic: defaultDomestic, Foreign: defaultForeign, FakeIPRange: defaultFakeIP, MixedPort: 7890}
+	cfg := Config{Topology: "gateway", LAN: lan, WAN: "ens34", AcceptGateway: true, LANGateway: "10.0.3.1", ClientNets: "10.0.0.0/24", PanelPort: 80, Domestic: defaultDomestic, Foreign: defaultForeign, FakeIPRange: defaultFakeIP, MixedPort: 7890, Backend: "sing-box"}
 	if field(cfg.Validate(ifaces, 9996, func(int) string { return "" }), "lan_gateway") == "" {
 		t.Error("Validate must check the client routes of a gateway")
 	}
@@ -1242,7 +1242,7 @@ func TestReplyViaRouter(t *testing.T) {
 			t.Errorf("router %q: ok=%v", router, got)
 		}
 	}
-	c := Config{Topology: "bypass", LAN: []string{"eth0"}, PanelPort: 80, Domestic: defaultDomestic, Foreign: defaultForeign, FakeIPRange: defaultFakeIP, MixedPort: 7890, ReplyVia: true}
+	c := Config{Topology: "bypass", LAN: []string{"eth0"}, PanelPort: 80, Domestic: defaultDomestic, Foreign: defaultForeign, FakeIPRange: defaultFakeIP, MixedPort: 7890, Backend: "sing-box", ReplyVia: true}
 	hasRouter := false
 	for _, e := range c.Validate(ifs, 9996, func(int) string { return "" }) {
 		hasRouter = hasRouter || e.Field == "router"
@@ -1970,5 +1970,69 @@ func TestRequireServicesActiveChecksOnlyTheSelectedBackend(t *testing.T) {
 		if err := requireServicesActive(f, p); err == nil {
 			t.Errorf("%s: atom-dns is down", tc.backend)
 		}
+	}
+}
+
+func TestValidateBackend(t *testing.T) {
+	ifs := []Iface{{Name: "eth0"}}
+	free := func(int) string { return "" }
+	base := Config{Topology: "bypass", LAN: []string{"eth0"}, PanelPort: 80, Domestic: defaultDomestic, Foreign: defaultForeign, FakeIPRange: defaultFakeIP, MixedPort: 7890}
+	for _, tc := range []struct {
+		backend, sub, field string
+		keep                bool
+	}{
+		{"", "", "backend", false},
+		{"clash", "", "backend", false},
+		{"sing-box", "", "", false},
+		{"mihomo", "", "", false},
+		{"mihomo", "https://example.com/sub?token=x", "", false},
+		{"mihomo", "ftp://example.com/sub", "subscription_url", false},
+		{"mihomo", "not a url", "subscription_url", false},
+		{"sing-box", "https://example.com/sub", "subscription_url", false},
+		{"", "", "", true}, // data of an earlier installation: the saved choice stays
+	} {
+		c := base
+		c.Backend, c.SubscriptionURL, c.keepData = tc.backend, tc.sub, tc.keep
+		errs := c.Validate(ifs, 9996, free)
+		got := ""
+		if len(errs) > 0 {
+			got = errs[0].Field
+		}
+		if len(errs) > 1 || got != tc.field {
+			t.Errorf("%+v: %+v, want %q", tc, errs, tc.field)
+		}
+	}
+}
+
+func TestInitialProxyState(t *testing.T) {
+	root := t.TempDir()
+	p := Paths{Root: root}
+	cfg := Config{Backend: "mihomo", FakeIPRange: " 28.0.0.0/8 ", MixedPort: 7891}
+	if err := writeInitialProxyState(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(p.Data(), "webinfo", "atom_proxy.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st struct {
+		Groups   []struct{ ID, Name string }
+		Final    struct{ Selected string }
+		Settings struct {
+			Backend     string
+			FakeIPRange string `json:"fakeip_range"`
+			MixedPort   int    `json:"mixed_port"`
+		}
+	}
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Settings.Backend != "mihomo" || st.Settings.FakeIPRange != "28.0.0.0/8" || st.Settings.MixedPort != 7891 ||
+		len(st.Groups) != 1 || st.Groups[0].ID != defaultGroup || st.Final.Selected != defaultGroup {
+		t.Fatalf("unexpected state: %s", data)
+	}
+	// The installer's own reading of the selected kernel agrees.
+	if backend, _, _ := p.proxyService(); backend != "mihomo" {
+		t.Fatalf("proxyService backend = %q", backend)
 	}
 }
