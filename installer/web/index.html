@@ -117,6 +117,7 @@ textarea.inp{font-family:var(--mono);font-size:12.5px;line-height:1.6;min-height
 .topo .tk{width:18px;height:18px;border-radius:50%;border:1.5px solid var(--faint);display:grid;place-items:center;flex:none}
 .topo.sel .tk{border-color:var(--accent);background:var(--accent);color:var(--on-accent)}
 .topo .tk svg{width:11px;height:11px}
+.topo ul{margin:0;padding-left:18px;color:var(--muted);font-size:13px}
 .art .ln{stroke:var(--faint);stroke-width:1.6;fill:none}
 .art .hot{stroke:var(--accent);stroke-width:1.8;fill:none}
 .art .lan{stroke:var(--lan);stroke-width:2;fill:none}
@@ -280,12 +281,12 @@ const ART = {
   </svg>`,
 };
 
-const FIELD_STEP = { topology: 'net', lan: 'net', wan: 'net', accept_gateway: 'net', lan_gateway: 'net', client_nets: 'net', router: 'net', panel_port: 'net', panel_user: 'net', panel_password: 'net', panel_login_off: 'net', domestic: 'dns', foreign: 'dns', fakeip_range: 'sb', mixed_port: 'sb' };
-// the DNS and sing-box steps are skipped when the data of an earlier installation is there: its settings stay
+const FIELD_STEP = { topology: 'net', lan: 'net', wan: 'net', accept_gateway: 'net', lan_gateway: 'net', client_nets: 'net', router: 'net', panel_port: 'net', panel_user: 'net', panel_password: 'net', panel_login_off: 'net', domestic: 'dns', foreign: 'dns', backend: 'kernel', fakeip_range: 'sb', mixed_port: 'sb', subscription_url: 'sb' };
+// the DNS, kernel and proxy steps are skipped when the data of an earlier installation is there: its settings stay
 function steps() {
   const all = [{ id: 'env', name: '环境检查', view: viewEnv }, { id: 'net', name: '网络', view: viewNet }, { id: 'dns', name: 'DNS 上游', view: viewDNS },
-    { id: 'sb', name: '代理', view: viewSB }, { id: 'confirm', name: '确认', view: viewConfirm }];
-  return S.state.has_data ? all.filter(x => x.id !== 'dns' && x.id !== 'sb') : all;
+    { id: 'kernel', name: '代理内核', view: viewKernel }, { id: 'sb', name: '代理', view: viewSB }, { id: 'confirm', name: '确认', view: viewConfirm }];
+  return S.state.has_data ? all.filter(x => x.id !== 'dns' && x.id !== 'kernel' && x.id !== 'sb') : all;
 }
 function stepId() { return steps()[S.step].id; }
 const S = { routesEdited: false, state: null, step: 0, cfg: null, errors: {}, freed: [], freeing: null, freeErr: '', job: null, jobNext: 0, log: [], phase: 'wizard', redirectTimer: null, paused: false, logOpen: false };
@@ -298,7 +299,7 @@ function initCfg(st) {
     reply_via: false, router: '',
     panel_port: st.defaults.panel_port, panel_user: '', panel_password: '', panel_login_off: false,
     domestic: st.defaults.domestic, foreign: st.defaults.foreign,
-    fakeip_range: st.defaults.fakeip_range, mixed_port: st.defaults.mixed_port, nodes: '',
+    backend: '', fakeip_range: st.defaults.fakeip_range, mixed_port: st.defaults.mixed_port, subscription_url: '', nodes: '',
   };
   if (st.reconfigure && st.current) {
     const cur = st.current;
@@ -379,7 +380,7 @@ function viewNet() {
       <div class="sec"><label class="lbl" for="client_nets">客户端网段</label><textarea class="inp${bad('client_nets')}" id="client_nets" data-bind="client_nets" spellcheck="false" placeholder="每行一个，例如 10.0.0.0/24">${esc(c.client_nets)}</textarea>${errOf('client_nets')}</div></div>` + '</div>';
     h += '<div class="side wan">' + sideHead('wan', I.globe, 'WAN 网卡', '外网 · 单选') + '<div class="ifs">' + ifs.map(i => ifRow(i, { name: 'wan', bind: 'wan', selected: c.wan === i.name })).join('') + '</div>' + errOf('wan') + '</div>';
     h += '</div>';
-    h += `<div class="alert">${I.warn}<div class="grow"><div>主路由需要把 FakeIP 网段和要代理的网段转到这台机器：从 LAN 网卡进来的 TCP、UDP 全部进入 sing-box，其余（如 ping）转发并 NAT 到 WAN。</div>
+    h += `<div class="alert">${I.warn}<div class="grow"><div>主路由需要把 FakeIP 网段和要代理的网段转到这台机器：从 LAN 网卡进来的 TCP、UDP 全部进入代理内核，其余（如 ping）转发并 NAT 到 WAN。</div>
       <label class="agree"><input type="checkbox" data-bind="accept_gateway" ${c.accept_gateway ? 'checked' : ''}>我知道，继续</label>${errOf('accept_gateway')}</div></div>`;
   }
   h += `<div class="sec short"><label class="lbl" for="panel_port">面板端口</label><input class="inp${bad('panel_port')}" id="panel_port" type="number" min="1" max="65535" data-bind="panel_port" value="${esc(c.panel_port)}">${errOf('panel_port')}</div>`;
@@ -399,12 +400,26 @@ function viewDNS() {
   </div>`;
 }
 
+function viewKernel() {
+  const c = S.cfg;
+  const kernel = (v, items) => `<label class="topo${c.backend === v ? ' sel' : ''}">
+    <input type="radio" name="backend" value="${v}" data-bind="backend" ${c.backend === v ? 'checked' : ''}>
+    <span class="nm"><span class="tk">${c.backend === v ? I.ok : ''}</span>${v}</span>
+    <ul>${items.map(x => `<li>${x}</li>`).join('')}</ul>
+  </label>`;
+  return head('代理内核') + '<div class="topos">' +
+    kernel('sing-box', ['节点组：手动、自动测速', '支持 naive 节点']) +
+    kernel('mihomo', ['节点组：手动、自动测速、故障转移、负载均衡', '支持订阅']) +
+    '</div>' + errOf('backend') + '<div class="lbl">安装后可在面板「设置 → 代理」切换。</div>';
+}
+
 function viewSB() {
   const c = S.cfg;
   return head('代理') + `<div class="g2">
     <div class="sec"><label class="lbl" for="fakeip_range">FakeIP 网段</label><input class="inp mono${bad('fakeip_range')}" id="fakeip_range" type="text" data-bind="fakeip_range" value="${esc(c.fakeip_range)}" spellcheck="false">${errOf('fakeip_range')}</div>
     <div class="sec"><label class="lbl" for="mixed_port">mixed 代理端口</label><input class="inp${bad('mixed_port')}" id="mixed_port" type="number" min="1" max="65535" data-bind="mixed_port" value="${esc(c.mixed_port)}">${errOf('mixed_port')}</div>
   </div>
+  ${c.backend === 'mihomo' ? `<div class="sec"><label class="lbl" for="subscription_url">订阅地址 <span class="tag">可选</span></label><input class="inp mono${bad('subscription_url')}" id="subscription_url" type="text" data-bind="subscription_url" value="${esc(c.subscription_url)}" placeholder="https://" spellcheck="false">${errOf('subscription_url')}</div>` : ''}
   <div class="sec"><label class="lbl" for="nodes">节点 <span class="tag">可选</span></label><textarea class="inp" id="nodes" data-bind="nodes" spellcheck="false" placeholder="分享链接（每行一个）、Clash YAML 或 sing-box JSON" style="min-height:180px">${esc(c.nodes)}</textarea></div>`;
 }
 
@@ -426,6 +441,7 @@ function viewConfirm() {
   if (S.state.has_data) {
     h += tile('设置', '沿用已有数据', '', true);
   } else {
+    h += tile('代理内核', esc(c.backend), c.backend === 'mihomo' ? (c.subscription_url.trim() ? '已填写订阅地址' : '未填写订阅地址') : '', true);
     h += tile('国内上游', `${lines(c.domestic)} 个`);
     h += tile('国外上游', `${lines(c.foreign)} 个`);
     h += tile('FakeIP 网段', `<span class="mono">${esc(c.fakeip_range)}</span>`);
@@ -514,7 +530,7 @@ function render() {
     content = list[S.step].view();
     pct = Math.round((S.step + 1) / list.length * 100);
     nav = `<button class="btn ghost" data-act="prev" ${S.step === 0 ? 'disabled' : ''}>${I.left}上一步</button><span class="sp"></span>` +
-      (last ? `<button class="btn pri lg" data-act="install">开始安装</button>` : `<button class="btn pri lg" data-act="next" ${S.step === 0 && !envReady() ? 'disabled' : ''}>下一步 ${I.right}</button>`);
+      (last ? `<button class="btn pri lg" data-act="install">开始安装</button>` : `<button class="btn pri lg" data-act="next" ${(S.step === 0 && !envReady()) || (stepId() === 'kernel' && !S.cfg.backend) ? 'disabled' : ''}>下一步 ${I.right}</button>`);
   } else if (S.phase === 'progress') {
     const j = S.job, list = runSteps();
     left = rail(list, list.length - 1);
@@ -646,7 +662,7 @@ document.addEventListener('input', ev => bind(ev.target));
 document.addEventListener('change', ev => {
   bind(ev.target);
   const f = ev.target.dataset && ev.target.dataset.bind;
-  if (['topology', 'lan_one', 'lan_multi', 'wan', 'accept_gateway', 'reply_via', 'panel_login_off'].includes(f)) {
+  if (['topology', 'backend', 'lan_one', 'lan_multi', 'wan', 'accept_gateway', 'reply_via', 'panel_login_off'].includes(f)) {
     render();
     const again = document.querySelector(`[data-bind="${f}"][value="${CSS.escape(ev.target.value)}"]`) || document.querySelector(`[data-bind="${f}"]`);
     if (again) again.focus();
@@ -675,6 +691,7 @@ function bind(t) {
     } else if (t.value === 'gateway') c.lan = c.lan.filter(x => x !== c.wan).slice(0, 1);
     else if (t.value === 'bypass') c.lan = [(def || ifs[0] || { name: '' }).name].filter(Boolean);
   }
+  else if (f === 'backend') { c.backend = t.value; if (t.value !== 'mihomo') c.subscription_url = ''; }
   else if (f === 'panel_port' || f === 'mixed_port') c[f] = parseInt(t.value, 10) || 0;
   else c[f] = t.value;
   if (['topology', 'lan_multi', 'wan'].includes(f)) prefillRoutes();
