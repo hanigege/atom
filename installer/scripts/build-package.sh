@@ -113,7 +113,7 @@ if [ -n "$SINGBOX_BIN" ]; then
     got="$(od -An -tx1 -j18 -N2 "$bin" | tr -d ' \n')"
     [ "$got" = "${want}00" ] || { echo "$bin: ELF machine $got, expected ${want}00 for $arch" >&2; exit 2; }
     case "$pkgname" in
-      *-musl) ! strings -a "$bin" | grep -q 'GLIBC_[0-9]' || { echo "$bin is for musl but references glibc" >&2; exit 2; } ;;
+      *-musl) [ -z "$(strings -a "$bin" | grep -oE 'GLIBC_[0-9]+' | head -1 || true)" ] || { echo "$bin is for musl but references glibc" >&2; exit 2; } ;;
       *) need="$(strings -a "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -uV | tail -1 || true)"
          if [ -n "$need" ] && [ "$(printf '%s\n2.35\n' "$need" | sort -V | tail -1)" != "2.35" ]; then
            echo "$bin needs glibc $need, newer than Ubuntu 22.04's 2.35" >&2; exit 2

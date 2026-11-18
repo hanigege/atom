@@ -63,6 +63,7 @@ if [ ! -f "$WORK/.keyring-ok" ]; then
   touch "$WORK/.keyring-ok"
 fi
 
+rm -f "$OUT/sing-box-commit"
 TAGS_GLIBC="$(cat "$SINGBOX_DIR/release/DEFAULT_BUILD_TAGS")"
 LDFLAGS_SHARED="$(cat "$SINGBOX_DIR/release/LDFLAGS")"
 for t in $TARGETS; do
@@ -81,7 +82,8 @@ for t in $TARGETS; do
   # the env subshell exports CC, CXX and CGO_LDFLAGS for this target only
   (
     cd "$CRONET"
-    eval "$(go run ./cmd/build-naive --target=linux/$arch $libc env --export)"
+    envvars="$(go run ./cmd/build-naive --target=linux/$arch $libc env --export)"
+    eval "$envvars"
     cd "$SINGBOX_DIR"
     CGO_ENABLED=1 GOOS=linux GOARCH=$arch go build -trimpath -tags "$tags" \
       -ldflags "-X github.com/sagernet/sing-box/constant.Version=$VERSION $LDFLAGS_SHARED -s -w -buildid=" \
@@ -89,4 +91,6 @@ for t in $TARGETS; do
   )
   ls -l "$OUT/sing-box-$t"
 done
-git -C "$SINGBOX_DIR" rev-parse HEAD > "$OUT/sing-box-commit" 2>/dev/null || echo unknown > "$OUT/sing-box-commit"
+# the commit stamp is only written when all four binaries are there, so a partial --targets run is never accepted
+all=1; for t in amd64 arm64 amd64-musl arm64-musl; do [ -f "$OUT/sing-box-$t" ] || all=""; done
+[ -z "$all" ] || git -C "$SINGBOX_DIR" rev-parse HEAD > "$OUT/sing-box-commit"
