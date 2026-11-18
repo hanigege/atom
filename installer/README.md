@@ -75,7 +75,21 @@ go vet ./... && go test ./...        # 纯函数的测试，Mac 上就能跑
 scripts/build-package.sh --version 0.1.0 --atomdns-dir DIR   # 一次出四个包、install.sh、SHA256SUMS
 ```
 
-DIR 里是 atomdns 的发布产物 `atomdns-linux-<变体>.tar.gz` 和 `atom-webui.tar.gz`；包与变体对应：amd64←`amd64`、arm64←`arm64-gnu`、amd64-musl←`amd64-musl`、arm64-musl←`arm64`。sing-box 和 `atom-installer` 由脚本按架构编。`install.sh.in` 是模板，`build-package.sh` 把版本和四个包的 sha256 写进去。包里的 `atom-installer` 是 Go 标准库写的单个静态文件，向导页面内嵌在里面（`web/index.html`）。
+DIR 里是 atomdns 的发布产物 `atomdns-linux-<变体>.tar.gz` 和 `atom-webui.tar.gz`；包与变体对应：amd64←`amd64`、arm64←`arm64-gnu`、amd64-musl←`amd64-musl`、arm64-musl←`arm64`。`atom-installer` 和 mihomo 由脚本按架构编（静态，不带 cgo）。`install.sh.in` 是模板，`build-package.sh` 把版本和四个包的 sha256 写进去。包里的 `atom-installer` 是 Go 标准库写的单个静态文件，向导页面内嵌在里面（`web/index.html`）。
+
+### sing-box 的 naive 出站
+
+naive 依赖 cronet，要用 cgo 静态链接，只能在 Linux 构建机（vm92，`/root/atom-build/naive`）上用 cronet-go 下载的 Chromium 工具链编。Mac 上直接交叉编译（不给 `--sing-box-bin`）得到的 sing-box 不含 naive，只适合开发。
+
+```bash
+# 在 vm92 上；源码目录是父仓库固定的 sing-box 提交（git bundle 或 rsync 过去），go 需要 1.25 以上
+installer/scripts/build-sing-box.sh --sing-box-dir /root/atom-build/naive/sing-box --out /root/atom-build/naive/out
+# 回到 Mac，把 out 目录拷过来，打包时指定
+scripts/build-package.sh --version 0.1.0 --atomdns-dir DIR --sing-box-bin /Users/tom/nas/u.2/mac-use/atom/sing-box-bin
+```
+
+`out` 里有 `sing-box-{amd64,arm64,amd64-musl,arm64-musl}` 和记录源码提交的 `sing-box-commit`；提交和 `--sing-box-dir` 不一致时打包会拒绝。glibc 版链接 Debian bullseye sysroot（glibc 2.31），musl 版用 OpenWrt sysroot 并带 `with_musl` 标签。`manifest.json` 的 `sing-box.naive` 表示这个 sing-box 是否带 naive。首次运行要下载 Chromium 工具链和 sysroot（每个目标约几个 GB），之后复用 `--work` 目录。
+
 
 ## 发布支持在线升级的版本
 

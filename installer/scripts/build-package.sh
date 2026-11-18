@@ -5,11 +5,14 @@
 #
 #   installer/scripts/build-package.sh --version 0.1.0 --atomdns-dir DIR \
 #       [--webui FILE] [--atomdns-version STR] [--config DIR] [--sing-box-dir DIR] [--sing-box-version STR] \
-#       [--repo owner/name] [--out DIR] [--signing-key FILE]
+#       [--sing-box-bin DIR] [--repo owner/name] [--out DIR] [--signing-key FILE]
 #
 # DIR holds atomdns-linux-<variant>.tar.gz (each with an `atomdns` program in it) and atom-webui.tar.gz.
 # Package <- atomdns variant:  amd64 <- amd64,  arm64 <- arm64-gnu,  amd64-musl <- amd64-musl,  arm64-musl <- arm64
-# sing-box and atom-installer are static (CGO_ENABLED=0), one build per architecture, shared by glibc and musl.
+# atom-installer and mihomo are static (CGO_ENABLED=0), one build per architecture, shared by glibc and musl.
+# sing-box without --sing-box-bin is cross-compiled here the same way, without the naive outbound (for development).
+# With --sing-box-bin DIR it is taken from DIR/sing-box-<package> (one per package, built with naive on the Linux
+# build host by build-sing-box.sh, which also writes DIR/sing-box-commit); the commit must match --sing-box-dir.
 #
 # Output (default installer/dist): atom-<version>-linux-{amd64,arm64,amd64-musl,arm64-musl}.tar.gz, install.sh
 # (this version and the four sha256 written into it), SHA256SUMS.
@@ -19,7 +22,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$(cd "$HERE/.." && pwd)"
 ATOM_ROOT="$(cd "$INSTALLER/.." && pwd)"
 SIGNING_KEY="${ATOM_RELEASE_SIGNING_KEY_FILE:-}"
-VERSION="" ATOMDNS_DIR="" WEBUI="" ATOMDNS_VERSION="unknown" SINGBOX_VERSION=""
+VERSION="" ATOMDNS_DIR="" WEBUI="" ATOMDNS_VERSION="unknown" SINGBOX_VERSION="" SINGBOX_BIN=""
 CONFIG="$ATOM_ROOT/atomdns/config" SINGBOX_DIR="$ATOM_ROOT/sing-box" MIHOMO_DIR="$ATOM_ROOT/mihomo" REPO="jasonxtt/atom" OUT="$INSTALLER/dist"
 
 while [ $# -gt 0 ]; do
@@ -31,6 +34,7 @@ while [ $# -gt 0 ]; do
     --config) CONFIG="$2"; shift 2 ;;
     --sing-box-dir) SINGBOX_DIR="$2"; shift 2 ;;
     --sing-box-version) SINGBOX_VERSION="$2"; shift 2 ;;
+    --sing-box-bin) SINGBOX_BIN="$2"; shift 2 ;;
     --repo) REPO="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --signing-key) SIGNING_KEY="$2"; shift 2 ;;
@@ -54,6 +58,16 @@ for p in $PACKAGES; do
   v="${p##*:}"
   [ -f "$ATOMDNS_DIR/atomdns-linux-$v.tar.gz" ] || { echo "missing $ATOMDNS_DIR/atomdns-linux-$v.tar.gz" >&2; exit 2; }
 done
+
+if [ -n "$SINGBOX_BIN" ]; then
+  [ -d "$SINGBOX_BIN" ] || { echo "--sing-box-bin $SINGBOX_BIN is not a directory" >&2; exit 2; }
+  want_commit="$(git -C "$SINGBOX_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+  [ "$(cat "$SINGBOX_BIN/sing-box-commit" 2>/dev/null || true)" = "$want_commit" ] || \
+    { echo "$SINGBOX_BIN/sing-box-commit does not match sing-box commit $want_commit; rebuild with build-sing-box.sh" >&2; exit 2; }
+  for p in $PACKAGES; do
+    [ -f "$SINGBOX_BIN/sing-box-${p%%:*}" ] || { echo "missing $SINGBOX_BIN/sing-box-${p%%:*}" >&2; exit 2; }
+  done
+fi
 
 sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
 commit() { git -C "$1" rev-parse --short HEAD 2>/dev/null || echo unknown; }
@@ -90,12 +104,30 @@ for p in $PACKAGES; do
   esac
 done
 
+# Prebuilt sing-box: right architecture and, for musl packages, no glibc symbols.
+if [ -n "$SINGBOX_BIN" ]; then
+  for p in $PACKAGES; do
+    IFS=: read -r pkgname arch variant <<<"$p"
+    bin="$SINGBOX_BIN/sing-box-$pkgname"
+    want=3e; [ "$arch" = arm64 ] && want=b7
+    got="$(od -An -tx1 -j18 -N2 "$bin" | tr -d ' \n')"
+    [ "$got" = "${want}00" ] || { echo "$bin: ELF machine $got, expected ${want}00 for $arch" >&2; exit 2; }
+    case "$pkgname" in
+      *-musl) ! strings -a "$bin" | grep -q 'GLIBC_[0-9]' || { echo "$bin is for musl but references glibc" >&2; exit 2; } ;;
+      *) need="$(strings -a "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -uV | tail -1 || true)"
+         if [ -n "$need" ] && [ "$(printf '%s\n2.35\n' "$need" | sort -V | tail -1)" != "2.35" ]; then
+           echo "$bin needs glibc $need, newer than Ubuntu 22.04's 2.35" >&2; exit 2
+         fi ;;
+    esac
+  done
+fi
+
 (cd "$INSTALLER" && go vet ./... && go test ./... >/dev/null)
 for arch in amd64 arm64; do
   mkdir -p "$STAGE/build/$arch"
   (cd "$INSTALLER" && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$VERSION -X main.updatePublicKey=$UPDATE_PUBLIC_KEY" \
     -o "$STAGE/build/$arch/atom-installer" .)
-  (cd "$SINGBOX_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+  [ -n "$SINGBOX_BIN" ] || (cd "$SINGBOX_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
     -tags "$(cat release/DEFAULT_BUILD_TAGS_OTHERS)" \
     -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$SINGBOX_VERSION $(cat release/LDFLAGS)" \
     -o "$STAGE/build/$arch/sing-box" ./cmd/sing-box)
@@ -110,6 +142,7 @@ else
   mktar() { COPYFILE_DISABLE=1 tar -C "$1" --no-xattrs --no-mac-metadata --uid 0 --gid 0 --uname root --gname root -czf "$2" "$3"; }
 fi
 
+SINGBOX_NAIVE=false; [ -z "$SINGBOX_BIN" ] || SINGBOX_NAIVE=true
 SHAS=""
 for p in $PACKAGES; do
   IFS=: read -r pkgname arch variant <<<"$p"
@@ -118,7 +151,8 @@ for p in $PACKAGES; do
   PKG="$STAGE/$pkgname/$NAME"
   mkdir -p "$PKG/bin" "$PKG/config"
   cp "$STAGE/x-$variant/atomdns" "$PKG/bin/atomdns"
-  cp "$STAGE/build/$arch/sing-box" "$STAGE/build/$arch/mihomo" "$STAGE/build/$arch/atom-installer" "$PKG/bin/"
+  cp "$STAGE/build/$arch/mihomo" "$STAGE/build/$arch/atom-installer" "$PKG/bin/"
+  if [ -n "$SINGBOX_BIN" ]; then cp "$SINGBOX_BIN/sing-box-$pkgname" "$PKG/bin/sing-box"; else cp "$STAGE/build/$arch/sing-box" "$PKG/bin/sing-box"; fi
   cp "$WEBUI" "$PKG/atom-webui.tar.gz"
   chmod 0755 "$PKG"/bin/*
   (cd "$CONFIG" && tar -cf - --exclude README.md --exclude .DS_Store .) | (cd "$PKG/config" && tar -xf -)
@@ -129,7 +163,7 @@ for p in $PACKAGES; do
   "libc": "$libc",
   "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "atomdns": {"version": "$ATOMDNS_VERSION", "commit": "$(commit "$ATOM_ROOT/atomdns")", "sha256": "$(sha256 "$PKG/bin/atomdns")"},
-  "sing-box": {"commit": "$(commit "$SINGBOX_DIR")", "sha256": "$(sha256 "$PKG/bin/sing-box")"},
+  "sing-box": {"commit": "$(commit "$SINGBOX_DIR")", "naive": $SINGBOX_NAIVE, "sha256": "$(sha256 "$PKG/bin/sing-box")"},
   "mihomo": {"commit": "$(commit "$MIHOMO_DIR")", "sha256": "$(sha256 "$PKG/bin/mihomo")"},
   "webui": {"sha256": "$(sha256 "$PKG/atom-webui.tar.gz")"},
   "installer": {"commit": "$(commit "$ATOM_ROOT")", "sha256": "$(sha256 "$PKG/bin/atom-installer")"}
