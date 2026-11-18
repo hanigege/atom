@@ -71,7 +71,7 @@ table inet atom {
 	}
 
 	chain output_tcp {
-		type nat hook output priority dstnat; policy accept;
+		type nat hook output priority -100; policy accept;
 		ip daddr @output_fakeip4 meta l4proto tcp ct direction original counter redirect to :7892
 	}
 
