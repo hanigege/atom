@@ -756,18 +756,16 @@ func (ins *Installer) stepCheck(cfg Config, j *Job) error {
 	api := newAPIClient(cfg.PanelPort, ins.Paths.Data())
 	st, err := api.waitStatus(90*time.Second, func(s *apiStatus) bool { return s.SingBox.Running && s.SingBox.InSync })
 	if err != nil {
-		msg := "sing-box 没有处于最新配置"
+		msg := "代理内核没有处于最新配置"
 		if st != nil && st.LastApply != nil && st.LastApply.Error != "" {
 			msg += "：" + st.LastApply.Error
 		}
 		return fmt.Errorf("%s", msg)
 	}
-	for _, u := range []string{dnsUnitName, singBoxUnitName, mihomoUnitName} {
-		if out := ins.Paths.Init().IsActive(u); out != "active" {
-			return fmt.Errorf("%s 不是 active（%s）", u, out)
-		}
+	if err := requireServicesActive(ins.Paths.Init(), ins.Paths); err != nil {
+		return err
 	}
-	j.Logf("两个服务都在运行，atomdns %s", st.AtomDNS.Version)
+	j.Logf("DNS 与代理内核都在运行，atomdns %s", st.AtomDNS.Version)
 	var cur struct {
 		FakeIPRange string `json:"fakeip_range"`
 		MixedPort   int    `json:"mixed_port"`

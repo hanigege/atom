@@ -1829,17 +1829,25 @@ func TestResolvConfLinkIsPutBack(t *testing.T) {
 	}
 }
 
-type fakeInit struct{ stopped []string }
+type fakeInit struct {
+	stopped []string
+	active  map[string]bool
+}
 
 func (f *fakeInit) Reload(Logger) error                { return nil }
 func (f *fakeInit) Enable(Logger, ...string) error     { return nil }
 func (f *fakeInit) DisableNow(Logger, ...string) error { return nil }
 func (f *fakeInit) Start(Logger, string) error         { return nil }
 func (f *fakeInit) Restart(Logger, string) error       { return nil }
-func (f *fakeInit) IsActive(string) string             { return "" }
-func (f *fakeInit) Logs(string) string                 { return "" }
-func (f *fakeInit) Forget(Logger, ...string)           {}
-func (f *fakeInit) Stop(_ Logger, n string) error      { f.stopped = append(f.stopped, n); return nil }
+func (f *fakeInit) IsActive(n string) string {
+	if f.active[n] {
+		return "active"
+	}
+	return ""
+}
+func (f *fakeInit) Logs(string) string            { return "" }
+func (f *fakeInit) Forget(Logger, ...string)      {}
+func (f *fakeInit) Stop(_ Logger, n string) error { f.stopped = append(f.stopped, n); return nil }
 
 func TestReconfigureRollbackStopsTheNewServicesFirst(t *testing.T) {
 	f := &fakeInit{}
@@ -1934,5 +1942,33 @@ func TestFinalizeFailureKeepsAnExistingDataMarker(t *testing.T) {
 	}
 	if !hasData(ins.Paths) {
 		t.Error("the marker of the data a reconfigure found must stay")
+	}
+}
+
+func TestRequireServicesActiveChecksOnlyTheSelectedBackend(t *testing.T) {
+	for _, tc := range []struct {
+		backend, other string
+		unit           string
+	}{{"sing-box", mihomoUnitName, singBoxUnitName}, {"mihomo", singBoxUnitName, mihomoUnitName}} {
+		p := Paths{Root: t.TempDir()}
+		if err := os.MkdirAll(filepath.Join(p.Data(), "webinfo"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		state := `{"settings":{"backend":"` + tc.backend + `"}}`
+		if err := os.WriteFile(filepath.Join(p.Data(), "webinfo", "atom_proxy.json"), []byte(state), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		f := &fakeInit{active: map[string]bool{dnsUnitName: true, tc.unit: true}}
+		if err := requireServicesActive(f, p); err != nil {
+			t.Errorf("%s: the other backend being stopped is fine: %v", tc.backend, err)
+		}
+		f = &fakeInit{active: map[string]bool{dnsUnitName: true, tc.other: true}}
+		if err := requireServicesActive(f, p); err == nil || !strings.Contains(err.Error(), tc.unit) {
+			t.Errorf("%s: the selected backend is down: %v", tc.backend, err)
+		}
+		f = &fakeInit{active: map[string]bool{tc.unit: true}}
+		if err := requireServicesActive(f, p); err == nil {
+			t.Errorf("%s: atom-dns is down", tc.backend)
+		}
 	}
 }

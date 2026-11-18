@@ -235,6 +235,18 @@ func panelReady(p Paths, port int, requireUI bool) error {
 	return fmt.Errorf("候选版本的面板未挂载")
 }
 
+// requireServicesActive checks atom-dns and the selected proxy backend; the two backends share their
+// ports, so only one of them runs at a time.
+func requireServicesActive(init initSystem, p Paths) error {
+	_, proxyUnit, _ := p.proxyService()
+	for _, name := range []string{dnsUnitName, proxyUnit} {
+		if out := init.IsActive(name); out != "active" {
+			return fmt.Errorf("%s 不是 active（%s）", name, out)
+		}
+	}
+	return nil
+}
+
 func maintenanceHealthy(p Paths, port int, log Logger) error {
 	api := newAPIClient(port, p.Data())
 	api.http.Timeout = 4 * time.Second
@@ -243,10 +255,8 @@ func maintenanceHealthy(p Paths, port int, log Logger) error {
 	}); err != nil {
 		return fmt.Errorf("DNS 管理接口未就绪或代理配置未同步：%w", err)
 	}
-	for _, name := range []string{dnsUnitName, singBoxUnitName, mihomoUnitName} {
-		if p.Init().IsActive(name) != "active" {
-			return fmt.Errorf("%s 没有运行", name)
-		}
+	if err := requireServicesActive(p.Init(), p); err != nil {
+		return err
 	}
 	ls, err := listeners()
 	if err != nil {
@@ -265,7 +275,7 @@ func maintenanceHealthy(p Paths, port int, log Logger) error {
 	if err := panelReady(p, port, false); err != nil {
 		return err
 	}
-	log.Logf("DNS 已就绪，sing-box 配置已同步")
+	log.Logf("DNS 已就绪，代理内核配置已同步")
 	return nil
 }
 
