@@ -2027,7 +2027,7 @@ func TestInitialProxyState(t *testing.T) {
 	if err := json.Unmarshal(data, &st); err != nil {
 		t.Fatal(err)
 	}
-	if st.Settings.Backend != "mihomo" || st.Settings.FakeIPRange != "28.0.0.0/8" || st.Settings.MixedPort != 7891 ||
+	if st.Settings.Backend != "mihomo" || st.Settings.FakeIPRange != "28.0.0.0/8" || st.Settings.MixedPort != defaultMixed ||
 		len(st.Groups) != 1 || st.Groups[0].ID != defaultGroup || st.Final.Selected != defaultGroup {
 		t.Fatalf("unexpected state: %s", data)
 	}
