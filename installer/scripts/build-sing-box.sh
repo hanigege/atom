@@ -36,6 +36,7 @@ have="$(go env GOVERSION | sed 's/^go//')"
 [ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | head -1)" = "$need" ] || { echo "go $have is older than the $need sing-box needs" >&2; exit 2; }
 
 SINGBOX_DIR="$(cd "$SINGBOX_DIR" && pwd)"
+COMMIT="$(git -C "$SINGBOX_DIR" rev-parse HEAD 2>/dev/null)" || { echo "--sing-box-dir must be a git checkout (the commit is recorded)" >&2; exit 2; }
 mkdir -p "$WORK" "$OUT"
 WORK="$(cd "$WORK" && pwd)"
 OUT="$(cd "$OUT" && pwd)"
@@ -63,7 +64,7 @@ if [ ! -f "$WORK/.keyring-ok" ]; then
   touch "$WORK/.keyring-ok"
 fi
 
-rm -f "$OUT/sing-box-commit"
+rm -f "$OUT/sing-box-commit" "$OUT"/sing-box-{amd64,arm64,amd64-musl,arm64-musl}
 TAGS_GLIBC="$(cat "$SINGBOX_DIR/release/DEFAULT_BUILD_TAGS")"
 LDFLAGS_SHARED="$(cat "$SINGBOX_DIR/release/LDFLAGS")"
 for t in $TARGETS; do
@@ -91,6 +92,6 @@ for t in $TARGETS; do
   )
   ls -l "$OUT/sing-box-$t"
 done
-# the commit stamp is only written when all four binaries are there, so a partial --targets run is never accepted
+# old outputs are removed at the start, so the stamp is only written when this run produced all four
 all=1; for t in amd64 arm64 amd64-musl arm64-musl; do [ -f "$OUT/sing-box-$t" ] || all=""; done
-[ -z "$all" ] || git -C "$SINGBOX_DIR" rev-parse HEAD > "$OUT/sing-box-commit"
+[ -z "$all" ] || echo "$COMMIT" > "$OUT/sing-box-commit"
