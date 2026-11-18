@@ -455,8 +455,8 @@ sing-box 的绑定只在收到 DNS 查询时更新，而客户端会缓存 DNS �
   - 有文件时，除了 UI 文件、`/api/v1/system/health` 和 `auth`、`auth/login` 以外的请求（atom API、`/metrics`、审计、`/plugins`、诊断抓取）都要带会话 Cookie `atom_session`（登录时发，30 天，HttpOnly、SameSite=Strict，内容是"过期时间 + 用密钥算的 HMAC"），或 `Authorization: Bearer <密钥>`（安装器以 root 读这个文件拿密钥，升级、保留数据重装时调接口用），否则 401。
   - 接口：`GET auth`（`{enabled, authenticated, username}`）；`PUT auth {username, password, current_password?}` 设置或修改，换新密钥（所有会话失效），给当前浏览器发新 Cookie；`DELETE auth {current_password?}` 关闭登录；`POST auth/login`（错误时等 1 秒再返回 401）；`POST auth/logout` 清掉 Cookie。已开登录、用会话改的时候要给当前密码。
   - WebUI：未登录时整个界面换成登录页；顶栏有退出按钮；设置页"面板登录"可以设置、修改、关闭。安装器：网络那一步面板端口下面有可选的用户名和密码，全新安装时在面板启动前写好。
-  - 登录和免登录模式都检查请求的访问地址和浏览器来源。默认可用 IP、`localhost`、本机名及其 `.local` / `.lan` 形式。自定义域名或 HTTPS 反向代理可在 `api.public_origin` 设置面板的完整来源（如 `https://panel.example.net`），代理需保留浏览器发来的 `Host`。脚本可用 `X-Atom-Request: 1` 调用无 JSON 正文的写入接口和旧的插件 `save` / `flush` 接口。
-  - 已知限制：退出只清本浏览器的 Cookie，那个会话本身到过期前仍然有效（改密码会让所有会话失效）；登录失败只有 1 秒延迟，没有锁定；面板是 HTTP，局域网里能抓包的人能拿到 Cookie。
+  - 写请求必须是 JSON（`Content-Type: application/json`）或带 `X-Atom-Request: 1`，用来防跨站伪造请求（浏览器的表单不能发这两样）；不检查 `Host` 和 `Origin`，反向代理不需要额外配置。没有 JSON 正文的写入接口和旧的插件 `save` / `flush`（GET）必须带 `X-Atom-Request: 1`。
+  - 已知限制：退出只清本浏览器的 Cookie，那个会话本身到过期前仍然有效（改密码会让所有会话失效）；登录失败只有 1 秒延迟，没有锁定；面板是 HTTP，局域网里能抓包的人能拿到 Cookie；不开面板登录时无法防御 DNS 重绑定，建议开启登录。
 
 ## 9. 部署
 
