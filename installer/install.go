@@ -404,8 +404,9 @@ func writeInitialProxyState(p Paths, cfg Config) error {
 		}},
 		"final": map[string]any{"members": []string{defaultGroup}, "selected": defaultGroup},
 		"settings": map[string]any{
-			// The default mixed port: stepSettings changes it through the API, which also moves main_proxy.
-			"backend": cfg.Backend, "fakeip_range": strings.TrimSpace(cfg.FakeIPRange), "mixed_port": defaultMixed,
+			// The default range and mixed port: stepSettings changes them through the API, which validates them and
+			// moves main_proxy.
+			"backend": cfg.Backend, "fakeip_range": defaultFakeIP, "mixed_port": defaultMixed,
 		},
 	}
 	data, err := json.MarshalIndent(state, "", "  ")
