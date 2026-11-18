@@ -12,7 +12,7 @@
 
 ## 订阅与分组
 
-- `POST /api/v1/atom/providers` 保存 HTTP(S) 订阅。请求可带 `interval`（秒）、`filter`（按源节点名称匹配的正则）和 `download_via`（手动节点 ID，默认直连）。让下载使用独立的手动节点可以避开订阅自身依赖。读取接口只返回公开字段，`PUT /providers/{id}` 省略 `url` 时保留旧值。
+- `POST /api/v1/atom/providers` 保存 HTTP(S) 订阅。请求可带 `interval`（秒）、`filter`（按源节点名称匹配的正则）和 `download_via`（手动节点 ID，默认直连）。让下载使用独立的手动节点可以避开订阅自身依赖。`user_agent` 设置下载时的 User-Agent（写成 mihomo 订阅的 `header`），留空用 mihomo 默认的 `clash.meta/<版本>`；改 UA 会换缓存文件，让 mihomo 重新下载。读取接口只返回公开字段，`PUT /providers/{id}` 省略 `url` 时保留旧值。
 - 组的 `providers` 字段接受订阅 ID，`members` 仍可加入手动节点或其他组。mihomo 用原生 `proxy-providers` 下载、缓存和健康检查。Atom 可通过 `GET /providers/{id}/nodes` 查看节点，`POST /providers/{id}/refresh` 手动刷新。节点 ID 带订阅前缀，可在 selector 组内手动选择。节点下架后 mihomo 使用现有可选成员。
 - 新建或修改活跃订阅时，Atom 通过 Clash API 确认 mihomo 已加载节点。下载失败、格式不兼容或过滤后没有节点时回滚。订阅仍被组引用时，删除会返回引用它的组。只有订阅来源的空组明确使用 `REJECT`。
 - 组的成员来源有两种：`providers`（点名的订阅 ID）和 `all_providers: true`（"全部订阅"，之后新加的订阅自动包含，对应 mihomo 的 `include-all-providers`）。两者互斥，同时给会返回 400。
