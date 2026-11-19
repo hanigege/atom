@@ -25,7 +25,7 @@ func fakeProbeEnv(capEff string, nft map[string]string, ipErr string, total, wit
 		run: func(stdin, name string, args ...string) (string, error) {
 			calls = append(calls, name+" "+strings.Join(args, " "))
 			base := filepath.Base(name)
-			if base == "nft" && len(args) > 0 && args[0] == "-f" {
+			if base == "nft" && len(args) > 0 && args[len(args)-2] == "-f" {
 				for key, msg := range nft {
 					if strings.Contains(stdin, key) {
 						return msg, errors.New("exit 1")
@@ -54,10 +54,10 @@ func TestProbeAllGood(t *testing.T) {
 			t.Errorf("check %s failed: %s", c.ID, c.Reason)
 		}
 	}
-	// the probe table is deleted after each load, the rule after its add
+	// the nft batches are only checked, never loaded; the ip rule is deleted after its add
 	joined := strings.Join(*calls, "\n")
-	if strings.Count(joined, "delete table inet "+probeTable) != 3 || !strings.Contains(joined, "rule del fwmark 0x2ff") {
-		t.Errorf("cleanup missing:\n%s", joined)
+	if strings.Count(joined, "-c -f -") != 3 || strings.Contains(joined, "delete table") || !strings.Contains(joined, "rule del fwmark 0x2ff") {
+		t.Errorf("%s", joined)
 	}
 }
 
@@ -780,20 +780,6 @@ func TestProbeRulesCannotMatchPackets(t *testing.T) {
 			t.Errorf("%s probe could match live traffic:\n%s", st.what, st.script)
 		}
 	}
-	// a table that cannot be deleted again is a failed check
-	bin := fakeCommands(t, map[string]string{"nft": `[ "$1" = delete ] && { echo "Error: Operation not permitted" >&2; exit 1; }`, "ip": ""})
-	_ = bin
-	env, _ := fakeProbeEnv("1fffffffff", nil, "", 1, 1)
-	env.run = func(stdin, name string, args ...string) (string, error) {
-		if filepath.Base(name) == "nft" && len(args) > 0 && args[0] == "delete" {
-			return "Error: Operation not permitted", errors.New("exit 1")
-		}
-		return "", nil
-	}
-	pr := env.probe()
-	if len(pr.Problems) == 0 || !strings.Contains(pr.Problems[0], "不能删除探测用的 nft 表") {
-		t.Errorf("%+v", pr)
-	}
 }
 
 func TestResetRefusesAnAtomDirectoryThatIsALink(t *testing.T) {
@@ -811,6 +797,21 @@ func TestResetRefusesAnAtomDirectoryThatIsALink(t *testing.T) {
 	}
 	if !fileExists(outside + "/atom-real/install.json") {
 		t.Error("something outside the data directory was deleted")
+	}
+}
+
+func TestResetRefusesADataDirectoryThatIsALink(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	os.MkdirAll(real+"/.atom", 0o755)
+	os.WriteFile(real+"/.atom/install.json", []byte("{}"), 0o644)
+	os.Symlink(real, filepath.Join(root, "data"))
+	p := Paths{Root: root, Container: true, RunDir: t.TempDir()}
+	if err := purgeData(p, stderrLogger{}); err == nil {
+		t.Error("the purge followed a linked data directory")
+	}
+	if !fileExists(real + "/.atom/install.json") {
+		t.Error("what the link points to was deleted")
 	}
 }
 
@@ -871,4 +872,27 @@ func TestResumeResetDoesNotRunAfterAMarkerLookupError(t *testing.T) {
 	if err := resumeReset(p, stderrLogger{}); err == nil {
 		t.Error("an unreadable marker location is not 'no reset pending'")
 	}
+}
+
+func TestAServiceThatIsStillStartingIsNotStopped(t *testing.T) {
+	// the reset waits for a start whose hook is still running: it has no process, so its state alone says "stopped"
+	p := containerPaths(t)
+	release := make(chan struct{})
+	spec := shSpec("atom-dns", `exec sleep 30`)
+	spec.Pre = func() error { <-release; return nil }
+	s, _ := testSup(t, p, spec)
+	closeAll, err := serveContainerSockets(p, s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeAll()
+	go s.Start(bg, "atom-dns")
+	waitFor(t, "a start under way", func() bool { return s.list()[0].Draining })
+	if left := containerRunning(bg, p); len(left) != 1 || !strings.Contains(left[0], "atom-dns") {
+		t.Errorf("a start under way counts as running: %v", left)
+	}
+	close(release)
+	waitFor(t, "running", func() bool { return s.list()[0].State == "running" && !s.list()[0].Draining })
+	s.Stop(bg, "atom-dns")
+	waitFor(t, "stopped", func() bool { return len(containerRunning(bg, p)) == 0 })
 }

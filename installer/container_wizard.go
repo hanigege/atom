@@ -315,6 +315,11 @@ func handOverPanel(p Paths, sup *supervisor, st *InstallState) error {
 	if err := sup.Restart(ctx, "atom-dns"); err != nil {
 		return fmt.Errorf("atomdns 改用面板端口 %d 时没有起来：%w", st.PanelPort, err)
 	}
+	// the process is started: the handover is done when the panel answers on its port
+	api := newAPIClient(st.PanelPort, p.Data())
+	if _, err := api.waitStatus(60*time.Second, func(*apiStatus) bool { return true }); err != nil {
+		return fmt.Errorf("atomdns 在面板端口 %d 上没有应答：%w", st.PanelPort, err)
+	}
 	return nil
 }
 

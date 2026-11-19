@@ -854,6 +854,9 @@ type serviceInfo struct {
 	State   string `json:"state"`
 	PID     int    `json:"pid,omitempty"`
 	Desired string `json:"desired"`
+	// Draining: a start or a stop is still under way (a start hook may be running although there is no process
+	// yet); the reset waits for it.
+	Draining bool `json:"draining,omitempty"`
 }
 
 // list: running (a process), failed (it died and will be tried again) or stopped.
@@ -871,7 +874,7 @@ func (s *supervisor) list() []serviceInfo {
 			case phBackoff:
 				st = "failed"
 			}
-			info := serviceInfo{Name: v.spec.Name, State: st, Desired: "stopped"}
+			info := serviceInfo{Name: v.spec.Name, State: st, Desired: "stopped", Draining: v.phase == phStarting || v.phase == phStopping}
 			if want[v.spec.Name] {
 				info.Desired = "running"
 			}

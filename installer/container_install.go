@@ -288,10 +288,10 @@ func purgeData(p Paths, log Logger) error {
 	return nil
 }
 
-// requireRealDirs: data/.atom and its backup directory are directories, not links to somewhere else, so that what
-// is deleted below them is what was backed up.
+// requireRealDirs: the data directory, data/.atom and its backup directory are directories, not links to somewhere
+// else, so that what is deleted below them is what was backed up.
 func requireRealDirs(p Paths) error {
-	for _, d := range []string{filepath.Join(p.Data(), ".atom"), keptByReset(p)} {
+	for _, d := range []string{p.Data(), filepath.Join(p.Data(), ".atom"), keptByReset(p)} {
 		info, err := os.Lstat(d)
 		if os.IsNotExist(err) {
 			continue
@@ -321,14 +321,21 @@ func resumeReset(p Paths, log Logger) error {
 	return os.Remove(resetPending(p))
 }
 
-// containerRunning names the services of atom that the entry process says run.
+// containerRunning names the services of atom that the entry process says run, or are still starting or stopping.
 func containerRunning(ctx context.Context, p Paths) []string {
+	var out struct {
+		Services []serviceInfo `json:"services"`
+	}
+	if err := (containerInit{socket: p.Run(controlSocket)}).callCtx(ctx, 5*time.Second, "GET", "/svc", nil, &out); err != nil {
+		return []string{"入口进程没有回答（" + err.Error() + "）"}
+	}
 	var left []string
-	for _, n := range []string{"atom-dns", "atom-sing-box", "atom-mihomo"} {
-		switch st := containerServiceState(ctx, p, n); st {
-		case "stopped":
-		default:
-			left = append(left, n+"（"+st+"）")
+	for _, s := range out.Services {
+		switch {
+		case s.State != "stopped":
+			left = append(left, s.Name+"（"+s.State+"）")
+		case s.Draining:
+			left = append(left, s.Name+"（还在启动或停止）")
 		}
 	}
 	return left

@@ -94,11 +94,11 @@ func hasCap(capEff string, bit uint) bool {
 	return err == nil && v&(1<<bit) != 0
 }
 
-// the probe table: its name is not atom's, so nothing of the installation is touched
+// the probe table: its name is not atom's, and it is only ever checked, never loaded
 const probeTable = "atom_probe"
 
-// probeIface is an interface name nothing has: the probe's rules begin with `iifname`, so no packet can match them
-// while they are loaded (the wizard of a reconfigure runs beside live traffic).
+// probeIface is an interface name nothing has: the probe's rules begin with `iifname`, so that no packet could match
+// them even if they were loaded (the wizard of a reconfigure runs beside live traffic).
 const probeIface = "atom-probe0"
 
 func probeNft(chain, rule string) string {
@@ -128,11 +128,9 @@ func (e probeEnv) probeNftTable() (reasons []string) {
 		return []string{"没有 nft 命令"}
 	}
 	for _, st := range probeStatements {
-		out, err := e.run(st.script, nft, "-f", "-")
+		// -c: the kernel checks the batch and drops it (nothing is loaded, nothing to delete again)
+		out, err := e.run(st.script, nft, "-c", "-f", "-")
 		if err == nil {
-			if out, err := e.run("", nft, "delete", "table", "inet", probeTable); err != nil {
-				reasons = append(reasons, "不能删除探测用的 nft 表："+firstLine(out))
-			}
 			continue
 		}
 		switch {
