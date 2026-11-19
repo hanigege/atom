@@ -181,6 +181,8 @@ networks:
 - 用户只需要改 `parent`、网段和容器的 IP。
 - Docker 默认把 `/proc/sys` 挂成只读，入口进程写不了 sysctl，所以需要的 sysctl 写在 compose 里。单网卡旁路由不需要 `ip_forward`（被代理的流量都是交给本机的 sing-box）。“回包经主路由”只需要 `accept_redirects=0`，而且 `all` 和网卡两项都要是 0（没开转发时，内核只要有一项允许就会收重定向；C2 实测 Docker 里 `all` 默认是 0、`eth0` 是 1，`eth0` 的值可以在 compose 里设，`default` 不行）；勾了这个选项但没在 compose 里写，向导就报错并指明要加哪几行。
 - macvlan 的限制：宿主自己访问不到容器。文档里写明，不做绕过方案。
+- C5 实测：这份 compose 原样可用（只换了镜像名和 IP）。如果宿主上已经有同网段、同 `parent` 的 macvlan 网络，`docker compose up` 会报 `Pool overlaps with other one on this address space`，要先删掉旧网络，或者在 compose 里把 `lan` 改成 `external: true` 指向它。Debian 13 的 `docker.io` 没带 compose 插件，要装 `docker-compose`（提供 `docker compose` 子命令）。
+- 宿主上的测试要用另一个接在同一块网卡上的 macvlan（比如 netns），不能从宿主直接访问容器；容器的出站 DNS 如果要避开宿主的 DNS（比如宿主的 DNS 本身返回 FakeIP），用 `dns:` 指定。
 - 宿主内核要有 `nft_tproxy` 和 `nft_socket`。Debian、Ubuntu 的默认内核都有。群晖这类 NAS 不保证，向导的环境探测会拦下来。
 
 ### 7.2 RouterOS container **[定]**
@@ -200,9 +202,10 @@ networks:
 ```
 /interface veth add name=atom address=172.31.233.2/30 gateway=172.31.233.1
 /ip address add address=172.31.233.1/30 interface=atom
-/container mounts add name=atom-data src=/sata1/atom-data dst=/opt/atom/data
+/file add name=sata1/atom-data type=directory
+/container mounts add list=atom src=/sata1/atom-data dst=/opt/atom/data
 /container add name=atom file=sata1/atom-0.3.0-container-amd64.tar interface=atom \
-    root-dir=sata1/atom mount=atom-data logging=yes start-on-boot=yes
+    root-dir=sata1/atom mountlists=atom logging=yes start-on-boot=yes
 /container start atom
 /ip route add dst-address=28.0.0.0/8 gateway=172.31.233.2
 /ip dhcp-server network set [find] dns-server=172.31.233.2
@@ -216,7 +219,7 @@ networks:
 # 其余的 mounts、container add 和路由同上，地址换成 192.168.88.250
 ```
 
-- `mounts` 和 `mountlists` 的写法在不同版本之间有变化，以实测的版本为准，文档写明是在哪个版本上测的。
+- 上面的写法在 RouterOS 7.23.8 上实测：`/container mounts add` 用 `list=`（不是 `name=`），`/container add` 用 `mountlists=`（`mount=` 是 `src=…,dst=…` 的内联写法，和一个挂载列表名不通用）；数据目录要先建好；`file=` 是 tar 的路径，不带开头的斜杠，镜像约 255MiB，`root-dir` 展开后约 256MiB，所以要放在数据盘上。不同版本写法可能不同。
 - 面板地址就是容器地址，比如 `http://172.31.233.2/`。
 - 文档里写清：`user-ns` 只能在创建容器时定；镜像和 `root-dir` 要放在数据盘上；ROS 的版本要求为 7.21 以上，最终以实测为准。
 - 测试时发现：ROS 自己发出的包会用 veth 上的 `172.31.233.1` 作源地址。所以需要防环的场景里，routing rule 只能匹配容器的单个地址，不能匹配整个 /30。正常部署不需要这类规则，只在测试文档里写一句。
@@ -398,7 +401,7 @@ networks:
 
 - Mac：`go vet ./...`；`container_migrate_test.go` 两项（恢复未完成的迁移；检查失败时不动数据、不写记录、不留备份）；全量里只有已知的四个计时测试失败。
 - vm92（`/root/atom-build/c4`，系统 Go 1.24，`GOTOOLCHAIN=auto`）：全量 `go test ./...` 只有 `TestContainerMaintenance` 失败：它期望 `GET /network` 返回 400，而 C3 的提交（d572706）已经让容器版返回 200，测试没跟着改（不是本步引起的；Mac 上因没有网卡而恰好通过）。这一步没有改它。
-- 实测，vm92，`/root/atom-build/c4`：镜像用 `FROM atom:0.2.1-c2` 加一层换 `atom-installer`（`-X main.version=0.2.1` / `0.2.2` / `0.2.3`）和 `manifest.json`，新版本的 `share/config/config_custom.yaml` 末尾加一行注释以便看出覆盖；macvlan 用 `atom-c3-net`，容器 10.0.0.204，客户端 netns 10.0.0.205；面板登录设了用户名和密码（空密码时面板要安装码，安装器的 `waitStatus` 会一直 401，这是 Linux 版同样的前提）。
+- 实测，vm92，`/root/atom-build/c4`：镜像用 `FROM atom:0.2.1-c2` 加一层换 `atom-installer`（`-X main.version=0.2.1` / `0.2.2` / `0.2.3`）和 `manifest.json`，新版本的 `share/config/config_custom.yaml` 末尾加一行注释以便看出覆盖；macvlan 用 `atom-c3-net`，容器 10.0.0.204，客户端 netns 10.0.0.205；面板登录设了用户名和密码（原来以为空密码时面板要安装码、安装器的 `waitStatus` 会一直 401，C5 实测不是这样，见 C5 一节；那次没有拿没设登录的数据测）。
 
 | 项目 | 结果 |
 |---|---|
@@ -430,7 +433,6 @@ networks:
 **还有这些已知限制**（codex 提的冷僻情形）：
 
 - 迁移期间（备份、覆盖、验证）维护 socket 和向导 socket 已经能收到请求：同时点“重置”或改网络会和迁移互相踩。窗口是几十秒，没有加锁。
-- 面板没设登录（空用户名和密码）时 atomdns 要“安装码”，安装器对 `/status` 一直 401，验证会超时并回滚。Linux 版升级有同样的前提；向导里设了用户名和密码就没有这个问题。
 - `in_sync` 在内核重载成功前可能已经为真，验证有极小的时间窗口会提前通过（同 Linux 版）。
 - `copyTree` 不复制符号链接，上游 YAML 如果是链接，回滚后会丢（同 Linux 版）。
 - 备份目录写到一半磁盘满了：残余目录要手动删（`data/.atom/backup/`，没有 `migrating.json` 指向的那些）。
@@ -448,3 +450,55 @@ networks:
 **需要用户注意**：`DOCKERHUB_TOKEN` 要有仓库的描述写权限；`jasonxtt/atom` 的 ghcr 包第一次推上去后默认私有，要在 GitHub 里改成公开。
 
 **codex 审查**（`codex exec -s read-only`，静态，2 轮）：第一轮 1 条阻断（重跑旧版本的标签会把 `latest` 改回去；已修：只有请求的标签正好是 GitHub 的最新 Release 时才加 `latest`）；第二轮没有阻断。
+
+### C5 Docker 端到端（2026-11-20）
+
+**测试对象**：版本 0.3.0 的测试镜像（不发布）：atom-installer 是当前 `container` 分支（`-X main.version=0.3.0`），WebUI 是 atomdns 子模块 `atom/container` 分支的 `npm run build:package`，atomdns、sing-box、mihomo 用 0.2.1 正式包里的同一份程序（Mac 上用去掉 `go test` 一步的 `build-package.sh` 副本出包，副本不提交；同一份源码在 vm92 上 `GOTOOLCHAIN=auto go test ./...` 全部通过，包括上一步修好的 `TestContainerMaintenance`），再在 vm92 上 `build-image.sh --base atom-base:trixie-slim` 出镜像。0.3.1 同样出一份，只有版本号不同。测试用的包和镜像 tar：vm92 的 `/root/atom-build/c56/pkg`、`/root/atom-build/c56/out/atom-0.3.{0,1}-container-amd64.tar`，Mac 的 `/Users/tom/nas/u.2/mac-use/atom/tmp/c56/`。
+
+**环境**（vm92，`/root/atom-build/c56`）：
+
+- compose 就是 7.1 节的示例，只换了镜像名（`atom:0.3.0`）和 IP（`10.0.0.201`），`docker compose up -d` 直接起来（compose 用的是阿里云临时源装的 `docker-compose` 2.26.1，用一份单独的 `sources.list` 加 `-o Dir::Etc::sourcelist`，没改系统源）。
+- 代理出口：另一个 macvlan 容器 `10.0.0.206`，用同一镜像里的 sing-box 跑 shadowsocks（aes-256-gcm，TCP 和 UDP），在向导里作为节点导入。这个出口在国内，到不了 google 一类被墙的站，所以“经节点”用服务端日志证明：日志里能看到来自 `10.0.0.201` 的 `inbound connection to <域名>:443`，域名是 sing-box 把 FakeIP 还原后发过来的；能通的国外站用 www.cloudflare.com、www.debian.org、www.python.org、example.com。
+- 客户端：vm92 上同一块网卡的 macvlan netns `10.0.0.205`，DNS 指向 `10.0.0.201`，默认路由指向主路由 `10.0.0.1`，另加静态路由 `28.0.0.0/8 via 10.0.0.201`（和设计一致：主路由把 FakeIP 网段交给 atom，别的流量不经过 atom；一开始误把默认路由也指到 atom，国内 IP 的连接就全进了 sing-box，这不是 atom 的用法）。客户端的 curl 经 systemd-resolved 解析，会绕过 netns 的 `resolv.conf`，所以测试脚本先 `dig @10.0.0.201` 再 `curl --resolve`。
+- “回包经主路由”：再起一个 netns `10.0.0.207` 当主路由（开转发、`28.0.0.0/8 via 10.0.0.201`、转发链里 `ip daddr 28.0.0.0/8 ct state invalid drop`），客户端默认路由指向它。
+
+| 项目 | 结果 |
+|---|---|
+| 向导 JSON API 走完（面板不设用户名密码、sing-box、导入 ss 节点）；检查四项全过，五步全 ok，自检 google → FakeIP、baidu → 真实 IP；`POST /api/finish` 后面板接管 80 端口 | 通过 |
+| sing-box：TCP，www.cloudflare.com、www.debian.org、www.python.org、example.com 都得到 200，服务端日志看到域名连接；www.google.com 经节点出去（服务端日志有域名）但服务端自己连不上，连接失败 | 通过（google 受环境限制） |
+| sing-box：UDP，对 one.one.one.one 的 FakeIP 做 UDP 53 查询（TProxy → 节点的 UDP），得到真实应答；服务端日志有 `inbound packet connection to one.one.one.one:53` | 通过 |
+| baidu 得真实 IP，客户端直连（不经过 atom，服务端没有这个连接） | 通过 |
+| 切到 mihomo（面板接口 `PUT /api/v1/atom/settings {"backend":"mihomo"}`）：`services.json` 变成 mihomo 运行、sing-box 停止，同样的 TCP、UDP、baidu 测试 | 通过（UDP 在服务端日志里是 `1.0.0.1:53`，mihomo 先解析了域名） |
+| 切回 sing-box | 通过 |
+| `docker exec atom atom-installer reconfigure`，向导里再选一次 mihomo：保留现有设置，仍是 sing-box（重新配置不改内核，这是设计，内核在面板里切） | 通过 |
+| “回包经主路由”：没有主路由那条转发规则时的对照 —— 不勾选，主路由的 `invalid` 规则丢包，FakeIP 连接超时（12 个包被丢），baidu 不受影响；勾选（主路由填 `10.0.0.207`）后 TCP、UDP 都通，表 234 的默认路由指向主路由，`accept_redirects` 为 0 | 通过 |
+| 勾了“回包经主路由”但 compose 没写 `sysctls`：容器起不来并按重启策略反复重启，日志每次都写“不能关闭 accept_redirects（/proc/sys 是只读的）：在 compose 的 sysctls 里加 [net.ipv4.conf.eth0.accept_redirects=0]”；加回 `sysctls` 后恢复。（前缀是固定的“检查 NET_ADMIN 和内核的 nft_tproxy、nft_socket”，对这个错误有点误导，没改） | 通过 |
+| 面板的“重置所有设置”：`POST /api/v1/atom/maintenance/reset` → 面板显示等待向导（`wizard_port 9996` 和安装码），向导里备份到 `data/.atom/backup/reset-…`、停服务、撤销 nft 和 `ip rule`、清空 `data/`；预填的 `previous` 带着原来的 `reply_via` 和主路由地址；再用向导装好，`finish` 后一切正常 | 通过 |
+| `docker stop`：0.15 秒，退出码 0，日志“收到 terminated，停止服务 / 已停止（19ms）”；`docker start` 和 `docker restart`（0.36 秒）后 8 秒内 DNS 和 TCP 都恢复，`services.json` 状态保留，FakeIP 分配保留 | 通过 |
+| 换镜像升级 0.3.0 → 0.3.1（compose 里只改镜像名，面板没设登录）：日志“镜像版本 0.3.1 比数据的版本 0.3.0 新，迁移数据”，`atomdns check` 通过，备份 `0.3.0-…`，`install.json` 变 0.3.1，没有 `migrating.json`，`atom_proxy.json` 和 `config_custom.yaml` 的 md5 不变，DNS 和 TCP 正常；`/status` 一直是 200，迁移的验证（`finishMigration` 里的 `waitStatus`）通过 | 通过 |
+
+**面板没设登录时 `/status` 会不会 401**：不会。C4 记的那两处说法是错的（已改）。实测：向导还开着的时候，80 端口是向导（安装器），向导对没带安装码的请求一律回 401“请输入启动终端上显示的安装码”，所以在向导 `finish` 之前对 80 端口发 `/api/v1/atom/status` 看到的就是这个 401（我自己一开始也是这样看到的）；`finish` 之后 80 端口归 atomdns，没有 `atom_auth.json` 时 `/status` 回 200，`/api/v1/atom/auth` 回 `enabled:false`。安装器自己的验证走 `127.0.0.1:<面板端口>`，向导已退出，所以不受影响；上表的升级就是在没设登录的数据上通过的。
+
+**没测**：WebUI 在浏览器里的显示（C3 已测过）；QUIC（用 UDP 53 代替了 UDP 的转发验证）；google 的完整往返（出口在国内）。
+
+**发现的问题**：没有需要改代码的 bug。文档改了：7.1 节加了 compose 网络重名和 compose 插件的说明；C4 里两处关于 401 的说法。
+
+### C6 RouterOS 端到端（2026-11-20）
+
+**环境**：`ros-test`（RouterOS 7.23.8 long-term，CHR x86_64，1GiB 内存），系统盘只剩约 59MiB，镜像 255MiB，所以 tar 和 `root-dir` 都放在 4GiB 的数据盘 `sata1`（`/file print`、`/disk print` 看得到，剩 3.7GiB）。镜像 tar 用 `scp` 传到 `sata1/`（4 秒），`/container add file=…` 导入（约 25 秒），`root-dir` 展开约 256MiB。节点用 C5 的那台 `10.0.0.206`（ROS 能直接 ping 通）。ROS 上另有别人的容器和 veth（`rbd`、`msm` 等），没动。
+
+**客户端**：ROS 的 LAN 里没有别的主机能经 ROS 转发，所以客户端用 ROS 自己：`:resolve <域名> server=<容器地址>` 查 DNS，`/ip dns static` 临时加一条指向 FakeIP，再 `/tool fetch https://…`，路由是 `28.0.0.0/9 via <容器地址>`（ROS 里已有一条指向生产 atom 的 `28.0.0.0/8`，没碰，用更具体的 /9 压过它，测完删除）。UDP：`:resolve www.example.org server=<one.one.one.one 的 FakeIP>`。所以“LAN 客户端经 ROS 转发进容器”的路径没有测，只测了 ROS 自己发起的流量。
+
+| 项目 | 结果 |
+|---|---|
+| 路由接法（veth `172.31.233.2/30`，ROS 上 `172.31.233.1/30`），`user-ns=no`：向导（经 ROS 上的 dst-nat `10.0.2.5:8081` → 容器 80 端口，用 JSON API 驱动）检查四项全过、五步 ok；DNS 得 FakeIP、baidu 得真实 IP；`fetch` www.cloudflare.com 得 200，服务端日志看到 `www.cloudflare.com:443`（源是 ROS 的出口地址）；UDP 53 经 FakeIP 通 | 通过 |
+| `/container stop`：约 1 秒内停止，退出码 0；`/container start` 后 12 秒内 DNS 和 fetch 恢复 | 通过 |
+| 路由接法，`user-ns=yes`（删掉容器重新导入，数据目录清空重装）：同样的向导、DNS、TCP、UDP | 通过 |
+| 网桥接法（veth `10.0.2.250/24` 加进 LAN 网桥，网关 `10.0.2.5`），`user-ns=no`，向导里勾“回包经主路由”（主路由填 `10.0.2.5`）：向导从 LAN 里直接访问 `10.0.2.250`，五步 ok（ROS 容器里能写 `accept_redirects`）；DNS、TCP、UDP 都通；停止再启动后恢复 | 通过 |
+| LAN 客户端经 ROS 转发（包括“回包经主路由”对 ROS 的 `invalid` 规则的实际效果） | 没测（ROS 的防火墙过滤规则本来就是停用的；Docker 一节里用 netns 模拟了主路由，验证了这个选项） |
+| `atom-installer reconfigure`（要 `/container shell`） | 没测 |
+| arm64 的 ROS | 没测（没有设备） |
+
+**命令行的差异（已改 7.2 节）**：7.23.8 里 `/container mounts add` 的参数是 `list=`（不是 `name=`），`/container add` 里引用它用 `mountlists=`；`mount=` 是内联写法（`src=…,dst=…`），写成列表名会报“expected value of dst-mode”。`/container add` 在 `name=` 之后才碰到错的 `mount=`，所以 `name=` 是被接受的；实测时没带 `name=`（默认名是 tar 文件名），用 `/container set` 改的名。`/file add name=… type=directory` 能建数据目录；删容器会连 `root-dir` 一起删。ROS 默认的 srcnat masquerade 没有出接口限制，容器不用另加 NAT 就能上网。
+
+**清理**：容器、挂载列表、veth、网桥端口、地址、路由、dst-nat、DNS 静态项、`sata1/atom-c6`、`sata1/atom-0.3.0-container-amd64.tar` 都已删除，`/container print`、`/interface veth print`、`/ip route print`、`/ip firewall nat print`、`/file print` 和测前一致（别人的对象还在）。
