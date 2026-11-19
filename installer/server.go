@@ -130,6 +130,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("POST /api/finish", s.handleFinish)
 	mux.HandleFunc("POST /api/reset", s.handleReset)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Atom-Wizard", "1") // the page tells the wizard from the panel that takes its port
 		if !isPrivateRemote(r.RemoteAddr) || !hostAllowed(r.Host) || !sameOriginRequest(r) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return

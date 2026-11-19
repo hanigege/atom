@@ -159,6 +159,10 @@ func cmdContainer([]string) int {
 	defer closeSockets()
 
 	failed := make(chan struct{})
+	if err := resumeReset(p, sup); err != nil {
+		sup.Logf("%v", err)
+		return 1
+	}
 	st, err := loadState(p)
 	if err != nil || !st.Complete {
 		// no installation: the wizard, then the services it started carry on
@@ -183,6 +187,8 @@ func cmdContainer([]string) int {
 		// a stop before the first wizard moved the panel from its temporary port: it moves now
 		if _, err := ensurePanelPort(p, st); err != nil {
 			sup.Logf("面板端口 %d 没有写进配置：%v", st.PanelPort, err)
+			close(failed)
+			return
 		}
 		if err := loadContainerNetwork(p); err != nil {
 			sup.Logf("加载网络失败（检查 NET_ADMIN 和内核的 nft_tproxy、nft_socket）：%v", err)

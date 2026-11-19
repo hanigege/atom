@@ -30,7 +30,11 @@ func (ins *Installer) stepNetworkContainer(cfg Config, j *Job) error {
 		return err
 	}
 	if !cfg.ReplyVia {
-		removeReplyRouting() // an installation before this one had the option: its rule and table go
+		if err := removeReplyRouting(); err != nil { // an installation before this one had the option: its rule and table go
+			return err
+		}
+	} else if ins.redirectsBefore == nil && (st.LAN != nil) {
+		ins.redirectsBefore = readRedirects(st.LAN[0]) // for the rollback
 	}
 	if err := loadContainerNetwork(ins.Paths); err != nil {
 		return err
@@ -39,19 +43,49 @@ func (ins *Installer) stepNetworkContainer(cfg Config, j *Job) error {
 	return nil
 }
 
-// removeReplyRouting takes the rule and the default route of the reply option away; both may be absent.
-func removeReplyRouting() {
+// absentErr: the command failed because what it was to remove is not there, which is what was wanted.
+func absentErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	for _, s := range []string{"No such file or directory", "does not exist", "No such process"} {
+		if strings.Contains(err.Error(), s) {
+			return true
+		}
+	}
+	return false
+}
+
+// removeReplyRouting takes the rule of the reply option and its default route away, when the rule is exactly
+// the installer's: another rule or table 234 is not touched.
+func removeReplyRouting() error {
+	rules, _ := quietCmd("ip", "rule", "show")
+	ours := false
+	for _, l := range strings.Split(rules, "\n") {
+		ours = ours || strings.TrimSpace(l) == replyRule
+	}
+	if !ours {
+		return nil
+	}
+	var errs []string
 	for _, args := range [][]string{
 		{"rule", "del", "fwmark", replyMark, "lookup", replyTable, "priority", replyPriority},
-		{"route", "flush", "table", replyTable},
+		{"route", "del", "default", "table", replyTable},
 	} {
-		_ = runCmd(quietLogger{}, 30*time.Second, "ip", args...)
+		if err := runCmd(quietLogger{}, 30*time.Second, "ip", args...); err != nil && !absentErr(err) {
+			errs = append(errs, err.Error())
+		}
 	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "；"))
+	}
+	return nil
 }
 
 // containerTeardown is the rollback of a failed installation: the services stop and the nft table and the policy
-// routing this installation loaded go. The files stay, so that the wizard can go back and try again.
-func containerTeardown(p Paths, log Logger) {
+// routing this installation loaded go. The files stay, so that the wizard can go back and try again. What cannot
+// be taken away is returned (what is already gone is not an error).
+func containerTeardown(p Paths, log Logger) error {
 	log.Logf("撤销本次加载的网络规则")
 	in := p.Init()
 	for _, n := range []string{dnsUnitName, singBoxUnitName, mihomoUnitName} {
@@ -59,15 +93,47 @@ func containerTeardown(p Paths, log Logger) {
 			log.Logf("  （忽略）%v", err)
 		}
 	}
-	ignore := func(name string, args ...string) {
-		if err := runCmd(log, 60*time.Second, name, args...); err != nil {
-			log.Logf("  （忽略）%v", err)
+	var errs []string
+	del := func(name string, args ...string) {
+		if err := runCmd(log, 60*time.Second, name, args...); err != nil && !absentErr(err) {
+			errs = append(errs, err.Error())
 		}
 	}
-	ignore("nft", "delete", "table", "inet", "atom")
-	ignore("ip", "rule", "del", "fwmark", fwmark, "lookup", routeTable, "priority", routePriority)
-	ignore("ip", "route", "flush", "table", routeTable)
-	removeReplyRouting()
+	del("nft", "delete", "table", "inet", "atom")
+	del("ip", "rule", "del", "fwmark", fwmark, "lookup", routeTable, "priority", routePriority)
+	del("ip", "route", "flush", "table", routeTable)
+	if err := removeReplyRouting(); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("没有撤销网络规则：%s", strings.Join(errs, "；"))
+	}
+	return nil
+}
+
+// readRedirects is the accept_redirects values the reply option is going to change, by /proc path.
+func readRedirects(lan string) map[string]string {
+	out := map[string]string{}
+	for _, dev := range []string{"all", lan} {
+		f := "/proc/sys/net/ipv4/conf/" + dev + "/accept_redirects"
+		if v, err := os.ReadFile(f); err == nil {
+			out[f] = strings.TrimSpace(string(v))
+		}
+	}
+	return out
+}
+
+// undoRedirects puts the values back that the installation read before it turned them off (where it could).
+func (ins *Installer) undoRedirects(log Logger) {
+	for f, v := range ins.redirectsBefore {
+		if cur, err := os.ReadFile(f); err == nil && strings.TrimSpace(string(cur)) == v {
+			continue
+		}
+		if err := os.WriteFile(f, []byte(v), 0o644); err != nil {
+			log.Logf("  （忽略）恢复 %s: %v", f, err)
+		}
+	}
+	ins.redirectsBefore = nil
 }
 
 // containerBackupItems is backupItems of the container: the programs and the shipped files are in the image, so
@@ -93,7 +159,8 @@ func (ins *Installer) containerBackupItems() []backupItem {
 // keptByReset is what the reset leaves in the data directory: the backups.
 func keptByReset(p Paths) string { return filepath.Join(p.Data(), ".atom", "backup") }
 
-// copyTreeExcept is copyTree without the path skip (and what is under it).
+// copyTreeExcept is copyTree without the path skip (and what is under it), and with the links kept as links: what
+// the reset deletes next, it has to have saved. Sockets and the like are runtime objects, not data.
 func copyTreeExcept(src, dst, skip string) error {
 	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -107,10 +174,20 @@ func copyTreeExcept(src, dst, skip string) error {
 			return err
 		}
 		target := filepath.Join(dst, rel)
-		if d.IsDir() {
+		switch {
+		case d.IsDir():
 			return os.MkdirAll(target, 0o755)
-		}
-		if !d.Type().IsRegular() {
+		case d.Type()&fs.ModeSymlink != 0:
+			dest, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			os.Remove(target)
+			return os.Symlink(dest, target)
+		case !d.Type().IsRegular():
 			return nil
 		}
 		info, err := d.Info()
@@ -120,6 +197,10 @@ func copyTreeExcept(src, dst, skip string) error {
 		return copyFileAtomic(path, target, info.Mode().Perm())
 	})
 }
+
+// resetPending is the record that a reset is deleting the data: an entry process that is stopped in the middle
+// finishes the deletion when it starts again, and does not start a half deleted installation.
+func resetPending(p Paths) string { return filepath.Join(keptByReset(p), ".reset-pending") }
 
 // containerUninstallForReset is uninstallForReset of the container: the services stop (and are checked to be
 // stopped before anything is deleted), the network rules go, and the data directory is emptied except for the
@@ -140,39 +221,70 @@ func containerUninstallForReset(p Paths, log Logger) (string, error) {
 	if len(failed) > 0 {
 		return "", fmt.Errorf("旧的服务没有停下，未删除任何数据：%s", strings.Join(failed, "、"))
 	}
-	containerTeardown(p, log)
-	// the install record goes last: while anything else is left, a retry still finds it
+	if err := containerTeardown(p, log); err != nil {
+		return "", fmt.Errorf("%w，未删除任何数据", err)
+	}
+	if err := os.MkdirAll(keptByReset(p), 0o700); err != nil {
+		return "", err
+	}
+	if err := writeFile(resetPending(p), []byte(time.Now().Format(time.RFC3339)+"\n"), 0o600, true); err != nil {
+		return "", fmt.Errorf("记录重置：%w，未删除任何数据", err)
+	}
+	if err := purgeData(p, log); err != nil {
+		return "", err
+	}
+	if err := os.Remove(resetPending(p)); err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	return "", nil
+}
+
+// purgeData empties the data directory except for the backups; the install record goes last, so that a removal
+// that failed half way can be tried again in full.
+func purgeData(p Paths, log Logger) error {
 	data := p.Data()
 	keep := keptByReset(p)
 	entries, err := os.ReadDir(data)
 	if err != nil {
-		return "", err
+		return err
 	}
 	slices.SortStableFunc(entries, func(a, b os.DirEntry) int { return cmpBool(a.Name() == ".atom", b.Name() == ".atom") })
 	for _, e := range entries {
 		path := filepath.Join(data, e.Name())
-		if path == filepath.Dir(keep) { // data/.atom: everything but the backups, the install record last
-			inner, err := os.ReadDir(path)
-			if err != nil {
-				return "", err
-			}
-			slices.SortStableFunc(inner, func(a, b os.DirEntry) int { return cmpBool(a.Name() == "install.json", b.Name() == "install.json") })
-			for _, f := range inner {
-				if filepath.Join(path, f.Name()) == keep {
-					continue
-				}
-				if err := os.RemoveAll(filepath.Join(path, f.Name())); err != nil {
-					return "", err
-				}
+		if path != filepath.Dir(keep) {
+			if err := os.RemoveAll(path); err != nil {
+				return err
 			}
 			continue
 		}
-		if err := os.RemoveAll(path); err != nil {
-			return "", err
+		inner, err := os.ReadDir(path) // data/.atom: everything but the backups
+		if err != nil {
+			return err
+		}
+		slices.SortStableFunc(inner, func(a, b os.DirEntry) int { return cmpBool(a.Name() == "install.json", b.Name() == "install.json") })
+		for _, f := range inner {
+			if filepath.Join(path, f.Name()) == keep {
+				continue
+			}
+			if err := os.RemoveAll(filepath.Join(path, f.Name())); err != nil {
+				return err
+			}
 		}
 	}
 	log.Logf("已清空 %s，备份留在 %s", data, keep)
-	return "", nil
+	return nil
+}
+
+// resumeReset finishes a reset that the entry process did not (it was stopped while the data was deleted).
+func resumeReset(p Paths, log Logger) error {
+	if _, err := os.Stat(resetPending(p)); err != nil {
+		return nil
+	}
+	log.Logf("上一次重置没有做完，继续清空数据")
+	if err := purgeData(p, log); err != nil {
+		return err
+	}
+	return os.Remove(resetPending(p))
 }
 
 // containerRunning names the services of atom that the entry process says run.

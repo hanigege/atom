@@ -161,8 +161,9 @@ services:
     container_name: atom
     restart: unless-stopped
     cap_add: [NET_ADMIN]
-    sysctls:
-      - net.ipv4.conf.all.accept_redirects=0   # 只在勾了“回包经主路由”时需要；写上也无妨
+    sysctls:                                   # 只在勾了“回包经主路由”时需要；写上也无妨
+      - net.ipv4.conf.all.accept_redirects=0
+      - net.ipv4.conf.eth0.accept_redirects=0  # 网卡名按容器里的实际名字（Docker 一般是 eth0）
     volumes:
       - ./data:/opt/atom/data
     networks:
@@ -177,7 +178,7 @@ networks:
 ```
 
 - 用户只需要改 `parent`、网段和容器的 IP。
-- Docker 默认把 `/proc/sys` 挂成只读，入口进程写不了 sysctl，所以需要的 sysctl 写在 compose 里。单网卡旁路由不需要 `ip_forward`（被代理的流量都是交给本机的 sing-box）。“回包经主路由”只需要 `accept_redirects=0`；勾了这个选项但没在 compose 里写，自检就报错并指明要加哪一行。
+- Docker 默认把 `/proc/sys` 挂成只读，入口进程写不了 sysctl，所以需要的 sysctl 写在 compose 里。单网卡旁路由不需要 `ip_forward`（被代理的流量都是交给本机的 sing-box）。“回包经主路由”只需要 `accept_redirects=0`，而且 `all` 和网卡两项都要是 0（没开转发时，内核只要有一项允许就会收重定向；C2 实测 Docker 里 `all` 默认是 0、`eth0` 是 1，`eth0` 的值可以在 compose 里设，`default` 不行）；勾了这个选项但没在 compose 里写，向导就报错并指明要加哪几行。
 - macvlan 的限制：宿主自己访问不到容器。文档里写明，不做绕过方案。
 - 宿主内核要有 `nft_tproxy` 和 `nft_socket`。Debian、Ubuntu 的默认内核都有。群晖这类 NAS 不保证，向导的环境探测会拦下来。
 

@@ -293,7 +293,8 @@ func TestContainerInstallStepsHaveNoDependenciesOrPrograms(t *testing.T) {
 
 func TestNetworkStepWritesStateAndLoadsRules(t *testing.T) {
 	p := containerPaths(t)
-	bin := fakeCommands(t, map[string]string{"nft": "", "ip": ""})
+	bin := fakeCommands(t, map[string]string{"nft": "", "ip": `[ "$1 $2" = "rule show" ] && cat "$D/rules"`})
+	os.WriteFile(filepath.Join(bin, "rules"), []byte(replyRule+"\n"), 0o644) // an earlier installation had the option
 	old := syncNftFn
 	var loaded bool
 	syncNftFn = func(_ Paths, _, loadAtom bool, _ string) error { loaded = loadAtom; return nil }
@@ -351,10 +352,13 @@ func TestTeardownRemovesOnlyWhatTheInstallationLoaded(t *testing.T) {
 		t.Errorf("atom-dns %s", st)
 	}
 	calls, _ := os.ReadFile(filepath.Join(bin, "calls"))
-	for _, want := range []string{"nft delete table inet atom", "ip rule del fwmark " + fwmark + " lookup " + routeTable, "ip route flush table " + routeTable, "ip rule del fwmark " + replyMark} {
+	for _, want := range []string{"nft delete table inet atom", "ip rule del fwmark " + fwmark + " lookup " + routeTable, "ip route flush table " + routeTable} {
 		if !strings.Contains(string(calls), want) {
 			t.Errorf("missing %q in\n%s", want, calls)
 		}
+	}
+	if strings.Contains(string(calls), "fwmark "+replyMark) {
+		t.Errorf("a reply rule that is not there was deleted:\n%s", calls)
 	}
 	if strings.Contains(string(calls), "atom_wan") || strings.Contains(string(calls), "ip_forward") {
 		t.Errorf("a gateway's things were touched:\n%s", calls)
@@ -603,4 +607,166 @@ func unixTransport(path string) *http.Transport {
 	return &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", path)
 	}}
+}
+
+// ---- what the first review found ----
+
+func TestTeardownReportsWhatItCannotRemoveButNotWhatIsGone(t *testing.T) {
+	p := containerPaths(t)
+	s, _ := testSup(t, p, shSpec("atom-sing-box", `exec sleep 30`), shSpec("atom-mihomo", `exec sleep 30`), shSpec("atom-dns", `exec sleep 30`))
+	closeAll, err := serveContainerSockets(p, s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeAll()
+	gone := fakeCommands(t, map[string]string{"nft": `echo "Error: No such file or directory" >&2; exit 1`, "ip": `echo "RTNETLINK answers: No such file or directory" >&2; exit 2`})
+	if err := containerTeardown(p, stderrLogger{}); err != nil {
+		t.Errorf("what is gone already is not an error: %v", err)
+	}
+	os.WriteFile(filepath.Join(gone, "nft"), []byte("#!/bin/sh\necho 'Error: Operation not permitted' >&2\nexit 1\n"), 0o755)
+	if err := containerTeardown(p, stderrLogger{}); err == nil || !strings.Contains(err.Error(), "not permitted") {
+		t.Errorf("a table that stays must be reported: %v", err)
+	}
+}
+
+func TestReplyRoutingIsOnlyRemovedWhenItIsTheInstallers(t *testing.T) {
+	dir := fakeCommands(t, map[string]string{"ip": `[ "$1 $2" = "rule show" ] && cat "$D/rules"`})
+	calls := func() string { b, _ := os.ReadFile(filepath.Join(dir, "calls")); return string(b) }
+	os.WriteFile(filepath.Join(dir, "rules"), []byte("0:\tfrom all lookup local\n9234:\tfrom all fwmark 0x999 lookup 234\n"), 0o644)
+	if err := removeReplyRouting(); err != nil || strings.Contains(calls(), "rule del") || strings.Contains(calls(), "route") {
+		t.Errorf("another rule was touched: %v\n%s", err, calls())
+	}
+	os.WriteFile(filepath.Join(dir, "rules"), []byte("0:\tfrom all lookup local\n"+replyRule+"\n"), 0o644)
+	if err := removeReplyRouting(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(calls(), "ip rule del fwmark "+replyMark) || !strings.Contains(calls(), "ip route del default table "+replyTable) || strings.Contains(calls(), "flush") {
+		t.Errorf("%s", calls())
+	}
+}
+
+func TestInterruptedResetIsFinishedAtTheNextStart(t *testing.T) {
+	p := containerPaths(t)
+	installedContainer(t, p)
+	os.MkdirAll(p.Data()+"/rule", 0o755)
+	os.WriteFile(p.Data()+"/rule/x", []byte("x"), 0o644)
+	os.MkdirAll(p.Backup()+"/reset-1/data", 0o755)
+	os.WriteFile(p.Backup()+"/reset-1/data/y", []byte("y"), 0o644)
+	if err := resumeReset(p, stderrLogger{}); err != nil || !fileExists(p.State()) {
+		t.Fatalf("nothing is pending: %v", err)
+	}
+	os.WriteFile(resetPending(p), []byte("now"), 0o600)
+	if err := resumeReset(p, stderrLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	if fileExists(p.State()) || fileExists(p.Data()+"/rule/x") || fileExists(p.Data()+"/.atom-data") || fileExists(resetPending(p)) {
+		t.Error("the data was not emptied")
+	}
+	if !fileExists(p.Backup() + "/reset-1/data/y") {
+		t.Error("a backup was deleted")
+	}
+}
+
+func TestResetBackupKeepsSymlinks(t *testing.T) {
+	p := containerPaths(t)
+	installedContainer(t, p)
+	os.MkdirAll(p.Data()+"/rule", 0o755)
+	os.WriteFile(p.Data()+"/rule/real", []byte("x"), 0o644)
+	os.Symlink("real", p.Data()+"/rule/link")
+	backup, err := backupForReset(p, stderrLogger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dest, err := os.Readlink(backup + "/data/rule/link"); err != nil || dest != "real" {
+		t.Errorf("the link was not kept: %q %v", dest, err)
+	}
+}
+
+func TestEnsurePanelPortKeepsTheBindAddress(t *testing.T) {
+	p := containerPaths(t)
+	os.MkdirAll(p.Data(), 0o755)
+	path := p.Data() + "/config_custom.yaml"
+	os.WriteFile(path, []byte("api:\n  http: \"127.0.0.1:80\"\n"), 0o644)
+	if changed, err := ensurePanelPort(p, &InstallState{PanelPort: 80}); err != nil || changed {
+		t.Errorf("%v %v", changed, err)
+	}
+	if data, _ := os.ReadFile(path); !strings.Contains(string(data), "127.0.0.1:80") {
+		t.Errorf("%s", data)
+	}
+	os.WriteFile(path, []byte("no api here\n"), 0o644)
+	if _, err := ensurePanelPort(p, &InstallState{PanelPort: 80}); err == nil {
+		t.Error("a config without api.http must be an error")
+	}
+}
+
+func TestTheWizardSlotIsHeldUntilWhatFollowsItIsDone(t *testing.T) {
+	p := containerPaths(t)
+	installedContainer(t, p)
+	s, _ := testSup(t, p, shSpec("atom-dns", `exec sleep 30`))
+	host := newWizardHost(p, s)
+	release := make(chan struct{})
+	ran := make(chan struct{})
+	w, err := host.start(wizardFirst, "", func(*containerWizard) error { close(ran); <-release; return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.server.stop(false)
+	<-ran
+	if _, err := host.reconfigure(); err == nil || !strings.Contains(err.Error(), "已在运行") {
+		t.Errorf("another wizard opened during the handover: %v", err)
+	}
+	if activeWizard(listenInfo{Port: w.port, Code: w.code}) {
+		setWizardHost(nil)
+	}
+	close(release)
+	<-w.done
+	if r, err := host.reconfigure(); err != nil {
+		t.Errorf("after it: %v", err)
+	} else {
+		host.cur.server.stop(false)
+		_ = r
+	}
+}
+
+func TestWizardAnswersCarryTheirMarkAndOverviewForgetsAStartedReset(t *testing.T) {
+	p := containerPaths(t)
+	_, do := containerServer(t, p, true)
+	req, _ := http.NewRequest("GET", "/api/state", nil)
+	req.RemoteAddr, req.Host = "10.0.0.9:1", "10.0.0.201"
+	rec := &recorder{header: http.Header{}}
+	s, _ := containerServer(t, p, true)
+	s.handler().ServeHTTP(rec, req)
+	if rec.header.Get("X-Atom-Wizard") != "1" {
+		t.Errorf("headers %v", rec.header)
+	}
+	_ = do
+	// the overview of a panel that comes after a reset
+	installedContainer(t, p)
+	c := containerMaintenance(p)
+	c.job = &maintenanceJob{ID: "j", Kind: "reset", Phase: "reset", Done: true}
+	rec = &recorder{header: http.Header{}}
+	c.overview(rec)
+	var m map[string]any
+	json.Unmarshal(rec.body.Bytes(), &m)
+	if _, ok := m["job"]; ok {
+		t.Errorf("a reset that began is shown: %v", m)
+	}
+	c.job = &maintenanceJob{ID: "j", Kind: "reset", Phase: "failed", Done: true, Error: "x"}
+	rec = &recorder{header: http.Header{}}
+	c.overview(rec)
+	json.Unmarshal(rec.body.Bytes(), &m)
+	if _, ok := m["job"]; !ok {
+		t.Errorf("a failed reset must stay visible: %v", m)
+	}
+}
+
+func TestRedirectsAreGivenBackAfterAFailedReconfigure(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "accept_redirects")
+	os.WriteFile(f, []byte("0\n"), 0o644)
+	ins := &Installer{redirectsBefore: map[string]string{f: "1"}}
+	ins.undoRedirects(stderrLogger{})
+	if b, _ := os.ReadFile(f); strings.TrimSpace(string(b)) != "1" || ins.redirectsBefore != nil {
+		t.Errorf("%q %v", b, ins.redirectsBefore)
+	}
 }

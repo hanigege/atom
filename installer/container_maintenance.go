@@ -39,8 +39,10 @@ func (c containerMaint) overview(w http.ResponseWriter) {
 		return
 	}
 	view := map[string]any{"version": st.Version, "online": false, "deployment": "container"}
-	if job := c.currentJob(); job != nil && !(job.Done && job.Kind == "reset" && job.Phase == "reset" && st.InstalledAt.After(job.Updated)) {
-		view["job"] = job // a reset the panel is following; one that was done before this installation is not
+	// A reset that began has taken this panel down with the rest: a panel that answers is a later one, which has
+	// nothing to show of it.
+	if job := c.currentJob(); job != nil && !(job.Done && job.Kind == "reset" && job.Phase == "reset") {
+		view["job"] = job
 	}
 	writeResp(w, 200, view)
 }

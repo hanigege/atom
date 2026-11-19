@@ -694,8 +694,14 @@ function watchPanel() {
 async function openPanel() {
   clearTimeout(S.redirectTimer);
   try { await api('POST', '/api/finish'); } catch (e) {}
-  for (let i = 0; i < 20; i++) {
-    try { await fetch(S.panelURL, { mode: 'no-cors', cache: 'no-store' }); break; } catch (e) { await new Promise(r => setTimeout(r, 500)); }
+  // On the wizard's own address (the container) the panel takes the port over: wait until it is not the wizard that answers.
+  const same = new URL(S.panelURL).origin === location.origin;
+  for (let i = 0; i < (same ? 60 : 20); i++) {
+    try {
+      const r = await fetch(S.panelURL, same ? { cache: 'no-store' } : { mode: 'no-cors', cache: 'no-store' });
+      if (!same || !r.headers.get('X-Atom-Wizard')) break;
+    } catch (e) { /* not up yet */ }
+    await new Promise(r => setTimeout(r, 500));
   }
   location.href = S.panelURL;
 }

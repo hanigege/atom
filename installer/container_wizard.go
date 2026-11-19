@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,9 +35,11 @@ type containerWizard struct {
 	ins       *Installer
 	port      int
 	code      string
-	done      chan struct{} // closed when the wizard has closed
+	done      chan struct{} // closed when the wizard has closed (and what follows it is done)
 	runFile   string
 	operation *os.File
+	after     func(*containerWizard) error // what follows the close, with the wizard's slot and lock still held
+	afterErr  error
 }
 
 type wizardHost struct {
@@ -90,7 +93,7 @@ func startContainerReset(p Paths, id string) error {
 	if h == nil {
 		return fmt.Errorf("入口进程没有安装向导的宿主")
 	}
-	_, err := h.start(wizardReset, id)
+	_, err := h.start(wizardReset, id, nil)
 	return err
 }
 
@@ -123,8 +126,9 @@ func freePort() (int, error) {
 }
 
 // start opens a wizard; id is the maintenance job of a reset. One wizard at a time: a reconfigure that is open is
-// returned again (the command may be run twice), any other open wizard is an error.
-func (h *wizardHost) start(kind wizardKind, id string) (*containerWizard, error) {
+// returned again (the command may be run twice), any other open wizard is an error. after runs when the wizard
+// has closed, before it counts as gone: no other one opens meanwhile.
+func (h *wizardHost) start(kind wizardKind, id string, after func(*containerWizard) error) (*containerWizard, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.cur != nil && !isClosed(h.cur.done) {
@@ -134,7 +138,7 @@ func (h *wizardHost) start(kind wizardKind, id string) (*containerWizard, error)
 		return nil, fmt.Errorf("安装向导已在运行，请先关闭它")
 	}
 	p := h.p
-	w := &containerWizard{kind: kind, ins: newContainerInstaller(p), done: make(chan struct{}), runFile: p.Run("installer.json")}
+	w := &containerWizard{kind: kind, ins: newContainerInstaller(p), done: make(chan struct{}), runFile: p.Run("installer.json"), after: after}
 	w.ins.Reconfigure = kind == wizardReconfigure
 	var err error
 	switch kind {
@@ -199,6 +203,9 @@ func (h *wizardHost) start(kind wizardKind, id string) (*containerWizard, error)
 		srv.Shutdown(ctx)
 		cancel()
 		os.Remove(w.runFile)
+		if w.after != nil {
+			w.afterErr = w.after(w)
+		}
 		if w.operation != nil {
 			w.operation.Close()
 		}
@@ -236,12 +243,21 @@ func (w *containerWizard) announce(log Logger) {
 
 // ---- the first installation ----
 
-// runFirstWizard serves the wizard of a container that has no installation, until it has installed. The services
-// the installation started keep running. ok is false when the wizard ended without an installation or stop was
-// closed first.
+// runFirstWizard serves the wizard of a container that has no installation, until it has installed and closed,
+// and the panel has moved to its port. The services the installation started keep running. It returns nil when
+// stop came first.
 func runFirstWizard(p Paths, sup *supervisor, h *wizardHost, stop <-chan struct{}) error {
 	sup.markReady()
-	w, err := h.start(wizardFirst, "")
+	w, err := h.start(wizardFirst, "", func(w *containerWizard) error {
+		st, err := loadState(p)
+		if err != nil || !st.Complete {
+			return fmt.Errorf("安装向导已关闭，但没有完成的安装")
+		}
+		if w.ins.PanelTemp != 0 {
+			return handOverPanel(p, sup, st)
+		}
+		return nil
+	})
 	if err != nil {
 		return fmt.Errorf("安装向导没有启动：%w", err)
 	}
@@ -251,16 +267,16 @@ func runFirstWizard(p Paths, sup *supervisor, h *wizardHost, stop <-chan struct{
 	case <-stop:
 		return nil
 	}
-	st, err := loadState(p)
-	if err != nil || !st.Complete {
-		return fmt.Errorf("安装向导已关闭，但没有完成的安装")
+	if w.afterErr != nil {
+		return w.afterErr
 	}
-	if w.ins.PanelTemp != 0 {
-		return handOverPanel(p, sup, st)
+	if st, err := loadState(p); err == nil {
+		sup.Logf("安装完成，面板端口 %d", st.PanelPort)
 	}
-	sup.Logf("安装完成，面板端口 %d", st.PanelPort)
 	return nil
 }
+
+var panelBindRe = regexp.MustCompile(`(?m)^api:[ \t]*\r?\n[ \t]+http:[ \t]*"([^"]*)"`)
 
 // ensurePanelPort makes the panel port of config_custom.yaml the one install.json says; it returns whether the
 // file had to change. It is what moves the panel from the temporary port of the installation to the real one,
@@ -271,12 +287,14 @@ func ensurePanelPort(p Paths, st *InstallState) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if m := panelBindRe.FindStringSubmatch(string(data)); m != nil {
+		if _, port, err := net.SplitHostPort(m[1]); err == nil && port == strconv.Itoa(st.PanelPort) {
+			return false, nil // the bind address stays as it is
+		}
+	}
 	out, err := setPanelPort(string(data), st.PanelPort)
 	if err != nil {
 		return false, err
-	}
-	if out == string(data) {
-		return false, nil
 	}
 	return true, writeFileAtomic(path, []byte(out), 0o644)
 }
@@ -291,7 +309,6 @@ func handOverPanel(p Paths, sup *supervisor, st *InstallState) error {
 	if err := sup.Restart(ctx, "atom-dns"); err != nil {
 		return fmt.Errorf("atomdns 改用面板端口 %d 时没有起来：%w", st.PanelPort, err)
 	}
-	sup.Logf("安装完成，面板端口 %d", st.PanelPort)
 	return nil
 }
 
@@ -304,7 +321,7 @@ type reconfigureReply struct {
 }
 
 func (h *wizardHost) reconfigure() (reconfigureReply, error) {
-	w, err := h.start(wizardReconfigure, "")
+	w, err := h.start(wizardReconfigure, "", nil)
 	if err != nil {
 		return reconfigureReply{}, err
 	}

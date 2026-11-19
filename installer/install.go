@@ -25,6 +25,8 @@ type Installer struct {
 	// PanelTemp (container): the wizard listens on the port the panel is to have, so the installation runs
 	// atomdns on this port instead; the entry process moves it to the real one when the wizard has closed.
 	PanelTemp int
+	// redirectsBefore (container): the accept_redirects values read before the reply option turned them off
+	redirectsBefore map[string]string
 }
 
 // Job is one run of the installation, observed by the wizard page.
@@ -953,7 +955,10 @@ func lookupVia(server, name string) ([]net.IP, error) {
 // the uninstaller finds them). It does nothing when the installer has not changed the network.
 func (ins *Installer) rollbackNetwork(log Logger) {
 	if ins.Paths.Container {
-		containerTeardown(ins.Paths, log)
+		if err := containerTeardown(ins.Paths, log); err != nil {
+			log.Logf("%v", err)
+		}
+		ins.undoRedirects(log)
 		return
 	}
 	ch, err := loadChanges(ins.Paths)

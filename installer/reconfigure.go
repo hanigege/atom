@@ -49,7 +49,10 @@ func (rc *reconfigureRun) restore(ins *Installer, log Logger) {
 	// interfaces, which the old services then turn off again when they start)
 	rc.undoAdditions(newCh, log)
 	if ins.Paths.Container && rc.oldSt.ReplyVia == "" {
-		removeReplyRouting()
+		if err := removeReplyRouting(); err != nil {
+			log.Logf("  （忽略）%v", err)
+		}
+		ins.undoRedirects(log)
 	}
 	if err := ins.restoreBackup(rc.dir, rc.oldSt.PanelPort, log); err != nil {
 		log.Logf("恢复备份出错：%v（备份在 %s）", err, rc.dir)

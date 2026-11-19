@@ -309,7 +309,7 @@ func (m *maintenance) watchReset() {
 			return
 		}
 		li, alive := runningWizard(m.paths)
-		if alive && li.PID != job.WizardPID {
+		if alive && (li.PID != job.WizardPID || (m.paths.Container && li.ResetJob != job.ID)) {
 			alive = false
 		}
 		var err error
@@ -736,7 +736,11 @@ func backupForReset(p Paths, log Logger) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	if _, err := os.Stat(p.Data()); err == nil {
+	_, statErr := os.Stat(p.Data())
+	if p.Container && statErr != nil && !os.IsNotExist(statErr) {
+		return "", statErr // the data cannot be read: it is not deleted either
+	}
+	if statErr == nil {
 		if err := copyData(filepath.Join(dir, "data")); err != nil {
 			return "", err
 		}
