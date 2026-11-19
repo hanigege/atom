@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"math/big"
@@ -130,6 +129,9 @@ func cmdServe(args []string) int {
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
+		if *resetJob != "" && ins.Paths.managedPackage(ins.PkgDir) && ins.PkgDir != ins.Paths.Pkg() {
+			os.RemoveAll(ins.PkgDir) // a reset that ended before this wizard started: nobody else removes its package
+		}
 		return 1
 	}
 	defer lock.Close()
@@ -166,11 +168,8 @@ func cmdServe(args []string) int {
 		}
 		li = reset.listen
 	}
-	data, err := json.MarshalIndent(li, "", "  ")
-	if err == nil {
-		err = writeFileAtomic(runFile, data, 0o600)
-	}
-	if err != nil {
+	// the run file holds the code: root only, in every write (see publishReset)
+	if err := writePrivateJSON(runFile, li); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}

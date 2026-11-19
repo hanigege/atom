@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -322,6 +323,9 @@ func TestMaintenanceFollowsTheResetWizard(t *testing.T) {
 		t.Fatalf("%+v", job)
 	}
 	start()
+	os.Remove(p.Run("installer.json")) // the wizard is gone
+	testWizardStarting = func() bool { return false }
+	defer func() { testWizardStarting = nil }()
 	m.change(func(job *maintenanceJob) {
 		job.WizardPID = 0
 		job.Phase = "preparing"
@@ -374,5 +378,340 @@ func TestResetJobLockAndRequest(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &body)
 	if body["error"] == "" {
 		t.Errorf("%s", w.Body.String())
+	}
+}
+
+// Review finding: every write of the run file (it holds the code) is 0600, not only the first one.
+func TestResetRunFileAndLogStayPrivate(t *testing.T) {
+	s := resetServer(t)
+	runFile := s.reset.runFile
+	// a run file that somehow has a wider mode is narrowed by the next phase
+	if err := os.MkdirAll(filepath.Dir(runFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runFile, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{resetBackingUp, resetPurging, resetPurgeFailed, resetReady, resetFailed} {
+		s.setResetPhase(phase, "")
+		info, err := os.Stat(runFile)
+		if err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("%s: the run file with the code is root only: %v %v", phase, info.Mode(), err)
+		}
+		var li listenInfo
+		if err := readJSON(runFile, &li); err != nil || li.Code != "012345" || li.Reset != phase {
+			t.Fatalf("%s: %+v %v", phase, li, err)
+		}
+	}
+	// the OpenRC wizard log, where the reset wizard prints its code
+	log := filepath.Join(t.TempDir(), "run", "installer.log")
+	if err := privateLog(log); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(log); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("a new log is root only: %v %v", info, err)
+	}
+	os.Chmod(log, 0o644)
+	os.WriteFile(log, []byte("安装码  111111\n"), 0o644)
+	if err := privateLog(log); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(log); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("an existing log is narrowed: %v %v", info, err)
+	}
+	if got, _ := os.ReadFile(log); string(got) != "安装码  111111\n" {
+		t.Errorf("the log is appended to, not truncated: %q", got)
+	}
+	script, err := os.ReadFile("scripts/install.sh.in")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(script), `chmod 600 "$ROOT/run/installer.log"`) {
+		t.Error("install.sh creates the OpenRC wizard log root only as well")
+	}
+}
+
+// installedForReset gives the reset server an installation with data, its marker and the install record.
+func installedForReset(t *testing.T, s *Server) {
+	t.Helper()
+	p := s.ins.Paths
+	for path, content := range map[string]string{
+		"data/webinfo/atom_proxy.json": `{"settings":{"backend":"sing-box"}}`,
+		"data/.atom-data":              `{"version":"1.2.3"}`,
+		"bin/atomdns":                  "x",
+	} {
+		if err := writeFileAtomic(filepath.Join(p.Root, path), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := saveChanges(p, &Changes{}); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.reset.phase = resetBackingUp
+	s.mu.Unlock()
+}
+
+func waitResetPhase(t *testing.T, s *Server, want string) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		if s.state().Reset.Phase == want {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("phase %q, want %q", s.state().Reset.Phase, want)
+}
+
+// Review finding: a removal that failed (or left the data) must not end in ready, where the default
+// installation would take the old data over; the page can try the removal again.
+func TestResetRemovalFailureIsRetryableAndNeverKeepsData(t *testing.T) {
+	s := resetServer(t)
+	p := s.ins.Paths
+	installedForReset(t, s)
+	defer func() { resetUninstall = uninstallForReset }()
+
+	calls := 0
+	resetUninstall = func(Paths, []string, Logger) (string, error) {
+		calls++
+		return "", os.ErrPermission // e.g. stopping the maintenance service failed: nothing was removed
+	}
+	s.runReset()
+	v := s.state().Reset
+	if v.Phase != resetPurgeFailed || !strings.Contains(v.Error, "移除旧的安装没有完成") || v.Backup == "" {
+		t.Fatalf("a failed removal is reported, not ready: %+v", v)
+	}
+	if v.Job.Steps[1].Status != "fail" {
+		t.Errorf("the removal step failed: %+v", v.Job.Steps)
+	}
+	var li listenInfo
+	if readJSON(s.reset.runFile, &li); li.Reset != resetPurgeFailed {
+		t.Errorf("the maintenance service sees it too: %+v", li)
+	}
+	if !hasData(p) {
+		t.Fatal("the test expects the old data to be there")
+	}
+	if !s.busyOrClosing() || s.requestClose() {
+		t.Error("no installation and no closing while the old installation is still there")
+	}
+	s.mu.Lock()
+	s.seen = time.Now().Add(-2 * idleLimit)
+	s.mu.Unlock()
+	if closed, hold := s.resetIdle(); closed || !hold || s.job != nil {
+		t.Errorf("the idle timer neither closes nor installs: %v %v %v", closed, hold, s.job)
+	}
+	if s.state().Reset.AutoInstall != nil {
+		t.Error("no default installation is announced")
+	}
+
+	// a removal that reports success but leaves the data is not a reset either
+	resetUninstall = func(Paths, []string, Logger) (string, error) { calls++; return "", nil }
+	post := func() int {
+		r := httptest.NewRequest("POST", "http://127.0.0.1/api/reset", strings.NewReader("{}"))
+		r.RemoteAddr = "127.0.0.1:8888"
+		r.Header.Set("X-Atom-Install-Code", "012345")
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		s.handler().ServeHTTP(w, r)
+		return w.Code
+	}
+	if code := post(); code != 202 {
+		t.Fatalf("the page retries the removal: %d", code)
+	}
+	waitResetPhase(t, s, resetPurgeFailed)
+	if e := s.state().Reset.Error; !strings.Contains(e, p.Data()) {
+		t.Errorf("the leftover is named: %q", e)
+	}
+
+	// the retry that removes everything reaches ready; the backup is not taken again
+	backup := s.state().Reset.Backup
+	resetUninstall = func(p Paths, keep []string, log Logger) (string, error) {
+		calls++
+		for _, d := range []string{"data", "bin", "etc"} {
+			os.RemoveAll(filepath.Join(p.Root, d))
+		}
+		return "", nil
+	}
+	if code := post(); code != 202 {
+		t.Fatalf("retry: %d", code)
+	}
+	waitResetPhase(t, s, resetReady)
+	if v := s.state().Reset; v.Backup != backup || v.AutoInstall == nil || v.Job.Steps[1].Status != "ok" {
+		t.Errorf("after the retry: %+v", v)
+	}
+	if calls != 3 {
+		t.Errorf("removal attempts: %d", calls)
+	}
+	// even with a data marker back (a failed installation, say), a reset installation never keeps data
+	writeFileAtomic(dataMarker(p), []byte("{}"), 0o600)
+	if s.keepExistingData() {
+		t.Error("after a reset the installation starts from the default settings")
+	}
+	if code := post(); code != 200 {
+		t.Errorf("once ready, the reset request only reports: %d", code)
+	}
+}
+
+// Review finding: the panel's writes are drained before the backup and refused until the old installation is gone.
+func TestResetHoldsPanelWritesFromBackupToRemoval(t *testing.T) {
+	s := resetServer(t)
+	p := s.ins.Paths
+	installedForReset(t, s)
+	defer func() { resetUninstall = uninstallForReset }()
+
+	// a panel write in progress: it holds the shared lock and finishes after the reset asked for the backup
+	if err := os.MkdirAll(p.Run(""), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	panel, err := os.OpenFile(p.Run(panelWriteLock), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer panel.Close()
+	if err := syscall.Flock(int(panel.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	refused := 0
+	resetUninstall = func(p Paths, keep []string, log Logger) (string, error) {
+		// a new panel write between the backup and the removal is refused
+		f, err := os.Open(p.Run(panelWriteLock))
+		if err != nil {
+			t.Error(err)
+			return "", err
+		}
+		defer f.Close()
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+			refused++
+		}
+		for _, d := range []string{"data", "bin", "etc"} {
+			os.RemoveAll(filepath.Join(p.Root, d))
+		}
+		return "", nil
+	}
+	done := make(chan struct{})
+	go func() { s.runReset(); close(done) }()
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("the reset waited for the write in progress")
+	default:
+	}
+	if err := os.WriteFile(filepath.Join(p.Data(), "webinfo", "late.json"), []byte("late"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	syscall.Flock(int(panel.Fd()), syscall.LOCK_UN)
+	<-done
+	v := s.state().Reset
+	if v.Phase != resetReady {
+		t.Fatalf("%+v", v)
+	}
+	if got, err := os.ReadFile(filepath.Join(v.Backup, "data", "webinfo", "late.json")); err != nil || string(got) != "late" {
+		t.Errorf("the write that was in progress is in the backup: %q %v", got, err)
+	}
+	if refused != 1 {
+		t.Error("panel writes are refused until the old installation is gone")
+	}
+	if s.reset.writes != nil {
+		t.Error("the lock is let go once the old installation is gone")
+	}
+}
+
+// Review finding: a maintenance service that restarts after it launched the wizard and before it recorded the
+// wizard's process must not remove the package the wizard runs from; it follows that wizard instead.
+func TestMaintenanceRestartWhileTheResetWizardStarts(t *testing.T) {
+	p := Paths{Root: filepath.Join(t.TempDir(), "atom")}
+	pkg := filepath.Join(p.Root, "pkg.reset-x")
+	defer func() { testWizardStarting, recoverWizardWait = nil, 20*time.Second }()
+	preparing := func() {
+		m := &maintenance{paths: p}
+		if err := m.save(maintenanceJob{ID: "job1", Kind: "reset", Phase: "preparing", Package: pkg}); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(pkg, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wizard := func(job, phase string) {
+		li := listenInfo{Port: 9996, PID: os.Getpid(), Code: "012345", ResetJob: job, Reset: phase}
+		if err := writeJSON(p.Run("installer.json"), li); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// the run file of the job's wizard is there: it is taken over
+	preparing()
+	wizard("job1", resetWaiting)
+	testWizardStarting = func() bool { return true }
+	m := &maintenance{paths: p}
+	if err := m.recover(); err != nil {
+		t.Fatal(err)
+	}
+	job := m.snapshot()
+	if job.Done || job.WizardPID != os.Getpid() || job.WizardCode != "012345" || job.Phase != "awaiting_browser" {
+		t.Fatalf("the running wizard is followed: %+v", job)
+	}
+	if _, err := os.Stat(pkg); err != nil {
+		t.Fatalf("the wizard's package stays: %v", err)
+	}
+	wizard("job1", resetReady)
+	for i := 0; i < 40 && !m.snapshot().Done; i++ {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if job := m.snapshot(); job.Phase != "reset" {
+		t.Fatalf("and its reset is recorded: %+v", job)
+	}
+
+	// the wizard was launched but has not written its run file yet: the service waits for it
+	preparing()
+	os.Remove(p.Run("installer.json"))
+	recoverWizardWait = 5 * time.Second
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		wizard("job1", resetWaiting)
+	}()
+	m = &maintenance{paths: p}
+	if err := m.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if job := m.snapshot(); job.Done || job.WizardPID != os.Getpid() {
+		t.Fatalf("the starting wizard is waited for: %+v", job)
+	}
+	if _, err := os.Stat(pkg); err != nil {
+		t.Fatalf("the wizard's package stays: %v", err)
+	}
+	wizard("job1", resetFailed)
+	for i := 0; i < 40 && !m.snapshot().Done; i++ {
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// a wizard of another job is not this reset's: no wizard got the package
+	preparing()
+	wizard("other", resetWaiting)
+	testWizardStarting = func() bool { return false }
+	m = &maintenance{paths: p}
+	if err := m.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if job := m.snapshot(); job.Phase != "cancelled" {
+		t.Fatalf("%+v", job)
+	}
+	if _, err := os.Stat(pkg); !os.IsNotExist(err) {
+		t.Errorf("the package no wizard got is removed: %v", err)
+	}
+
+	// a wizard process that never writes its run file: the service waits, then cancels
+	preparing()
+	os.Remove(p.Run("installer.json"))
+	testWizardStarting = func() bool { return true }
+	recoverWizardWait = 500 * time.Millisecond
+	m = &maintenance{paths: p}
+	if err := m.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if job := m.snapshot(); job.Phase != "cancelled" {
+		t.Fatalf("%+v", job)
+	}
+	if _, err := os.Stat(pkg); err != nil {
+		t.Errorf("a process that may still run from the package keeps it (it removes it when it exits): %v", err)
 	}
 }

@@ -344,7 +344,7 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg.fillDefaults()
-	cfg.keepData = hasData(s.ins.Paths)
+	cfg.keepData = s.keepExistingData()
 	cfg.currentUser = s.currentLoginUser()
 	errs := cfg.Validate(listInterfaces(), s.ins.InstallerPort, s.busy())
 	if errs == nil {
@@ -366,7 +366,7 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg.fillDefaults()
-	cfg.keepData = hasData(s.ins.Paths)
+	cfg.keepData = s.keepExistingData()
 	cfg.currentUser = s.currentLoginUser()
 	if probs := checkSystem().Problems; len(probs) > 0 {
 		writeErr(w, 400, strings.Join(probs, "；"))
@@ -386,6 +386,12 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	go s.ins.runInstall(cfg, job)
 	writeResp(w, 202, map[string]bool{"started": true})
+}
+
+// keepExistingData: the installation takes over the data of an earlier one. Never after a reset: the reset is
+// the promise that the next installation starts from the default settings.
+func (s *Server) keepExistingData() bool {
+	return s.reset == nil && hasData(s.ins.Paths)
 }
 
 // busyOrClosing: an installation is running, or finish was accepted. A reset wizard takes nothing before the

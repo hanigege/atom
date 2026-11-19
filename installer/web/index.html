@@ -502,9 +502,10 @@ function viewDone() {
 // The reset the panel started: the wizard backs the data up and removes the old installation, then the steps
 // of a new installation follow.
 function viewReset() {
-  const r = S.state.reset, j = r.job, failed = r.phase === 'failed';
-  let h = `<div class="head"><div class="k">重置所有设置</div><h1>${failed ? '没有重置' : '正在重置…'}</h1></div>` + jobBar(failed ? j : Object.assign({}, j, { done: false }));
-  if (!failed) h += '<div class="lbl">正在备份数据并移除旧的安装。局域网的 DNS 在安装完成前不可用，请不要关闭此页面。</div>';
+  const r = S.state.reset, j = r.job, failed = r.phase === 'failed', stuck = r.phase === 'reset_failed';
+  let h = `<div class="head"><div class="k">重置所有设置</div><h1>${failed ? '没有重置' : stuck ? '重置没有完成' : '正在重置…'}</h1></div>` + jobBar(failed ? j : Object.assign({}, j, { done: false }));
+  if (stuck) h += '<div class="lbl">数据已备份，但旧的安装没有完全移除，暂时不能重新安装。请按日志处理后点「重试」；安装向导会一直等待。</div>';
+  else if (!failed) h += '<div class="lbl">正在备份数据并移除旧的安装。局域网的 DNS 在安装完成前不可用，请不要关闭此页面。</div>';
   h += '<ol class="timeline">';
   j.steps.forEach(s => {
     const b = s.status === 'ok' ? badge('ok', I.ok) : s.status === 'fail' ? badge('bad', I.bad) : s.status === 'running' ? badge('run', spin) : badge('wait', I.dot);
@@ -512,7 +513,8 @@ function viewReset() {
   });
   h += '</ol>';
   if (r.error) h += `<div class="alert bad">${I.warn}<div class="grow">${esc(r.error)}</div></div>`;
-  h += `<details class="log" id="logbox" ${S.logOpen || failed ? 'open' : ''}><summary>${I.chev}日志 · ${j.log.length} 行</summary><pre class="out" id="log">${esc(j.log.join('\n'))}</pre></details>`;
+  if (S.retryErr) h += `<div class="alert bad">${I.warn}<div class="grow">${esc(S.retryErr)}</div></div>`;
+  h += `<details class="log" id="logbox" ${S.logOpen || failed || stuck ? 'open' : ''}><summary>${I.chev}日志 · ${j.log.length} 行</summary><pre class="out" id="log">${esc(j.log.join('\n'))}</pre></details>`;
   return h;
 }
 
@@ -532,7 +534,18 @@ async function pollReset() {
   const r = S.state.reset;
   if (r.phase === 'ready') { S.cfg = null; initCfg(S.state); S.phase = 'wizard'; S.step = 0; await startWizard(); return; }
   render();
-  if (r.phase !== 'failed') setTimeout(pollReset, 1000);
+  if (r.phase !== 'failed' && r.phase !== 'reset_failed') setTimeout(pollReset, 1000);
+}
+
+// retryReset tries the removal of the old installation again (the data is backed up already).
+async function retryReset() {
+  S.retryErr = '';
+  try {
+    await api('POST', '/api/reset');
+  } catch (e) {
+    S.retryErr = e.message;
+  }
+  await pollReset();
 }
 
 function viewInstalled() {
@@ -565,6 +578,7 @@ function render() {
     left = rail(null);
     content = viewReset();
     if (st.reset.phase === 'failed') nav = `<span class="sp"></span><a class="btn pri lg" href="${esc(resetPanelURL())}">返回面板 ${I.right}</a>`;
+    else if (st.reset.phase === 'reset_failed') nav = `<span class="sp"></span><button class="btn pri lg" data-act="reset-retry">重试</button>`;
   } else if (st.installed && !st.reconfigure && S.phase === 'wizard') {
     left = rail(null);
     content = viewInstalled();
@@ -699,6 +713,7 @@ document.addEventListener('click', ev => {
   else if (a === 'free') free(+b.dataset.i);
   else if (a === 'back') { S.phase = 'wizard'; S.step = steps().length - 1; render(); }
   else if (a === 'retry') install();
+  else if (a === 'reset-retry') retryReset();
   else if (a === 'open') openPanel();
   else if (a === 'copy') copy(b.dataset.v, b);
   else if (a === 'pause') { S.paused = !S.paused; b.textContent = S.paused ? '继续跳转' : '暂停跳转'; if (!S.paused) watchPanel(); else clearTimeout(S.redirectTimer); const el = document.getElementById('countdown'); if (el && S.paused) el.textContent = ''; }

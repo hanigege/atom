@@ -8,9 +8,10 @@ package main
 // has authorized with that code and asked for the reset; a wizard nobody opens within resetWait exits and the
 // job ends as cancelled.
 //
-// The wizard then copies the data to backup/reset-<time>/ (kept, never pruned), takes atom off the machine as
-// `uninstall --purge` does (keeping the package copy, the backups and its own run file) and continues as the
-// installation wizard of a new machine. A wizard that is left alone after the reset installs with the previous
+// The wizard then holds the panel's writes, copies the data to backup/reset-<time>/ (kept, never pruned), takes
+// atom off the machine as `uninstall --purge` does (keeping the package copy, the backups and its own run file)
+// and, once it has checked that the old installation is gone, continues as the installation wizard of a new
+// machine. A removal that did not complete stays in reset_failed, from which the page tries it again. A wizard that is left alone after the reset installs with the previous
 // network (topology, interfaces, panel port, panel login) and the default settings, so the LAN gets its DNS back.
 
 import (
@@ -36,8 +37,14 @@ const (
 	resetBackingUp = "resetting" // checks and the data backup; nothing changed yet
 	resetPurging   = "purging"   // atom is being taken off the machine
 	resetFailed    = "failed"    // refused before anything changed; the wizard exits
-	resetReady     = "ready"     // a new installation follows
+	// resetPurgeFailed: the data is backed up but atom is not (all) off the machine; the wizard stays and the page
+	// offers to try the removal again (POST /api/reset). No installation is possible until it succeeded.
+	resetPurgeFailed = "reset_failed"
+	resetReady       = "ready" // atom is verified gone; a new installation follows
 )
+
+// resetUninstall takes atom off the machine for the reset; a variable for the tests.
+var resetUninstall = uninstallForReset
 
 // keepShipped keeps the shipped configuration, WebUI and manifest of the version being installed in share/;
 // a reset installs from them again, together with the programs in bin/.
@@ -157,6 +164,19 @@ func wizardRunning(p Paths) bool {
 	return false
 }
 
+// privateLog creates the log the wizard appends to with mode 0600, or narrows an existing one to it.
+func privateLog(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Chmod(0o600)
+}
+
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 // launchResetWizard starts the wizard as its own service, as install.sh does, so that it outlives the
@@ -170,6 +190,10 @@ func launchResetWizard(p Paths, pkg, id string, log Logger) error {
 		}
 	}
 	if p.OpenRC {
+		// The wizard prints its code to this log (for a lost browser tab): root only, created so.
+		if err := privateLog(p.Run("installer.log")); err != nil {
+			return err
+		}
 		pidfile := p.Run("installer.pid")
 		os.Remove(pidfile)
 		var script []string
@@ -228,9 +252,15 @@ func (m *maintenance) runReset(st *InstallState, operation *os.File) {
 		m.failed(fmt.Errorf("安装向导没有启动，未做任何更改（详情见 atom-installer 的日志）"))
 		return
 	}
+	m.adoptWizard(st.LAN, li)
+	m.watchReset()
+}
+
+// adoptWizard records the wizard of the reset job (its port, code and process) for the panel.
+func (m *maintenance) adoptWizard(lan []string, li listenInfo) {
 	deadline := time.Now().Add(resetWait)
 	urls := wizardURLs(li.Port)
-	if ips := panelIPs(st.LAN, listInterfaces()); len(ips) > 0 {
+	if ips := panelIPs(lan, listInterfaces()); len(ips) > 0 {
 		urls = nil
 		for _, ip := range ips {
 			urls = append(urls, "http://"+net.JoinHostPort(ip, strconv.Itoa(li.Port))+"/")
@@ -238,11 +268,13 @@ func (m *maintenance) runReset(st *InstallState, operation *os.File) {
 	}
 	if err := m.change(func(job *maintenanceJob) {
 		job.Phase, job.Deadline = "awaiting_browser", &deadline
+		if li.Reset == resetBackingUp {
+			job.Phase = "resetting"
+		}
 		job.WizardPort, job.WizardCode, job.WizardPID, job.WizardURLs = li.Port, li.Code, li.PID, urls
 	}); err != nil {
 		stderrLogger{}.Logf("记录重置任务：%v", err)
 	}
-	m.watchReset()
 }
 
 // watchReset follows the wizard through its run file until the reset began, failed, or the wizard exited.
@@ -269,7 +301,7 @@ func (m *maintenance) watchReset() {
 			err = m.change(func(job *maintenanceJob) { job.Phase = "resetting" })
 		case li.Reset == resetFailed:
 			err = m.finish("failed", fmt.Errorf("%s", li.ResetError))
-		case li.Reset == resetPurging || li.Reset == resetReady:
+		case li.Reset == resetPurging || li.Reset == resetPurgeFailed || li.Reset == resetReady:
 			err = m.finish("reset", nil)
 		}
 		if err != nil {
@@ -292,21 +324,68 @@ func (m *maintenance) watchReset() {
 	}
 }
 
+// recoverWizardWait is how long a restarted maintenance service waits for a wizard that was launched for the
+// job but has not written its run file yet; a variable for the tests.
+var recoverWizardWait = 20 * time.Second
+
 // recoverReset picks up an unfinished reset after this service restarted: a wizard that still waits or works is
-// followed again; otherwise the reset did not happen.
+// followed again; otherwise the reset did not happen. The run file decides, not the job record: the service may
+// have stopped after it launched the wizard and before it recorded the wizard's process (phase "preparing"), and
+// such a wizard runs from the job's package, which must then not be removed.
 func (m *maintenance) recoverReset() error {
 	job := *m.job
-	if job.WizardPID != 0 {
-		if li, ok := runningWizard(m.paths); ok && li.PID == job.WizardPID {
-			go m.watchReset()
-			return nil
+	p := m.paths
+	ours := func(li listenInfo) bool { return li.ResetJob == job.ID && li.Code != "" }
+	li, ok := runningWizard(p)
+	if ok && job.WizardPID != 0 && li.PID == job.WizardPID {
+		go m.watchReset()
+		return nil
+	}
+	// A wizard process without a run file may be this job's, still starting; a live wizard with another run file
+	// is not (the job was only created while no wizard ran), and this job's wizard cannot start beside it.
+	starting := func() bool { return !ok && wizardStarting(p) }
+	if job.WizardPID == 0 && job.Phase == "preparing" && starting() {
+		for deadline := time.Now().Add(recoverWizardWait); time.Now().Before(deadline); time.Sleep(250 * time.Millisecond) {
+			if li, ok = runningWizard(p); ok || !wizardStarting(p) {
+				break
+			}
 		}
 	}
-	if job.Phase == "preparing" && job.Package != "" && m.paths.managedPackage(job.Package) {
-		os.RemoveAll(job.Package) // the wizard never got it
+	if ok && ours(li) && job.WizardPID == 0 {
+		var lan []string
+		if st, err := loadState(p); err == nil {
+			lan = st.LAN
+		}
+		m.adoptWizard(lan, li)
+		go m.watchReset()
+		return nil
+	}
+	if job.Phase == "preparing" && job.Package != "" && p.managedPackage(job.Package) && !(ok && ours(li)) && !starting() {
+		os.RemoveAll(job.Package) // no wizard got it
 	}
 	return m.finish("cancelled", fmt.Errorf("维护服务中断，重置没有开始，未做任何更改"))
 }
+
+// wizardStarting: a wizard process exists, which may not have written its run file yet (its systemd unit is
+// active, or on OpenRC the process in its pid file is there).
+func wizardStarting(p Paths) bool {
+	if p.OpenRC {
+		data, err := os.ReadFile(p.Run("installer.pid"))
+		if err != nil {
+			return false
+		}
+		pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+		return processAlive(pid)
+	}
+	if testWizardStarting != nil {
+		return testWizardStarting()
+	}
+	_, err := quietCmd("systemctl", "is-active", "--quiet", "atom-installer.service")
+	return err == nil
+}
+
+// testWizardStarting replaces the systemd check in the tests.
+var testWizardStarting func() bool
 
 // resetOperationLock is the wizard's lock in reset mode: the operation lock that the maintenance service released
 // just before, for the reset job that started this wizard and is still open.
@@ -344,6 +423,9 @@ type resetRun struct {
 
 	listen  listenInfo // published in runFile for the maintenance service
 	runFile string
+	// writes holds the panel's write lock (maintenance-writes.lock) from before the backup until the old
+	// installation is gone, so the backup is what the reset takes off the machine.
+	writes *os.File
 }
 
 var resetSteps = []string{"备份数据", "移除旧的安装"}
@@ -409,7 +491,8 @@ func (s *Server) publishReset() {
 	li.Reset, li.ResetError = s.reset.phase, s.reset.err
 	runFile := s.reset.runFile
 	s.mu.Unlock()
-	if err := writeJSON(runFile, li); err != nil {
+	// the run file holds the code: root only in every write, as when the wizard started
+	if err := writePrivateJSON(runFile, li); err != nil {
 		stderrLogger{}.Logf("记录重置状态：%v", err)
 	}
 }
@@ -434,11 +517,23 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	defer s.opMu.Unlock()
 	s.mu.Lock()
 	phase, closing, late := s.reset.phase, s.closing, time.Now().After(s.reset.deadline)
+	retry := phase == resetPurgeFailed && !closing
 	if phase == resetWaiting && !closing && !late {
 		s.reset.phase = resetBackingUp
+	} else if retry {
+		s.reset.phase, s.reset.err = resetPurging, ""
 	}
 	s.mu.Unlock()
 	switch {
+	case retry:
+		// the data is backed up already: only the removal is tried again
+		s.publishReset()
+		go s.purgeForReset()
+		s.mu.Lock()
+		v := s.resetState()
+		s.mu.Unlock()
+		writeResp(w, 202, v)
+		return
 	case phase != resetWaiting:
 		s.mu.Lock()
 		v := s.resetState()
@@ -458,7 +553,8 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 }
 
 // runReset backs the data up and takes atom off the machine. A failure before anything changed ends the wizard
-// (the panel keeps running); after that the wizard continues as a new installation in any case.
+// (the panel keeps running). A removal that did not complete leaves the wizard in resetPurgeFailed, from which
+// the page tries it again; only a verified removal leads to a new installation.
 func (s *Server) runReset() {
 	p := s.ins.Paths
 	j := s.reset.steps
@@ -480,46 +576,105 @@ func (s *Server) runReset() {
 		refuse(err)
 		return
 	}
-	backup, err := backupForReset(p, j)
+	// The panel's writes are drained and held off as for an upgrade (maintenance.holdWrites), until the old
+	// installation is gone: a change made after the backup would be lost with the data.
+	writes, err := holdPanelWrites(p, 30*time.Second)
 	if err != nil {
 		j.setStep(0, "fail")
-		refuse(fmt.Errorf("备份数据：%w", err))
+		refuse(fmt.Errorf("暂停面板的写入：%w", err))
 		return
 	}
-	plan, err := planReset(p, s.reset.previous, backup)
+	backup, err := backupForReset(p, j)
+	if err == nil {
+		var plan resetPlan
+		if plan, err = planReset(p, s.reset.previous, backup); err == nil {
+			s.mu.Lock()
+			s.reset.backup, s.reset.plan, s.reset.writes = backup, plan, writes
+			s.mu.Unlock()
+		}
+	} else {
+		err = fmt.Errorf("备份数据：%w", err)
+	}
 	if err != nil {
+		writes.Close()
 		j.setStep(0, "fail")
 		refuse(err)
 		return
 	}
 	j.setStep(0, "ok")
-	s.mu.Lock()
-	s.reset.backup, s.reset.plan = backup, plan
-	s.mu.Unlock()
+	s.purgeForReset()
+}
 
+// holdPanelWrites takes the panel's write lock exclusively, as maintenance.holdWrites does: writes in progress
+// finish first, later ones are refused while it is held.
+func holdPanelWrites(p Paths, wait time.Duration) (*os.File, error) {
+	for deadline := time.Now().Add(wait); ; time.Sleep(100 * time.Millisecond) {
+		lock, err := exclusiveLock(p.Run(panelWriteLock), true)
+		if !errors.Is(err, errMaintenanceBusy) || time.Now().After(deadline) {
+			return lock, err
+		}
+	}
+}
+
+// purgeForReset takes atom off the machine (after the backup, and again for each retry from the page) and
+// checks that it is gone before the wizard offers a new installation.
+func (s *Server) purgeForReset() {
+	p := s.ins.Paths
+	j := s.reset.steps
+	s.mu.Lock()
+	backup := s.reset.backup
+	s.mu.Unlock()
 	j.setStep(1, "running")
 	s.setResetPhase(resetPurging, "")
 	// The maintenance service records the reset before it is removed with the rest.
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(250 * time.Millisecond) {
 		var job maintenanceJob
-		if readJSON(p.Run(maintenanceRecord), &job) == nil && job.ID == s.reset.jobID && job.Done {
+		if readJSON(p.Run(maintenanceRecord), &job) != nil || job.ID != s.reset.jobID || job.Done {
 			break
 		}
 	}
-	warning, err := uninstallForReset(p, []string{filepath.Base(s.ins.PkgDir), "backup"}, j)
-	if err != nil {
-		// Part of it may have been taken back: the wizard stays, a new installation sets the machine up again.
-		j.warn("移除旧的安装时出错：%v", err)
-		j.setStep(1, "fail")
-	} else {
-		if warning != "" {
-			j.warn("%s", warning)
-		}
-		j.setStep(1, "ok")
+	warning, err := resetUninstall(p, []string{filepath.Base(s.ins.PkgDir), "backup"}, j)
+	if err == nil {
+		err = verifyPurged(p)
 	}
+	if err != nil {
+		j.Logf("移除旧的安装没有完成：%v", err)
+		j.setStep(1, "fail")
+		s.setResetPhase(resetPurgeFailed, fmt.Sprintf("移除旧的安装没有完成：%v。数据已备份在 %s；处理好之后可以重试", err, backup))
+		return
+	}
+	if warning != "" {
+		j.warn("%s", warning)
+	}
+	j.setStep(1, "ok")
 	j.finish(nil, 0)
 	j.Logf("已重置，数据备份在 %s", backup)
+	s.mu.Lock()
+	if s.reset.writes != nil {
+		s.reset.writes.Close() // the panel is gone with the rest
+		s.reset.writes = nil
+	}
+	s.mu.Unlock()
 	s.setResetPhase(resetReady, "")
+}
+
+// verifyPurged checks that nothing of the old installation that a new one could take over is left: the data
+// (and its marker), the install record, the programs and the service definitions.
+func verifyPurged(p Paths) error {
+	left := []string{p.Data(), dataMarker(p), p.State(), filepath.Join(p.Root, "bin"), p.Shipped(), p.Lib("")}
+	if p.UnitDir != "" {
+		left = append(left, p.unitFile(maintenanceUnitName), p.DNSUnit(), p.SingBoxUnit(), p.MihomoUnit())
+	}
+	var found []string
+	for _, f := range left {
+		if _, err := os.Lstat(f); err == nil || !os.IsNotExist(err) {
+			found = append(found, f)
+		}
+	}
+	if len(found) > 0 {
+		return fmt.Errorf("仍然存在：%s", strings.Join(found, "、"))
+	}
+	return nil
 }
 
 // backupForReset copies the data and the install records to backup/reset-<time>/. The name is not one that
@@ -663,7 +818,9 @@ func (s *Server) startDefaultInstall() {
 		job.Logf("重置后 %d 分钟内没有完成安装：按原来的网络设置和默认配置安装", int(idleLimit/time.Minute))
 		cfg := plan.cfg
 		cfg.LAN = slices.Clone(plan.cfg.LAN)
-		cfg.keepData = hasData(s.ins.Paths)
+		// A reset installs the default settings, never the old ones; this runs only in resetReady, which
+		// purgeForReset reaches once the old installation was verified gone.
+		cfg.keepData = false
 		if probs := checkSystem().Problems; len(probs) > 0 {
 			job.finish(fmt.Errorf("%s", strings.Join(probs, "；")), 0)
 			return
