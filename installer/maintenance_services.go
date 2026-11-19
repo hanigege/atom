@@ -18,6 +18,9 @@ var panelServices = []string{"atom-maintenance", "atom-dns", "atom-sing-box", "a
 var (
 	serviceQueryWait = 3 * time.Second        // all status queries of one GET /services together
 	restartDelay     = 300 * time.Millisecond // lets the 202 get through atomdns before a restart cuts it off
+	// selfRestartHold keeps the operation lock after systemd took the job to restart this service: the stop
+	// ends this process and the lock with it; should it never come, the lock goes after this long.
+	selfRestartHold = 2 * time.Minute
 )
 
 type serviceStatus struct {
@@ -54,16 +57,24 @@ func serviceState(ctx context.Context, p Paths, name string) string {
 	return "unknown"
 }
 
-// installedServices are the panel services whose service definition is there.
+// installedServices are the panel services whose service definition is there. Of the two proxy kernels only
+// the selected one counts: the other shares its ports and nft sets and must stay stopped.
 func installedServices(p Paths) []string {
+	_, kernel, _ := p.proxyService()
 	var names []string
 	for _, n := range panelServices {
-		if _, err := os.Lstat(p.unitFile(n + ".service")); err == nil {
+		unit := n + ".service"
+		if isKernel(unit) && unit != kernel {
+			continue
+		}
+		if _, err := os.Lstat(p.unitFile(unit)); err == nil {
 			names = append(names, n)
 		}
 	}
 	return names
 }
+
+func isKernel(unit string) bool { return unit == singBoxUnitName || unit == mihomoUnitName }
 
 func (m *maintenance) services(w http.ResponseWriter) {
 	ctx, cancel := context.WithTimeout(context.Background(), serviceQueryWait)
@@ -91,6 +102,10 @@ func (m *maintenance) restartService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !slices.Contains(installedServices(m.paths), req.Service) {
+		if _, kernel, _ := m.paths.proxyService(); isKernel(req.Service+".service") && req.Service+".service" != kernel {
+			writeErr(w, 400, "不是当前使用的代理内核")
+			return
+		}
 		writeErr(w, 400, "没有安装这个服务")
 		return
 	}
@@ -114,14 +129,18 @@ func (m *maintenance) restartService(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer lock.Close()
 		time.Sleep(restartDelay)
-		if err := restartUnit(m.paths, req.Service+".service"); err != nil {
+		unit := req.Service + ".service"
+		err := restartUnit(m.paths, unit)
+		if err != nil {
 			stderrLogger{}.Logf("重启 %s：%v", req.Service, err)
+		} else if unit == maintenanceUnitName && !m.paths.OpenRC {
+			time.Sleep(selfRestartHold)
 		}
 	}()
 }
 
-// restartUnit restarts one of atom's services. The maintenance service restarts itself without waiting: the
-// service manager stops this process on the way.
+// restartUnit restarts one of atom's services. For the maintenance service itself the service manager stops
+// this process on the way: systemd gets the job without waiting for it, OpenRC's rc-service runs on its own.
 func restartUnit(p Paths, unit string) error {
 	log := stderrLogger{}
 	if unit != maintenanceUnitName {
@@ -130,12 +149,9 @@ func restartUnit(p Paths, unit string) error {
 	if !p.OpenRC {
 		return runCmd(log, 30*time.Second, "systemctl", "restart", "--no-block", sysdName(unit))
 	}
-	// rc-service waits for the stop; in a session of its own it outlives this process, which the stop ends
+	// in a session of its own rc-service outlives this process, which its stop ends; if it returns first, the
+	// restart did not happen
 	cmd := exec.Command("rc-service", rcName(unit), "restart")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	go cmd.Wait()
-	return nil
+	return cmd.Run()
 }

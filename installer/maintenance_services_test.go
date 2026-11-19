@@ -82,10 +82,37 @@ func TestServicesOpenRC(t *testing.T) {
 		os.WriteFile(filepath.Join(stub, "status-"+name), []byte(code), 0o644)
 	}
 	got := getServices(t, &maintenance{paths: p})
-	want := []serviceStatus{{"atom-maintenance", "running"}, {"atom-dns", "failed"}, {"atom-sing-box", "stopped"}, {"atom-mihomo", "stopped"}}
+	want := []serviceStatus{{"atom-maintenance", "running"}, {"atom-dns", "failed"}, {"atom-sing-box", "stopped"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("%+v", got)
 	}
+}
+
+// Of the two kernels only the selected one is shown and may be restarted: the other shares its ports and nft
+// sets.
+func TestServicesOnlyTheSelectedKernel(t *testing.T) {
+	p, stub := openRCMachine(t)
+	m := &maintenance{paths: p}
+	w := postRestart(m, `{"service":"atom-mihomo"}`)
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "不是当前使用的代理内核") {
+		t.Errorf("%d %s", w.Code, w.Body.String())
+	}
+	if err := writeFileAtomic(filepath.Join(p.Data(), "webinfo", "atom_proxy.json"), []byte(`{"settings":{"backend":"mihomo"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := getServices(t, m)
+	want := []serviceStatus{{"atom-maintenance", "running"}, {"atom-dns", "running"}, {"atom-mihomo", "running"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("%+v", got)
+	}
+	if w := postRestart(m, `{"service":"atom-sing-box"}`); w.Code != 400 {
+		t.Errorf("%d %s", w.Code, w.Body.String())
+	}
+	if w := postRestart(m, `{"service":"atom-mihomo"}`); w.Code != 202 {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	waitCall(t, stub, "rc-service atom-mihomo restart")
+	waitUnlocked(t, p)
 }
 
 func postRestart(m *maintenance, body string) *httptest.ResponseRecorder {
@@ -166,20 +193,26 @@ func waitUnlocked(t *testing.T, p Paths) {
 }
 
 func TestRestartTheMaintenanceServiceItself(t *testing.T) {
+	old := selfRestartHold
+	selfRestartHold = 500 * time.Millisecond
+	t.Cleanup(func() { selfRestartHold = old })
 	p, dir := servicesSystemd(t, nil)
-	if w := postRestart(&maintenance{paths: p}, `{"service":"atom-maintenance"}`); w.Code != 202 {
+	m := &maintenance{paths: p}
+	if w := postRestart(m, `{"service":"atom-maintenance"}`); w.Code != 202 {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
 	waitCall(t, dir, "systemctl restart --no-block atom-maintenance.service")
+	// systemd only took the job: until it stops this process, nothing else may start
+	if w := postRestart(m, `{"service":"atom-dns"}`); w.Code != 409 {
+		t.Errorf("while the restart is pending: %d", w.Code)
+	}
+	waitUnlocked(t, p)
 
 	p, stub := openRCMachine(t)
 	if w := postRestart(&maintenance{paths: p}, `{"service":"atom-maintenance"}`); w.Code != 202 {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
 	waitCall(t, stub, "rc-service atom-maintenance restart")
+	// rc-service came back without stopping this process: the restart did not happen, the lock goes
 	waitUnlocked(t, p)
-	if w := postRestart(&maintenance{paths: p}, `{"service":"atom-mihomo"}`); w.Code != 202 {
-		t.Fatalf("%d %s", w.Code, w.Body.String())
-	}
-	waitCall(t, stub, "rc-service atom-mihomo restart")
 }

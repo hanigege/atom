@@ -1193,8 +1193,6 @@ func TestOwnRoutes(t *testing.T) {
 	}
 }
 
-// The gateway warning says what the topology needs (the main router sends this machine what is to be
-// proxied), not that all LAN traffic passes through it.
 // The gateway topology has no warning or confirmation in the wizard (2026-11-19): what the main router must do
 // is in docs/guide/install.md.
 func TestNoGatewayConfirmation(t *testing.T) {
@@ -1209,6 +1207,21 @@ func TestNoGatewayConfirmation(t *testing.T) {
 	r := httptest.NewRequest("POST", "/network", strings.NewReader(`{"topology":"gateway","lan":["eth1"],"wan":"eth0","accept_gateway":false,"panel_port":80,"revision":"x"}`))
 	if err := decodeMaintenance(r, &n); err != nil || n.Topology != "gateway" {
 		t.Errorf("%+v %v", n, err)
+	}
+	// and reads it back ticked for a gateway, so its required checkbox does not ask again
+	for topology, want := range map[string]bool{"gateway": true, "bypass": false} {
+		p := Paths{Root: t.TempDir()}
+		if err := writeFileAtomic(p.State(), []byte(`{"complete":true,"topology":"`+topology+`","lan":["eth1"],"wan":"eth0"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		(&maintenance{paths: p}).handler(w, httptest.NewRequest("GET", "/network", nil))
+		var body struct {
+			Config map[string]any `json:"config"`
+		}
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &body) != nil || body.Config["accept_gateway"] != want {
+			t.Errorf("%s: %d %s", topology, w.Code, w.Body.String())
+		}
 	}
 }
 

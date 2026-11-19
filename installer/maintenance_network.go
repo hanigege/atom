@@ -15,7 +15,7 @@ type networkConfig struct {
 	Topology      string   `json:"topology"`
 	LAN           []string `json:"lan"`
 	WAN           string   `json:"wan"`
-	AcceptGateway bool     `json:"accept_gateway,omitempty"` // ignored: older panels still send it
+	AcceptGateway bool     `json:"accept_gateway"` // older panels: given ticked for a gateway, ignored when sent
 	LANGateway    string   `json:"lan_gateway"`
 	ClientNets    string   `json:"client_nets"`
 	ReplyVia      bool     `json:"reply_via"`
@@ -44,7 +44,7 @@ func (m *maintenance) network(w http.ResponseWriter) {
 	writeResp(w, 200, map[string]any{
 		"revision": networkRevision(st), "ifaces": ifaces,
 		"config": networkConfig{
-			Topology: c.Topology, LAN: c.LAN, WAN: c.WAN,
+			Topology: c.Topology, LAN: c.LAN, WAN: c.WAN, AcceptGateway: c.Topology == "gateway",
 			LANGateway: c.LANGateway, ClientNets: c.ClientNets, ReplyVia: c.ReplyVia,
 			Router: c.Router, PanelPort: c.PanelPort,
 		},
