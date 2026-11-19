@@ -66,7 +66,9 @@ func (p Paths) managedPackage(pkg string) bool {
 	return path == p.Pkg() || ok
 }
 
-func (p Paths) removeMaintenance(log Logger) error {
+// removeMaintenance takes the maintenance service off: stopped and disabled when disable (the reset has done that
+// in stopForReset already, and a second disable is not repeated), then its file removed.
+func (p Paths) removeMaintenance(log Logger, disable bool) error {
 	unit := p.unitFile(maintenanceUnitName)
 	if _, err := os.Stat(unit); err != nil {
 		if os.IsNotExist(err) {
@@ -74,8 +76,10 @@ func (p Paths) removeMaintenance(log Logger) error {
 		}
 		return err
 	}
-	if err := p.Init().DisableNow(log, maintenanceUnitName); err != nil {
-		return err
+	if disable {
+		if err := p.Init().DisableNow(log, maintenanceUnitName); err != nil {
+			return err
+		}
 	}
 	if err := os.Remove(unit); err != nil {
 		return err

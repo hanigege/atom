@@ -214,7 +214,8 @@ type backupItem struct {
 	mode       os.FileMode // of a file item when put back; 0 is 0644
 }
 
-// backed up: programs, the state and network files, the shipped configuration (not the data), the WebUI, the panel login.
+// backed up: programs, the state and network files, the shipped configuration (not the data), the WebUI, the panel login,
+// and the copy of the shipped package a reset installs from.
 func (ins *Installer) backupItems() []backupItem {
 	p := ins.Paths
 	items := []backupItem{
@@ -223,6 +224,7 @@ func (ins *Installer) backupItems() []backupItem {
 		{path: p.Etc("atom-wan.nft"), name: "gateway/atom-wan.nft", file: true},
 		{path: p.Etc("atom-gateway.nft"), name: "gateway/atom-gateway.nft", file: true},
 		{path: filepath.Join(p.Root, "lib"), name: "lib"},
+		{path: p.Shipped(), name: "share", exact: true},
 		{path: filepath.Join(p.Data(), "sub_config"), name: "data/sub_config", exact: true},
 		{path: filepath.Join(p.Data(), "ui", "main"), name: "data/ui/main", exact: true},
 		{path: filepath.Join(p.Data(), "config_custom.yaml"), name: "data/config_custom.yaml", file: true},

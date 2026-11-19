@@ -173,7 +173,14 @@ func (ins *Installer) runInstall(cfg Config, j *Job) {
 				return ins.stepNetwork(cfg, j)
 			},
 			func() error {
-				if !cfg.keepData && strings.TrimSpace(cfg.PanelUser) != "" && cfg.PanelPassword != "" {
+				if !cfg.keepData && cfg.panelAuth != "" {
+					target := filepath.Join(ins.Paths.Data(), "webinfo", "atom_auth.json")
+					_, err := os.Stat(target)
+					removeNewLogin = os.IsNotExist(err)
+					if err := copyFileAtomic(cfg.panelAuth, target, 0o600); err != nil {
+						return fmt.Errorf("沿用面板登录：%w", err)
+					}
+				} else if !cfg.keepData && strings.TrimSpace(cfg.PanelUser) != "" && cfg.PanelPassword != "" {
 					_, err := os.Stat(filepath.Join(ins.Paths.Data(), "webinfo", "atom_auth.json"))
 					removeNewLogin = os.IsNotExist(err)
 					if err := ins.initPanelLogin(cfg); err != nil {
@@ -206,7 +213,7 @@ func (ins *Installer) runInstall(cfg Config, j *Job) {
 	if err != nil {
 		j.Logf("安装失败：%v", err)
 		if maintenanceStarted {
-			if cleanupErr := ins.Paths.removeMaintenance(j); cleanupErr != nil {
+			if cleanupErr := ins.Paths.removeMaintenance(j, true); cleanupErr != nil {
 				j.warn("清理维护服务失败：%v", cleanupErr)
 			}
 		}
@@ -375,6 +382,10 @@ func (ins *Installer) installData(panelPort int, log Logger) error {
 		return fmt.Errorf("面板: %w", err)
 	}
 	log.Logf("面板 → %s/ui/main", ins.Paths.Data())
+	// Without the copy only the panel's reset is unavailable; the installation itself is fine.
+	if err := ins.keepShipped(); err != nil {
+		log.Logf("! 没有保存安装包副本（面板的「重置所有设置」暂时不可用）：%v", err)
+	}
 	return nil
 }
 
@@ -913,12 +924,13 @@ func (ins *Installer) rollbackNetwork(log Logger) {
 		log.Logf("无法撤销网络：%v", err)
 		return
 	}
-	teardownNetwork(ins.Paths, ch, log)
+	teardownNetwork(ins.Paths, ch, true, log)
 }
 
 // teardownNetwork stops the services and removes nft tables, policy routing and ip_forward changes, when the
-// record says they are the installer's, and then clears that record.
-func teardownNetwork(p Paths, ch *Changes, log Logger) {
+// record says they are the installer's, and then clears that record. stopServices is false for the reset, whose
+// services stopForReset has stopped and disabled already.
+func teardownNetwork(p Paths, ch *Changes, stopServices bool, log Logger) {
 	if !ch.Network {
 		log.Logf("网络部分不是安装器装的（或已经撤销），不动")
 		return
@@ -929,13 +941,15 @@ func teardownNetwork(p Paths, ch *Changes, log Logger) {
 			log.Logf("  （忽略）%v", err)
 		}
 	}
-	if _, err := os.Stat(p.MihomoUnit()); err == nil {
-		if err := p.Init().Stop(log, mihomoUnitName); err != nil {
-			log.Logf("停止 mihomo 失败：%v", err)
+	if stopServices {
+		if _, err := os.Stat(p.MihomoUnit()); err == nil {
+			if err := p.Init().Stop(log, mihomoUnitName); err != nil {
+				log.Logf("停止 mihomo 失败：%v", err)
+			}
 		}
-	}
-	if err := p.Init().DisableNow(log, dnsUnitName, singBoxUnitName); err != nil {
-		log.Logf("  （忽略）%v", err)
+		if err := p.Init().DisableNow(log, dnsUnitName, singBoxUnitName); err != nil {
+			log.Logf("  （忽略）%v", err)
+		}
 	}
 	ignore("nft", "delete", "table", "inet", "atom")
 	ignore("nft", "delete", "table", "inet", "atom_wan")

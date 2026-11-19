@@ -72,6 +72,16 @@ func writeJSON(path string, v any) error {
 	return writeFile(path, append(data, '\n'), 0o644, true)
 }
 
+// writePrivateJSON writes v readable by root only: the temporary file is 0600 from its creation (os.CreateTemp)
+// and is synced and renamed over the target, so the content is never visible with a wider mode.
+func writePrivateJSON(path string, v any) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFile(path, append(data, '\n'), 0o600, true)
+}
+
 func readJSON(path string, v any) error {
 	data, err := os.ReadFile(path)
 	if err != nil {

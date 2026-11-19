@@ -36,6 +36,8 @@ type Server struct {
 
 	closing bool       // finish was accepted: no new job
 	opMu    sync.Mutex // one free action at a time, and not while a job starts
+
+	reset *resetRun // the wizard resets the installed atom first (reset.go); nil otherwise
 }
 
 func newServer(ins *Installer, code string) *Server {
@@ -120,6 +122,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("POST /api/install", s.handleInstall)
 	mux.HandleFunc("GET /api/job", s.handleJob)
 	mux.HandleFunc("POST /api/finish", s.handleFinish)
+	mux.HandleFunc("POST /api/reset", s.handleReset)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !isPrivateRemote(r.RemoteAddr) || !hostAllowed(r.Host) || !sameOriginRequest(r) {
 			http.Error(w, "forbidden", http.StatusForbidden)
@@ -191,6 +194,8 @@ type stateResp struct {
 		Enabled  bool   `json:"enabled"`
 		Username string `json:"username"`
 	} `json:"login,omitempty"`
+	// Reset: the wizard was started by the panel's reset (reset.go).
+	Reset *resetView `json:"reset,omitempty"`
 }
 
 func (s *Server) state() stateResp {
@@ -237,6 +242,7 @@ func (s *Server) state() stateResp {
 	}
 	s.mu.Lock()
 	r.Running = s.job != nil && !s.job.view(0).Done
+	r.Reset = s.resetState()
 	s.mu.Unlock()
 	return r
 }
@@ -338,7 +344,7 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg.fillDefaults()
-	cfg.keepData = hasData(s.ins.Paths)
+	cfg.keepData = s.keepExistingData()
 	cfg.currentUser = s.currentLoginUser()
 	errs := cfg.Validate(listInterfaces(), s.ins.InstallerPort, s.busy())
 	if errs == nil {
@@ -360,7 +366,7 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg.fillDefaults()
-	cfg.keepData = hasData(s.ins.Paths)
+	cfg.keepData = s.keepExistingData()
 	cfg.currentUser = s.currentLoginUser()
 	if probs := checkSystem().Problems; len(probs) > 0 {
 		writeErr(w, 400, strings.Join(probs, "；"))
@@ -382,11 +388,25 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 	writeResp(w, 202, map[string]bool{"started": true})
 }
 
-// busyOrClosing: an installation is running, or finish was accepted.
+// keepExistingData: the installation takes over the data of an earlier one. Never after a reset: the reset is
+// the promise that the next installation starts from the default settings.
+func (s *Server) keepExistingData() bool {
+	return s.reset == nil && hasData(s.ins.Paths)
+}
+
+// busyOrClosing: an installation is running, or finish was accepted. A reset wizard takes nothing before the
+// reset is done, and after it no deadline applies: it stays until an installation succeeded.
 func (s *Server) busyOrClosing() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.closing || time.Since(s.seen) >= idleLimit || (s.job != nil && !s.job.view(0).Done)
+	expired := time.Since(s.seen) >= idleLimit
+	if s.reset != nil {
+		if s.reset.phase != resetReady {
+			return true
+		}
+		expired = false
+	}
+	return s.closing || expired || (s.job != nil && !s.job.view(0).Done)
 }
 
 func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
@@ -413,12 +433,20 @@ func (s *Server) requestClose() bool {
 	if s.job != nil && !s.job.view(0).Done {
 		return false
 	}
+	// after a reset began, only a successful installation ends the wizard: the machine has no DNS until then
+	if r := s.reset; r != nil && r.phase != resetWaiting && r.phase != resetFailed && (s.job == nil || !s.job.view(0).OK) {
+		return false
+	}
 	s.closing = true
 	return true
 }
 
 func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 	if !s.requestClose() {
+		if s.reset != nil {
+			writeErr(w, 409, "已开始重置，安装完成前安装向导不会关闭")
+			return
+		}
 		writeErr(w, 409, "正在安装")
 		return
 	}
@@ -447,6 +475,11 @@ func (s *Server) stop(cleanup bool) {
 // idleClose ends the wizard after the startup deadline, or shortly after success.
 // A running installation can finish even if it outlives the deadline.
 func (s *Server) idleClose() bool {
+	if s.reset != nil {
+		if closed, hold := s.resetIdle(); hold {
+			return closed
+		}
+	}
 	s.mu.Lock()
 	expired := time.Since(s.seen) >= idleLimit
 	var done, ok bool

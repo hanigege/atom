@@ -1,7 +1,12 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -119,17 +124,36 @@ func (openRCInit) Enable(log Logger, names ...string) error {
 	return nil
 }
 
+// DisableNow can be repeated: a service that is already stopped and a service that is not (or no longer) in the
+// default runlevel are what it asks for, not errors (`rc-update del` fails for a service that is not there).
 func (o openRCInit) DisableNow(log Logger, names ...string) error {
 	var first error
 	for _, n := range names {
-		if err := o.Stop(log, n); err != nil && first == nil {
-			first = err
+		if err := o.Stop(log, n); err != nil {
+			// an older openrc-run may refuse to stop what is stopped already: that is a stopped service
+			ctx, cancel := context.WithTimeout(context.Background(), serviceStopWait)
+			code, qerr := openRCStatus(ctx, n)
+			cancel()
+			if qerr == nil && openRCStopped(code) {
+				log.Logf("%s 已经停止", rcName(n))
+			} else if first == nil {
+				first = err
+			}
+		}
+		if !inRunlevel(n, "default") {
+			continue
 		}
 		if err := runCmd(log, 30*time.Second, "rc-update", "del", rcName(n), "default"); err != nil && first == nil {
 			first = err
 		}
 	}
 	return first
+}
+
+// inRunlevel: the service is in the runlevel (rc-update keeps it as /etc/runlevels/<level>/<name>).
+func inRunlevel(name, level string) bool {
+	_, err := os.Lstat(filepath.Join(runlevelsDir, level, rcName(name)))
+	return err == nil
 }
 
 func (openRCInit) Start(log Logger, name string) error {
@@ -157,3 +181,68 @@ func (openRCInit) Logs(name string) string {
 }
 
 func (openRCInit) Forget(Logger, ...string) {}
+
+// queryCmd runs a status query of the service manager within ctx. A query cut short by ctx is an error, never
+// an answer: its exit code says nothing about the service.
+func queryCmd(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = 200 * time.Millisecond // a child that keeps the output open does not hold the query either
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return "", fmt.Errorf("%s %s：没有在时限内回答", name, strings.Join(args, " "))
+	}
+	return string(out), err
+}
+
+// openRCStatus is the exit code of `rc-service <name> status`; err is a query that gave no exit code.
+func openRCStatus(ctx context.Context, name string) (int, error) {
+	out, err := queryCmd(ctx, "rc-service", rcName(name), "status")
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return 0, nil
+	case errors.As(err, &ee):
+		return ee.ExitCode(), nil
+	default:
+		return -1, fmt.Errorf("%v %s", err, strings.TrimSpace(out))
+	}
+}
+
+// openRCStopped: the exit codes of openrc-run status that mean nothing runs: 3 stopped, 16 inactive, 32 crashed
+// (started, but the daemon is gone). 0 is started, 4 stopping, 8 starting.
+func openRCStopped(code int) bool { return code == 3 || code == 16 || code == 32 }
+
+// serviceRunning asks the service manager, within ctx, whether one of atom's services runs (or is starting or
+// stopping). An answer that cannot be had is an error, never "stopped": the reset deletes the data only once it
+// is sure.
+func serviceRunning(ctx context.Context, p Paths, name string) (bool, error) {
+	if p.OpenRC {
+		code, err := openRCStatus(ctx, name)
+		switch {
+		case err != nil:
+			return false, fmt.Errorf("查询 %s 的状态：%v", name, err)
+		case code == 0 || code == 4 || code == 8:
+			return true, nil
+		case openRCStopped(code):
+			return false, nil
+		}
+		// rc-service fails (1) for a service it does not know: stopped only when its script is really gone
+		if _, serr := os.Lstat(p.unitFile(name)); code == 1 && os.IsNotExist(serr) {
+			return false, nil
+		}
+		return false, fmt.Errorf("查询 %s 的状态：rc-service status 的退出码 %d 不是已知的状态", name, code)
+	}
+	out, err := queryCmd(ctx, "systemctl", "is-active", sysdName(name))
+	if err == nil {
+		return true, nil
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	switch state := strings.TrimSpace(lines[len(lines)-1]); state {
+	case "inactive", "failed", "unknown": // unknown: an older systemd, for a unit it does not know
+		return false, nil
+	case "activating", "deactivating", "reloading", "refreshing":
+		return true, nil
+	default:
+		return false, fmt.Errorf("查询 %s 的状态：%v %s", name, err, strings.TrimSpace(out))
+	}
+}

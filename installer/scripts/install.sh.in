@@ -253,6 +253,9 @@ if [ "$INIT" = systemd ]; then
 else
   mkdir -p "$ROOT/run"
   rm -f "$PIDFILE"
+  # the wizard may print its code to this log: root only
+  ( umask 077; : >> "$ROOT/run/installer.log" )
+  chmod 600 "$ROOT/run/installer.log"
   start-stop-daemon --start --background --make-pidfile --pidfile "$PIDFILE" --exec /bin/sh -- \
     -c "export ATOM_WIZARD_BACKGROUND=1; exec \"$PKG/bin/atom-installer\" serve --pkg \"$PKG\" $WIZARD_ARGS >> \"$ROOT/run/installer.log\" 2>&1" \
     || die "启动安装器失败"

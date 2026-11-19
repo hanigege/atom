@@ -35,6 +35,7 @@ func (p Paths) Run(name string) string { return filepath.Join(p.Root, "run", nam
 func (p Paths) Data() string           { return filepath.Join(p.Root, "data") }
 func (p Paths) Backup() string         { return filepath.Join(p.Root, "backup") }
 func (p Paths) Pkg() string            { return filepath.Join(p.Root, "pkg") }
+func (p Paths) Shipped() string        { return filepath.Join(p.Root, "share") }
 func (p Paths) State() string          { return p.Etc("install.json") }
 func (p Paths) Changes() string        { return p.Etc("changes.json") }
 func (p Paths) DNSUnit() string        { return p.unitFile(dnsUnitName) }
