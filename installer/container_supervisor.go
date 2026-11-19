@@ -46,15 +46,16 @@ type service struct {
 	ring lineRing // has its own lock: Logs() reads it without the loop
 
 	// owned by the loop
-	phase   string
-	gen     uint64        // of the current start, retry wait or stop; results carry the one they were made for
-	drain   uint64        // the start (gen) a stop in progress is waiting for the worker of
-	cancel  chan struct{} // closed when the start in progress is cancelled: its worker does not spawn
-	record  bool          // the start in progress is to be written to services.json when it has succeeded
-	proc    *proc
-	retry   bool // a failed or dead service is tried again (it was started by the boot, or has run)
-	timer   *time.Timer
-	waiters []func(error) // answered when the current start ends
+	phase        string
+	gen          uint64        // of the current start, retry wait or stop; results carry the one they were made for
+	drainExpired bool          // the wait of the stop that is draining is over
+	drain        uint64        // the start (gen) a stop in progress is waiting for the worker of
+	cancel       chan struct{} // closed when the start in progress is cancelled: its worker does not spawn
+	record       bool          // the start in progress is to be written to services.json when it has succeeded
+	proc         *proc
+	retry        bool // a failed or dead service is tried again (it was started by the boot, or has run)
+	timer        *time.Timer
+	waiters      []func(error) // answered when the current start ends
 	// startAfterStop: a start came while the service was stopping
 	startAfterStop bool
 	stopWaiters    []func()
@@ -75,8 +76,9 @@ type supervisor struct {
 	finishOnce sync.Once
 
 	// every live process group, for the last stage of the shutdown, which does not need the loop
-	pmu   sync.Mutex
-	procs map[*proc]struct{}
+	pmu     sync.Mutex
+	procs   map[*proc]struct{}
+	noSpawn bool
 
 	// owned by the loop
 	ready, closing  bool
@@ -293,17 +295,26 @@ func (s *supervisor) spawn(v *service) (*proc, error) {
 		return nil, err
 	}
 	cmd.Stdout, cmd.Stderr = pw, pw
+	// start and registration are one step with respect to the last stage of the shutdown, which sweeps the registry
+	// and after which nothing is started
+	s.pmu.Lock()
+	if s.noSpawn {
+		s.pmu.Unlock()
+		pr.Close()
+		pw.Close()
+		return nil, errClosing
+	}
 	err = cmd.Start()
 	pw.Close()
 	if err != nil {
+		s.pmu.Unlock()
 		pr.Close()
 		return nil, err
 	}
-	go s.pump(v, pr)
 	p := &proc{cmd}
-	s.pmu.Lock()
 	s.procs[p] = struct{}{}
 	s.pmu.Unlock()
+	go s.pump(v, pr)
 	return p, nil
 }
 
@@ -494,6 +505,7 @@ func (s *supervisor) stop(v *service, wait time.Duration, w func()) {
 		// the worker may still be in its hook, which changes nft rules, and may start a process: the service (and the
 		// kernel slot) stays taken until the worker has ended, or for wait
 		close(v.cancel)
+		v.drainExpired = false
 		v.drain = v.gen
 		v.gen++
 		v.phase = phStopping
@@ -508,6 +520,7 @@ func (s *supervisor) stop(v *service, wait time.Duration, w func()) {
 				if v.gen == g && v.phase == phStopping && v.proc == nil {
 					// the caller stops waiting, the slot stays taken until the worker has ended
 					s.Logf("%s 的启动没有在 %s 内结束，请求不再等待", v.spec.Name, wait)
+					v.drainExpired = true
 					ws := v.stopWaiters
 					v.stopWaiters = nil
 					for _, w := range ws {
@@ -543,7 +556,11 @@ func (s *supervisor) stop(v *service, wait time.Duration, w func()) {
 		})
 	case phStopping:
 		if w != nil {
-			v.stopWaiters = append(v.stopWaiters, w)
+			if v.proc == nil && v.drainExpired { // a drain that has used up its wait: the slot is held, the caller is not
+				w()
+			} else {
+				v.stopWaiters = append(v.stopWaiters, w)
+			}
 		}
 	}
 }
@@ -804,13 +821,16 @@ func (s *supervisor) shutdown() {
 	select {
 	case <-s.quit:
 	case <-time.After(2*stopWait + 300*time.Millisecond):
-		s.pmu.Lock()
-		for p := range s.procs {
-			signalGroup(p, syscall.SIGKILL)
-		}
-		s.pmu.Unlock()
-		s.finish()
 	}
+	// the last stage, for what is left whichever way the wait ended: a child the loop has not adopted, or one that
+	// outlived its stop
+	s.pmu.Lock()
+	s.noSpawn = true
+	for p := range s.procs {
+		signalGroup(p, syscall.SIGKILL)
+	}
+	s.pmu.Unlock()
+	s.finish()
 }
 
 func (s *supervisor) logs(name string, n int) ([]string, error) {

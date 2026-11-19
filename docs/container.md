@@ -255,7 +255,7 @@ networks:
 
 **做了什么**（代码在 `installer/`，只用标准库）：
 
-- `atom-installer container`（`container.go`）：PID 1。启动顺序是先开控制 socket 和维护 socket，再读 `install.json`，再加载网络，再按 `services.json` 起服务（内核在前，atomdns 在后）；SIGTERM 后先停 atomdns 再停内核，每个服务 SIGTERM 后最多等 4 秒再 SIGKILL。
+- `atom-installer container`（`container.go`，监督器在 `container_supervisor.go`）：PID 1。启动顺序是先开控制 socket 和维护 socket，再读 `install.json`，再加载网络，再按 `services.json` 起服务（内核在前，atomdns 在后）；SIGTERM 后先停 atomdns 再停内核，每个服务 SIGTERM 后最多等 4 秒再 SIGKILL。
 - 三个服务的命令行、`sync-nft --start`、重载前的 `sync-nft` 和 RestartSec（atomdns 2 秒，内核 1 秒）与 systemd 单元一致，有单元测试对比。退出码为 0 的进程不重启（同 `Restart=on-failure`），被信号杀死或非 0 退出会重启；启动前的准备（`sync-nft --start`、`config.json` 在不在）失败也按同样的间隔重试。
 - 加载网络放在 atomdns 的启动前（同单元里的 `ExecStartPre`），启动时先做一次，失败就退出并提示检查 `NET_ADMIN` 和内核模块。**每次都从 `install.json` 重新渲染 `atom.nft` 和 `policy-route.sh`**（偏离 5.1 节的字面：5.1 只说加载），所以没有向导的 C1 也能起来，向导（C2）直接复用 `writeNetworkFiles`。
 - `services.json` 是 `{"atom-dns": "running", ...}`。`start`、`reload`、`restart` 记为 running，`stop` 记为 stopped；SIGTERM 关机不改它。没有这个文件时只有 atomdns 是 running，内核由 atomdns 自己拉起，和 systemd 版第一次安装一样。
@@ -288,14 +288,18 @@ networks:
 
 没有节点，所以没测代理流量能不能出去；没测“回包经主路由”（5.1 节第 4 步里的 `accept_redirects` 逻辑只有单元测试没有实测）；没测 arm64。
 
-**codex 审查**（三轮，`codex exec -s read-only`，静态审查，没有让它编译）：
+**监督器的结构（C1 重构后）**：监督器是单事件循环（`container_supervisor.go`）。一个 goroutine 持有全部状态（每个服务的阶段、进程、重试计时、内核的位置、关机阶段），其余都是发给它的事件：控制请求、进程退出、计时到期、启动钩子完成、SIGTERM。钩子和进程的启动在别的 goroutine 里做，完成后带着当时的代号把结果发回，代号过期的结果丢掉并杀掉它带来的进程。内核同时只有一个，由阶段决定（“正在启动”“重试等待”“正在停止”都占着位置，被拒绝的内核不占位置）。控制请求带 context，客户端超时后循环还没开始处理的请求丢掉。关机是一个整体截止时间 `2*stopWait`（8 秒）：atomdns 先 TERM，4 秒后 KILL，然后内核，卡住的钩子不等；最后一步由主 goroutine 在截止时间后杀掉登记表里剩下的进程组，不依赖循环。之前每个服务一个循环加 `groupMu`、`closing`、`end()` 超时的做法每轮 codex 审查都能找到新的竞争，所以整体重写，不再逐条补丁。
 
-- 第一轮 10 条：关机和启动的竞争（SIGTERM 在启动中、关机时还能启动、三个服务串行停）、只给进程组长发信号、重载在重试等待中返回成功、`services.json` 读失败当成新安装且写失败只记日志、两个内核同时记为运行、运行目录权限、`setReloadCommand` 容器改写不检查、种子脚本和 `build-image.sh` 的写法。除了“Linux 面板重启的锁等待超过 atomdns 的 8 秒”（Linux 版已有代码，不在 C1 范围）和 Mac 临时目录默认值（沿用 `build-package.sh` 的约定）外都修了，加了测试。
-- 第二轮 8 条：并发启动能同时跑两个内核（1 条阻断）、控制请求和启动的竞争、关机时慢的启动脚本、重载在重试等待中取消了自动重试、`services.json` 为 `null`、写 `services.json` 失败时的一致性、状态查询丢了调用方的时限、种子脚本校验。全部修了，加了测试（含 `-race`）。
-- 第三轮 7 条，其中 3 条阻断：重试中的内核重载时另一个内核能抢位置、关机会被卡在启动脚本里、关机和并发停止的次序。已修：重试循环每次都先做同组检查，内核在重试等待中仍占着位置，`end()` 让后来的调用等同一个结束并在 `stopWait` 后放弃卡住的循环，启动在操作锁内重读期望状态，重复的 `start` 写不进 `services.json` 时不动已经在跑的服务，种子脚本逐条校验四条命令；对应加了测试，在 vm92 上 `go test ./...` 和 `-race` 通过，容器里的实测重新跑了一遍。**这一轮的修复没有再送 codex 复审**（按规矩三轮为限）。
-- 记为已知限制的（codex 提了，超出 C1）：客户端 90 秒超时后，排在卡住的启动脚本后面的请求仍可能执行（控制 socket 没有把请求的 context 传进监督器）；启动脚本（`sync-nft`、`policy-route.sh`）不能被取消，关机只是不再等它们；`writeJSON` 在 rename 之后同步目录失败时，`services.json` 可能已经是新值而调用报错；运行目录只做了 0700，没有校验目录属主和符号链接（容器里只有 root，`ATOM_RUN_DIR` 只给测试用）。
+**codex 审查**（旧结构三轮，重构后重新计数三轮，`codex exec -s read-only`，静态审查，没有让它编译）：
+
+- 旧结构：第一轮 10 条、第二轮 8 条、第三轮 7 条，每轮都有新的竞争（关机和启动、两个内核同时启动、重试等待中的重载、`services.json` 读写失败的一致性等），对 da80623 的复审又报了 4 条阻断，所以改为重构。
+- 重构后第一轮 9 条（4 条阻断）：停止时清掉排队的重启；停止正在启动的服务时位置保留到 worker 结束；事件队列保证已投递的结果一定被处理，子进程所有权明确；关机截止时间不依赖循环；同一次启动的多个请求共用一次记录判断；启动时按选中的内核；僵尸进程回收和超时客户端的等待者增长记为已知限制。全部修了。
+- 第二轮 8 条（2 条阻断）：日志写阻塞会拖住关机；取消的启动在 `stopWait` 后释放位置而钩子还在跑；回滚时的等待者；被拒绝的内核占位置；`list()` 和最后一批事件的先后；取消中的启动被报为运行。全部修了：请求不再等待但位置保留到 worker 结束，子进程在 `cmd.Start` 时登记，最后一遍的事件之后才置 `dead`，关机时的日志不在关键路径上。
+- 第三轮 2 条（1 条阻断）：关机最后一步没有和子进程的创建、登记协调（循环还没认领的子进程可能漏杀）；第二次停止在已耗尽等待的取消启动上空等。已修：创建进程和登记在同一把锁里，关机最后一步置 `noSpawn` 再扫一遍登记表，两条关机路径都走它；耗尽等待的取消启动让后来的停止立即返回。**这一轮的修复没有再送 codex 复审**（按三轮为限）。
+- 记为已知限制：重载钩子（`sync-nft`）和生命周期变化、以及同一个服务的多个重载钩子之间不协调（`nft.lock` 只保证单次更新，不保证先后）；客户端超时后已被循环接受的请求的等待者留在列表里直到那次启动结束；入口进程自己写 stdout 被阻塞时循环会被卡住，只有主 goroutine 的最后一步（杀进程组）还在工作；`sync-nft`、`policy-route.sh` 不能取消；`writeJSON` 在 rename 之后同步目录失败时，`services.json` 可能已经是新值而调用报错；运行目录只做了 0700，没有校验属主和符号链接。
 
 **已知限制**：
 
 - 入口进程不回收孤儿子进程（僵尸进程）。要正确回收，需要接管所有子进程的 wait（`exec.Cmd` 的 wait 会和通用回收冲突）；atomdns、sing-box、mihomo 的子进程都是自己 wait 的，目前没见到孤儿。需要的话 Docker 可以加 `init: true`。
+- `docker stop` 的宽限期：监督器在 8 秒内收尾，Docker 默认的 10 秒够用；镜像里不能设置停止宽限期（Docker 的 `--stop-timeout`、compose 的 `stop_grace_period`、ROS 的 `stop-time` 是运行时设置），文档里写明不要把它设得比 10 秒短。
 - 入口进程在 C1 没有安装向导，没有完成安装就退出；镜像版本比数据新时只打印一行日志，数据迁移留给 C4。
