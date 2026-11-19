@@ -40,6 +40,9 @@ type Config struct {
 	// currentUser is the panel login user of an installed machine (reconfigure): the same name without a
 	// password changes nothing.
 	currentUser string
+	// panelAuth is a saved panel login (atom_auth.json) a new installation takes over: the default installation
+	// after a reset keeps the login of the installation before it.
+	panelAuth string
 }
 
 const (

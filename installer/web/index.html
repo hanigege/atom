@@ -301,11 +301,12 @@ function initCfg(st) {
     domestic: st.defaults.domestic, foreign: st.defaults.foreign,
     backend: '', fakeip_range: st.defaults.fakeip_range, mixed_port: st.defaults.mixed_port, subscription_url: '', nodes: '',
   };
-  if (st.reconfigure && st.current) {
-    const cur = st.current;
+  // after a reset the network step starts from the network of the installation before it
+  const cur = st.reconfigure && st.current ? st.current : st.reset ? st.reset.previous : null;
+  if (cur) {
     Object.assign(S.cfg, { topology: cur.topology, lan: cur.lan || [], wan: cur.wan || '', accept_gateway: !!cur.accept_gateway, lan_gateway: cur.lan_gateway || '',
       client_nets: cur.client_nets || '', reply_via: !!cur.reply_via, router: cur.router || '', panel_port: cur.panel_port });
-    if (st.login && st.login.enabled) S.cfg.panel_user = st.login.username;
+    if (st.reconfigure && st.login && st.login.enabled) S.cfg.panel_user = st.login.username;
   }
 }
 
@@ -347,6 +348,11 @@ function viewEnv() {
   });
   h += '</div>';
   if (S.freeErr) h += `<div class="alert bad">${I.warn}<div class="grow">${esc(S.freeErr)}</div></div>`;
+  const r = st.reset;
+  if (r && r.phase === 'ready') {
+    const at = r.auto_install ? new Date(r.auto_install).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+    h += `<div class="alert">${I.warn}<div class="grow"><div>已重置。原来的数据备份在 <span class="mono">${esc(r.backup || '')}</span>。</div>${at ? `<div>${esc(at)} 前没有完成安装时，将按原来的网络设置、面板端口和登录，其余用默认配置自动安装。</div>` : ''}</div></div>`;
+  }
   return h;
 }
 
@@ -493,6 +499,42 @@ function viewDone() {
   return h;
 }
 
+// The reset the panel started: the wizard backs the data up and removes the old installation, then the steps
+// of a new installation follow.
+function viewReset() {
+  const r = S.state.reset, j = r.job, failed = r.phase === 'failed';
+  let h = `<div class="head"><div class="k">重置所有设置</div><h1>${failed ? '没有重置' : '正在重置…'}</h1></div>` + jobBar(failed ? j : Object.assign({}, j, { done: false }));
+  if (!failed) h += '<div class="lbl">正在备份数据并移除旧的安装。局域网的 DNS 在安装完成前不可用，请不要关闭此页面。</div>';
+  h += '<ol class="timeline">';
+  j.steps.forEach(s => {
+    const b = s.status === 'ok' ? badge('ok', I.ok) : s.status === 'fail' ? badge('bad', I.bad) : s.status === 'running' ? badge('run', spin) : badge('wait', I.dot);
+    h += `<li class="${esc(s.status)}">${b}<span class="t">${esc(s.name)}</span></li>`;
+  });
+  h += '</ol>';
+  if (r.error) h += `<div class="alert bad">${I.warn}<div class="grow">${esc(r.error)}</div></div>`;
+  h += `<details class="log" id="logbox" ${S.logOpen || failed ? 'open' : ''}><summary>${I.chev}日志 · ${j.log.length} 行</summary><pre class="out" id="log">${esc(j.log.join('\n'))}</pre></details>`;
+  return h;
+}
+
+function resetPanelURL() {
+  const p = S.state.reset.panel_port;
+  return `http://${location.hostname}${p === 80 ? '' : ':' + p}/#/settings/system`;
+}
+
+async function pollReset() {
+  try {
+    await loadState();
+  } catch (e) {
+    if (S.state.reset && S.state.reset.phase === 'failed') return; // the wizard has exited; the panel is still there
+    setTimeout(pollReset, 1000);
+    return;
+  }
+  const r = S.state.reset;
+  if (r.phase === 'ready') { S.cfg = null; initCfg(S.state); S.phase = 'wizard'; S.step = 0; await startWizard(); return; }
+  render();
+  if (r.phase !== 'failed') setTimeout(pollReset, 1000);
+}
+
 function viewInstalled() {
   const i = S.state.installed, url = `http://${location.hostname}${i.panel_port === 80 ? '' : ':' + i.panel_port}/`;
   return `<div class="hero"><div class="big">${I.ok}</div><h1>已安装</h1><div class="url">版本 ${esc(i.version)} · ${esc(url)}</div></div>`;
@@ -519,7 +561,11 @@ function render() {
   if (keepLog) S.logOpen = keepLog.open;
   let left, content, nav = '', pct = null;
   const runSteps = () => steps().concat([{ name: '安装' }]);
-  if (st.installed && !st.reconfigure && S.phase === 'wizard') {
+  if (S.phase === 'reset') {
+    left = rail(null);
+    content = viewReset();
+    if (st.reset.phase === 'failed') nav = `<span class="sp"></span><a class="btn pri lg" href="${esc(resetPanelURL())}">返回面板 ${I.right}</a>`;
+  } else if (st.installed && !st.reconfigure && S.phase === 'wizard') {
     left = rail(null);
     content = viewInstalled();
     const url = `http://${location.hostname}${st.installed.panel_port === 80 ? '' : ':' + st.installed.panel_port}/`;
@@ -709,10 +755,26 @@ function prefillRoutes() {
 
 async function startWizard() {
   await loadState();
+  const r = S.state.reset;
+  if (r && r.phase !== 'ready') {
+    // the browser has the code: this is the reset confirmed in the panel
+    if (r.phase === 'waiting') await api('POST', '/api/reset');
+    S.phase = 'reset';
+    await pollReset();
+    return;
+  }
   const j = await api('GET', '/api/job?since=0');
   if (!j.idle) { S.phase = 'progress'; S.job = j; S.log = j.log; S.jobNext = j.next; render(); if (j.done && j.ok) { S.phase = 'done'; render(); watchPanel(); } else if (!j.done) pollJob(); else render(); return; }
   render();
 }
+
+// The panel's reset hands the code over in the fragment (#code=…), which never reaches a server; it is taken out
+// of the address at once and kept in this tab only, so that a reload does not ask for it.
+const CODE_KEY = 'atom-install-code';
+const handed = new URLSearchParams(location.hash.slice(1)).get('code') || '';
+if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+function keepCode(code) { try { if (code) sessionStorage.setItem(CODE_KEY, code); else sessionStorage.removeItem(CODE_KEY); } catch (e) {} }
+function keptCode() { try { return sessionStorage.getItem(CODE_KEY) || ''; } catch (e) { return ''; } }
 
 const app = document.getElementById('app');
 app.innerHTML = `<section class="body"><div class="content">
@@ -732,12 +794,23 @@ document.getElementById('unlockWizard').onsubmit = async e => {
   installCode = document.getElementById('installCode').value;
   try {
     await startWizard();
+    keepCode(installCode);
   } catch (error) {
     installCode = '';
     document.getElementById('unlockError').textContent = error.message;
     button.disabled = false;
   }
 };
+const known = /^[0-9]{6}$/.test(handed) ? handed : keptCode();
+if (known) {
+  installCode = known;
+  keepCode(known);
+  startWizard().catch(error => {
+    installCode = '';
+    keepCode('');
+    document.getElementById('unlockError').textContent = error.message;
+  });
+}
 </script>
 </body>
 </html>

@@ -26,7 +26,8 @@ type manifest struct {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage: atom-installer <command>
-  serve [--pkg DIR] [--port N] [--reconfigure]   start the installation wizard (--reconfigure: on an installed machine)
+  serve [--pkg DIR] [--port N] [--reconfigure]   start the installation wizard (--reconfigure: on an installed machine;
+                                 the maintenance service adds --reset JOB for the panel's reset)
   urls                           print the wizard's addresses
   upgrade [--pkg DIR] [--force] [--keep-pkg]  upgrade an installed atom from an unpacked package
   uninstall [--purge] [--yes]    remove atom (the data stays unless --purge)
@@ -102,6 +103,10 @@ type listenInfo struct {
 	Port int    `json:"port"`
 	PID  int    `json:"pid"`
 	Code string `json:"code"`
+	// A wizard in reset mode (reset.go): the maintenance job that started it and where the reset stands.
+	ResetJob   string `json:"reset_job,omitempty"`
+	Reset      string `json:"reset,omitempty"`
+	ResetError string `json:"reset_error,omitempty"`
 }
 
 func cmdServe(args []string) int {
@@ -109,13 +114,20 @@ func cmdServe(args []string) int {
 	pkg := fs.String("pkg", "", "unpacked package (default: the directory above this program's)")
 	port := fs.Int("port", defaultPort, "port to try first; a free one is chosen when it is taken")
 	reconf := fs.Bool("reconfigure", false, "edit the configuration of an installed atom")
+	resetJob := fs.String("reset", "", "reset the installed atom for the panel's maintenance job (started by the maintenance service)")
 	fs.Parse(args)
 	ins, err := newInstaller(*pkg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	lock, err := cliOperationLock(ins.Paths)
+	var lock *os.File
+	if *resetJob != "" {
+		*reconf = false
+		lock, err = resetOperationLock(ins.Paths, *resetJob)
+	} else {
+		lock, err = cliOperationLock(ins.Paths)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -146,6 +158,14 @@ func cmdServe(args []string) int {
 	}
 	li := listenInfo{Port: ins.InstallerPort, PID: os.Getpid(), Code: fmt.Sprintf("%06d", n.Int64())}
 	runFile := ins.Paths.Run("installer.json")
+	var reset *resetRun
+	if *resetJob != "" {
+		if reset, err = newResetRun(ins.Paths, *resetJob, li, runFile); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		li = reset.listen
+	}
 	data, err := json.MarshalIndent(li, "", "  ")
 	if err == nil {
 		err = writeFileAtomic(runFile, data, 0o600)
@@ -157,10 +177,12 @@ func cmdServe(args []string) int {
 	defer os.Remove(runFile)
 
 	s := newServer(ins, li.Code)
+	s.reset = reset
 	srv := &http.Server{Handler: s.handler(), ReadHeaderTimeout: 10 * time.Second}
 	go srv.Serve(ln)
 	go s.watchIdle()
-	if os.Getenv("ATOM_WIZARD_BACKGROUND") != "1" {
+	// a reset wizard runs in the background too; its log (root only) keeps the code for a lost browser tab
+	if os.Getenv("ATOM_WIZARD_BACKGROUND") != "1" || reset != nil {
 		printWizardAccess(li)
 	}
 	<-s.quit

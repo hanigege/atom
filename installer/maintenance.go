@@ -84,6 +84,12 @@ type maintenanceJob struct {
 	NewPanel   int        `json:"new_panel,omitempty"`
 	NewIPs     []string   `json:"new_ips,omitempty"`
 	SameAccess bool       `json:"same_access,omitempty"`
+	// A reset (reset.go): the wizard the panel hands over to, its code, and the package copy it installs from.
+	WizardPort int      `json:"wizard_port,omitempty"`
+	WizardCode string   `json:"wizard_code,omitempty"`
+	WizardURLs []string `json:"wizard_urls,omitempty"`
+	WizardPID  int      `json:"wizard_pid,omitempty"`
+	Package    string   `json:"package,omitempty"`
 }
 
 type maintenance struct {
@@ -172,7 +178,7 @@ func (m *maintenance) handler(w http.ResponseWriter, r *http.Request) {
 		m.network(w)
 	case r.Method == "POST" && r.URL.Path == "/confirm":
 		m.confirmNetwork(w, r)
-	case r.Method == "POST" && (r.URL.Path == "/check" || r.URL.Path == "/upgrade" || r.URL.Path == "/network"):
+	case r.Method == "POST" && (r.URL.Path == "/check" || r.URL.Path == "/upgrade" || r.URL.Path == "/network" || r.URL.Path == "/reset"):
 		m.start(w, r)
 	default:
 		writeErr(w, 404, "没有这个维护接口")
@@ -201,6 +207,11 @@ func (m *maintenance) start(w http.ResponseWriter, r *http.Request) {
 	case "check":
 		if decodeMaintenance(r, &struct{}{}) != nil {
 			writeErr(w, 400, "无效的检查请求")
+			return
+		}
+	case "reset":
+		if decodeMaintenance(r, &struct{}{}) != nil {
+			writeErr(w, 400, "无效的重置请求")
 			return
 		}
 	case "upgrade":
@@ -241,6 +252,10 @@ func (m *maintenance) start(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "请选择比当前版本更新的正式发布")
 		return
 	}
+	if kind == "reset" && wizardRunning(m.paths) {
+		writeErr(w, 409, "安装向导已在运行，请先关闭它")
+		return
+	}
 
 	var random [16]byte
 	if _, err := rand.Read(random[:]); err != nil {
@@ -248,6 +263,9 @@ func (m *maintenance) start(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	job := maintenanceJob{ID: hex.EncodeToString(random[:]), Kind: kind, Phase: "checking", Version: upgrade.Version}
+	if kind == "reset" {
+		job.Phase = "preparing"
+	}
 	if kind == "network" {
 		if network.Revision != networkRevision(st) {
 			writeErr(w, 409, "网络配置已更新，请重新读取")
@@ -267,6 +285,8 @@ func (m *maintenance) start(w http.ResponseWriter, r *http.Request) {
 			m.runNetwork(st, network)
 		case "check", "upgrade":
 			m.runUpdate(st, job, lock)
+		case "reset":
+			m.runReset(st, lock)
 		}
 	}()
 	writeResp(w, 202, m.job)
@@ -341,6 +361,9 @@ func (m *maintenance) recover() error {
 	m.job = &job
 	if job.Done && !job.Blocking {
 		return nil
+	}
+	if job.Kind == "reset" {
+		return m.recoverReset()
 	}
 	failure := fmt.Errorf("维护服务中断，任务未完成")
 	if job.Blocking {

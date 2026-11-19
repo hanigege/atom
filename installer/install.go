@@ -173,7 +173,14 @@ func (ins *Installer) runInstall(cfg Config, j *Job) {
 				return ins.stepNetwork(cfg, j)
 			},
 			func() error {
-				if !cfg.keepData && strings.TrimSpace(cfg.PanelUser) != "" && cfg.PanelPassword != "" {
+				if !cfg.keepData && cfg.panelAuth != "" {
+					target := filepath.Join(ins.Paths.Data(), "webinfo", "atom_auth.json")
+					_, err := os.Stat(target)
+					removeNewLogin = os.IsNotExist(err)
+					if err := copyFileAtomic(cfg.panelAuth, target, 0o600); err != nil {
+						return fmt.Errorf("沿用面板登录：%w", err)
+					}
+				} else if !cfg.keepData && strings.TrimSpace(cfg.PanelUser) != "" && cfg.PanelPassword != "" {
 					_, err := os.Stat(filepath.Join(ins.Paths.Data(), "webinfo", "atom_auth.json"))
 					removeNewLogin = os.IsNotExist(err)
 					if err := ins.initPanelLogin(cfg); err != nil {
@@ -375,6 +382,10 @@ func (ins *Installer) installData(panelPort int, log Logger) error {
 		return fmt.Errorf("面板: %w", err)
 	}
 	log.Logf("面板 → %s/ui/main", ins.Paths.Data())
+	// Without the copy only the panel's reset is unavailable; the installation itself is fine.
+	if err := ins.keepShipped(); err != nil {
+		log.Logf("! 没有保存安装包副本（面板的「重置所有设置」暂时不可用）：%v", err)
+	}
 	return nil
 }
 
