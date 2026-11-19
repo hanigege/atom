@@ -1001,7 +1001,16 @@ func (r *recLogger) ran(sub string) bool {
 	return false
 }
 
+// noHostCommands keeps a test off the machine it runs on: with nothing on PATH, the nft, ip, systemctl and
+// rc-service commands it reaches are only logged. Run as root on an installed machine, the real ones would stop
+// and disable atom's services and take its routes and nft tables down.
+func noHostCommands(t *testing.T) {
+	t.Helper()
+	t.Setenv("PATH", t.TempDir())
+}
+
 func TestUninstallFollowsTheOwnershipRecord(t *testing.T) {
+	noHostCommands(t)
 	newPaths := func() Paths { return Paths{Root: t.TempDir(), UnitDir: t.TempDir()} }
 
 	// the network part was rolled back (or never installed): table 233 and the nft tables are not touched
@@ -1054,6 +1063,7 @@ func TestUninstallFollowsTheOwnershipRecord(t *testing.T) {
 }
 
 func TestTeardownClearsOwnership(t *testing.T) {
+	noHostCommands(t)
 	p := Paths{Root: t.TempDir()}
 	saveChanges(p, &Changes{Network: true, IPForwardBefore: ""})
 	ins := Installer{Paths: p}
@@ -1381,6 +1391,7 @@ func TestSetReloadCommand(t *testing.T) {
 }
 
 func TestOpenRCServiceOfPID(t *testing.T) {
+	noHostCommands(t)
 	root := t.TempDir()
 	daemons, proc := filepath.Join(root, "daemons"), filepath.Join(root, "proc")
 	pidfile := func(name string, pid int) {
@@ -1667,6 +1678,7 @@ func TestSetLogin(t *testing.T) {
 }
 
 func TestReconfigureUndoesWhatTheOldStateLacks(t *testing.T) {
+	noHostCommands(t)
 	route := ClientRoute{"10.1.0.0/24", "192.168.1.2", "eth1"}
 	kept := ClientRoute{"10.2.0.0/24", "192.168.1.2", "eth1"}
 	newCh := &Changes{IPForwardBefore: "0", Reply: true, Routes: []ClientRoute{route, kept}}
@@ -1716,6 +1728,7 @@ func TestBeginReconfigureBacksUp(t *testing.T) {
 }
 
 func TestOwnRoutesChangedGateway(t *testing.T) {
+	noHostCommands(t)
 	old := ClientRoute{"10.1.0.0/24", "192.168.1.2", "eth1"}
 	now := ClientRoute{"10.1.0.0/24", "192.168.1.3", "eth1"}
 	existing := func(ClientRoute) string { return "10.1.0.0/24 via 192.168.1.2 dev eth1 " }
