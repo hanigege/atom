@@ -47,7 +47,10 @@ type service struct {
 
 	// owned by the loop
 	phase   string
-	gen     uint64 // of the current start, retry wait or stop; results carry the one they were made for
+	gen     uint64        // of the current start, retry wait or stop; results carry the one they were made for
+	drain   uint64        // the start (gen) a stop in progress is waiting for the worker of
+	cancel  chan struct{} // closed when the start in progress is cancelled: its worker does not spawn
+	record  bool          // the start in progress is to be written to services.json when it has succeeded
 	proc    *proc
 	retry   bool // a failed or dead service is tried again (it was started by the boot, or has run)
 	timer   *time.Timer
@@ -63,8 +66,17 @@ type supervisor struct {
 	out  io.Writer
 	outM sync.Mutex
 
-	ev   chan func()
-	quit chan struct{} // closed when the loop ends: after the shutdown
+	// the event queue: a post that returns true is run, in the loop or, at its end, by the loop's last act
+	qmu        sync.Mutex
+	queue      []func()
+	dead       bool
+	wake       chan struct{}
+	quit       chan struct{} // closed when the shutdown is done
+	finishOnce sync.Once
+
+	// every live process group, for the last stage of the shutdown, which does not need the loop
+	pmu   sync.Mutex
+	procs map[*proc]struct{}
 
 	// owned by the loop
 	ready, closing  bool
@@ -73,53 +85,68 @@ type supervisor struct {
 }
 
 func newSupervisor(p Paths, specs []serviceSpec, out io.Writer) *supervisor {
-	s := &supervisor{p: p, out: out, ev: make(chan func(), 64), quit: make(chan struct{})}
+	s := &supervisor{p: p, out: out, wake: make(chan struct{}, 1), quit: make(chan struct{}), procs: map[*proc]struct{}{}}
 	for _, sp := range specs {
 		s.svcs = append(s.svcs, &service{spec: sp, phase: phStopped})
 	}
-	go func() {
-		for {
-			select {
-			case f := <-s.ev:
-				f()
-			case <-s.quit:
-				return
-			}
-			select { // after the end nothing more runs
-			case <-s.quit:
-				return
-			default:
-			}
-		}
-	}()
+	go s.run()
 	return s
 }
 
-// post hands an event to the loop; once the loop has ended it is dropped.
-func (s *supervisor) post(f func()) {
-	select {
-	case s.ev <- f:
-	case <-s.quit:
+func (s *supervisor) run() {
+	for {
+		select {
+		case <-s.wake:
+		case <-s.quit:
+		}
+		s.qmu.Lock()
+		batch := s.queue
+		s.queue = nil
+		ended := false
+		select {
+		case <-s.quit:
+			ended, s.dead = true, true
+		default:
+		}
+		s.qmu.Unlock()
+		for _, f := range batch {
+			f()
+		}
+		if ended {
+			return
+		}
 	}
+}
+
+// post hands an event to the loop. It returns false once the loop has ended, and the event is not run; one that
+// returns true is run, at the latest by the loop's last pass.
+func (s *supervisor) post(f func()) bool {
+	s.qmu.Lock()
+	if s.dead {
+		s.qmu.Unlock()
+		return false
+	}
+	s.queue = append(s.queue, f)
+	s.qmu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+	return true
 }
 
 // do runs f in the loop and waits for the answer f gives through reply (possibly much later). A request whose ctx
 // is over before the loop gets to it is dropped. After the loop has ended nothing is served: errClosing.
 func (s *supervisor) do(ctx context.Context, f func(reply func(error))) error {
 	res := make(chan error, 1)
-	run := func() {
+	if !s.post(func() {
 		if err := ctx.Err(); err != nil {
 			res <- err
 			return
 		}
 		f(func(err error) { res <- err })
-	}
-	select {
-	case s.ev <- run:
-	case <-s.quit:
+	}) {
 		return errClosing
-	case <-ctx.Done():
-		return ctx.Err()
 	}
 	select {
 	case err := <-res:
@@ -288,6 +315,8 @@ func (s *supervisor) begin(v *service) {
 	v.gen++
 	g := v.gen
 	v.phase = phStarting
+	v.cancel = make(chan struct{})
+	cancel := v.cancel
 	go func() {
 		var p *proc
 		var err error
@@ -296,18 +325,35 @@ func (s *supervisor) begin(v *service) {
 				err = fmt.Errorf("%s 启动前的准备失败：%w", v.spec.Name, err)
 			}
 		}
+		select {
+		case <-cancel: // stopped while the hook ran: no process
+			if err == nil {
+				err = errSuperseded
+			}
+		default:
+		}
 		if err == nil {
 			p, err = s.spawn(v)
 		}
-		s.post(func() { s.started(v, g, p, err) })
+		if !s.post(func() { s.started(v, g, p, err) }) && p != nil {
+			s.kill(p) // the loop has ended: the process is ours to end
+		}
 	}()
+}
+
+// kill ends a process nobody supervises.
+func (s *supervisor) kill(p *proc) {
+	signalGroup(p, syscall.SIGKILL)
+	go p.cmd.Wait()
 }
 
 func (s *supervisor) started(v *service, g uint64, p *proc, err error) {
 	if v.gen != g || v.phase != phStarting { // dropped: the service was stopped or started again meanwhile
 		if p != nil {
-			signalGroup(p, syscall.SIGKILL)
-			go p.cmd.Wait()
+			s.kill(p)
+		}
+		if v.phase == phStopping && v.proc == nil && v.drain == g { // the worker of a cancelled start has ended
+			s.stopped(v)
 		}
 		return
 	}
@@ -316,11 +362,24 @@ func (s *supervisor) started(v *service, g uint64, p *proc, err error) {
 		return
 	}
 	v.proc, v.phase, v.retry = p, phRunning, true
+	s.pmu.Lock()
+	s.procs[p] = struct{}{}
+	s.pmu.Unlock()
 	go func() {
 		err := p.cmd.Wait()
 		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL) // what it left behind goes with it, as in a systemd cgroup
+		s.pmu.Lock()
+		delete(s.procs, p)
+		s.pmu.Unlock()
 		s.post(func() { s.exited(v, p, err) })
 	}()
+	if v.record { // one decision for every request that waits for this start
+		v.record = false
+		if err := s.setDesired(v.spec.Name, true); err != nil {
+			s.stop(v, stopWait, func() { s.answer(v, err) }) // the start is taken back, then the requests are answered
+			return
+		}
+	}
 	s.answer(v, nil)
 }
 
@@ -335,6 +394,7 @@ func (s *supervisor) answer(v *service, err error) {
 
 func (s *supervisor) failStart(v *service, err error) {
 	s.Logf("%v", err)
+	v.record = false
 	switch {
 	case s.closing:
 		v.phase = phStopped
@@ -410,11 +470,31 @@ func (s *supervisor) stop(v *service, wait time.Duration, w func()) {
 		if w != nil {
 			w()
 		}
-	case phStarting, phBackoff: // nothing runs: the result of the start in progress is dropped when it comes
+	case phStarting:
+		// the worker may still be in its hook, which changes nft rules, and may start a process: the service (and the
+		// kernel slot) stays taken until the worker has ended, or for wait
+		close(v.cancel)
+		v.drain = v.gen
+		v.gen++
+		v.phase = phStopping
+		v.record = false
+		g := v.gen
+		if w != nil {
+			v.stopWaiters = append(v.stopWaiters, w)
+		}
+		s.answer(v, errSuperseded)
+		time.AfterFunc(wait, func() {
+			s.post(func() {
+				if v.gen == g && v.phase == phStopping && v.proc == nil {
+					s.Logf("%s 的启动没有在 %s 内结束，不再等待", v.spec.Name, wait)
+					s.stopped(v)
+				}
+			})
+		})
+	case phBackoff:
 		s.stopTimer(v)
 		v.gen++
 		v.phase = phStopped
-		s.answer(v, errSuperseded)
 		if w != nil {
 			w()
 		}
@@ -486,13 +566,7 @@ func (s *supervisor) settled() {
 	s.finish()
 }
 
-func (s *supervisor) finish() {
-	select {
-	case <-s.quit:
-	default:
-		close(s.quit)
-	}
-}
+func (s *supervisor) finish() { s.finishOnce.Do(func() { close(s.quit) }) }
 
 // ---- the operations ----
 
@@ -510,18 +584,14 @@ func (s *supervisor) mutating(name string) (*service, error) {
 	return v, nil
 }
 
-// recorded is the answer of a start request: the service is to run when the container starts again; when that
-// cannot be saved, the start is taken back (unless the service ran before).
-func (s *supervisor) recorded(v *service, was bool, reply func(error)) func(error) {
-	return func(err error) {
-		if err == nil {
-			if err = s.setDesired(v.spec.Name, true); err != nil && !was {
-				s.stop(v, stopWait, func() { reply(err) })
-				return
-			}
-		}
-		reply(err)
+// starting is requestStart for a request that is to be recorded in services.json when the service runs.
+func (s *supervisor) starting(v *service, reply func(error)) {
+	if v.phase == phRunning {
+		reply(s.setDesired(v.spec.Name, true))
+		return
 	}
+	v.record = true
+	s.requestStart(v, reply)
 }
 
 func (s *supervisor) Start(ctx context.Context, name string) error {
@@ -531,7 +601,7 @@ func (s *supervisor) Start(ctx context.Context, name string) error {
 			reply(err)
 			return
 		}
-		s.requestStart(v, s.recorded(v, v.phase == phRunning, reply))
+		s.starting(v, reply)
 	})
 }
 
@@ -549,6 +619,9 @@ func (s *supervisor) Stop(ctx context.Context, name string) error {
 				reply(err)
 				return
 			}
+			// a start or restart that was waiting is over: the service is to stay down
+			v.startAfterStop = false
+			s.answer(v, errSuperseded)
 			s.stop(v, stopWait, func() { reply(nil) })
 		}
 	})
@@ -563,12 +636,13 @@ func (s *supervisor) Restart(ctx context.Context, name string) error {
 		}
 		if v.phase == phRunning {
 			// stop, then start again: the start waits in v.waiters for the stop to be done
-			v.waiters = append(v.waiters, s.recorded(v, false, reply))
+			v.waiters = append(v.waiters, reply)
+			v.record = true
 			v.startAfterStop = true
 			s.stop(v, stopWait, nil)
 			return
 		}
-		s.requestStart(v, s.recorded(v, false, reply))
+		s.starting(v, reply)
 	})
 }
 
@@ -582,16 +656,17 @@ func (s *supervisor) Reload(ctx context.Context, name string) error {
 		}
 		if v.spec.Reload == nil {
 			if v.phase == phRunning {
-				v.waiters = append(v.waiters, s.recorded(v, false, reply))
+				v.waiters = append(v.waiters, reply)
+				v.record = true
 				v.startAfterStop = true
 				s.stop(v, stopWait, nil)
 				return
 			}
-			s.requestStart(v, s.recorded(v, false, reply))
+			s.starting(v, reply)
 			return
 		}
 		if v.phase != phRunning {
-			s.requestStart(v, s.recorded(v, false, reply))
+			s.starting(v, reply)
 			return
 		}
 		g, p := v.gen, v.proc
@@ -641,6 +716,7 @@ func (s *supervisor) boot() {
 			s.Logf("%v，按新安装处理", err)
 		}
 		want := s.desired()
+		skip := "" // the kernel that is not started although the file says so
 		// the kernels share ports and rules: of two that are marked running only the selected one starts
 		if want["atom-sing-box"] && want["atom-mihomo"] {
 			backend, _, _ := s.p.proxyService()
@@ -649,6 +725,7 @@ func (s *supervisor) boot() {
 				other = "atom-sing-box"
 			}
 			s.Logf("atom-sing-box 和 atom-mihomo 都记为运行，只启动选中的内核")
+			skip = other
 			if err := s.setDesired(other, false); err != nil {
 				s.Logf("%v", err)
 			}
@@ -658,7 +735,7 @@ func (s *supervisor) boot() {
 		next = func(i int) {
 			for ; i < len(s.svcs); i++ {
 				v := s.svcs[i]
-				if s.closing || !s.desired()[v.spec.Name] {
+				if s.closing || v.spec.Name == skip || !s.desired()[v.spec.Name] {
 					continue
 				}
 				v.retry = true
@@ -677,7 +754,8 @@ func (s *supervisor) boot() {
 
 // shutdown stops atomdns first, then the kernels, and leaves services.json as it is. Nothing starts or stops by
 // request after it has begun; what is starting is dropped. The whole takes at most 2*stopWait (8 s: `docker stop`
-// allows 10): a hook that hangs is not waited for.
+// allows 10): a hook that hangs is not waited for. The last stage does not depend on the loop: at the deadline every
+// process group that is left is killed.
 func (s *supervisor) shutdown() {
 	s.post(func() {
 		if s.closing {
@@ -696,7 +774,16 @@ func (s *supervisor) shutdown() {
 		s.stop(s.svcs[len(s.svcs)-1], stopWait, nil)
 		s.settled()
 	})
-	<-s.quit
+	select {
+	case <-s.quit:
+	case <-time.After(2*stopWait + 300*time.Millisecond):
+		s.pmu.Lock()
+		for p := range s.procs {
+			signalGroup(p, syscall.SIGKILL)
+		}
+		s.pmu.Unlock()
+		s.finish()
+	}
 }
 
 func (s *supervisor) logs(name string, n int) ([]string, error) {
@@ -739,15 +826,10 @@ func (s *supervisor) list() []serviceInfo {
 	}
 	var once sync.Once
 	done := make(chan struct{})
-	select {
-	case s.ev <- func() { once.Do(read); close(done) }:
-		select {
-		case <-done:
-		case <-s.quit:
-			once.Do(read) // the loop ended before it came to this
-		}
-	case <-s.quit:
-		once.Do(read)
+	if !s.post(func() { once.Do(read); close(done) }) {
+		once.Do(read) // the loop has ended: nothing changes any more
+		return out
 	}
+	<-done
 	return out
 }

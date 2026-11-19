@@ -868,6 +868,9 @@ func TestStaleStartResultIsDroppedAndItsProcessKilled(t *testing.T) {
 	hold := make(chan struct{})
 	sp.Pre = func() error { <-hold; return nil }
 	s, _ := testSup(t, p, sp)
+	old := stopWait
+	stopWait = 200 * time.Millisecond
+	defer func() { stopWait = old }()
 	first := make(chan error, 1)
 	go func() { first <- s.Start(bg, "atom-dns") }()
 	waitFor(t, "start under way", func() bool { return startingPhase(s) })
@@ -943,4 +946,51 @@ func TestShutdownTakesNoMoreThanTwiceStopWait(t *testing.T) {
 			t.Errorf("%+v", st)
 		}
 	}
+}
+
+func TestStopDuringARestartLeavesTheServiceDown(t *testing.T) {
+	p := containerPaths(t)
+	s, _ := testSup(t, p, shSpec("atom-dns", `trap 'sleep 0.3; exit 0' TERM; echo up; while :; do sleep 0.05; done`))
+	if err := s.Start(bg, "atom-dns"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	rs := make(chan error, 1)
+	go func() { rs <- s.Restart(bg, "atom-dns") }()
+	waitFor(t, "stopping", func() bool { return phaseOf(s, 0) == phStopping })
+	if err := s.Stop(bg, "atom-dns"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-rs; !errors.Is(err, errSuperseded) {
+		t.Errorf("the restart that was stopped: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if st := s.list()[0]; st.State != "stopped" || st.Desired != "stopped" {
+		t.Errorf("%+v", st)
+	}
+}
+
+func phaseOf(s *supervisor, i int) string {
+	ph := make(chan string, 1)
+	s.post(func() { ph <- s.svcs[i].phase })
+	return <-ph
+}
+
+func TestWaitingStartsShareOneRecordingDecision(t *testing.T) {
+	p := containerPaths(t)
+	sp := shSpec("atom-dns", `exec sleep 30`)
+	hold := make(chan struct{})
+	sp.Pre = func() error { <-hold; return nil }
+	s, _ := testSup(t, p, sp)
+	os.MkdirAll(filepath.Join(p.Etc(servicesFile), "x"), 0o755) // services.json cannot be read: every record fails
+	errs := make(chan error, 2)
+	go func() { errs <- s.Start(bg, "atom-dns") }()
+	waitFor(t, "start under way", func() bool { return phaseOf(s, 0) == phStarting })
+	go func() { errs <- s.Start(bg, "atom-dns") }()
+	time.Sleep(50 * time.Millisecond)
+	close(hold)
+	if e1, e2 := <-errs, <-errs; e1 == nil || e2 == nil {
+		t.Errorf("the requests disagree: %v %v", e1, e2)
+	}
+	waitFor(t, "taken back", func() bool { return s.list()[0].State == "stopped" })
 }
