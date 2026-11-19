@@ -105,7 +105,8 @@ func loadChanges(p Paths) (*Changes, error) {
 	var c *Changes
 	if err := readJSON(p.Changes(), &c); err != nil {
 		if os.IsNotExist(err) {
-			if _, err := os.Lstat(p.State()); os.IsNotExist(err) {
+			// the container keeps no record of network changes: they go with its network namespace
+			if _, err := os.Lstat(p.State()); os.IsNotExist(err) || p.Container {
 				return &Changes{}, nil
 			}
 		}

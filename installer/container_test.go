@@ -406,7 +406,7 @@ func TestShutdownStopsAtomdnsFirstAndKillsWhatIgnoresTerm(t *testing.T) {
 func TestControlSocketAndContainerInit(t *testing.T) {
 	p := containerPaths(t)
 	s, _ := testSup(t, p, shSpec("atom-sing-box", `echo kernel-line; exec sleep 30`), shSpec("atom-dns", `exec sleep 30`))
-	closeAll, err := serveContainerSockets(p, s)
+	closeAll, err := serveContainerSockets(p, s, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -469,7 +469,7 @@ func TestControlSocketAndContainerInit(t *testing.T) {
 func TestContainerMaintenance(t *testing.T) {
 	p := containerPaths(t)
 	s, _ := testSup(t, p, shSpec("atom-sing-box", `exec sleep 30`), shSpec("atom-mihomo", `exec sleep 30`), shSpec("atom-dns", `exec sleep 30`))
-	closeAll, err := serveContainerSockets(p, s)
+	closeAll, err := serveContainerSockets(p, s, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +499,7 @@ func TestContainerMaintenance(t *testing.T) {
 	if code != 200 || m["deployment"] != "container" || m["version"] != "1.2.3" {
 		t.Errorf("overview %d %v", code, m)
 	}
-	for _, c := range []struct{ method, path string }{{"POST", "/upgrade"}, {"POST", "/check"}, {"POST", "/network"}, {"GET", "/network"}, {"POST", "/reset"}} {
+	for _, c := range []struct{ method, path string }{{"POST", "/upgrade"}, {"POST", "/check"}, {"POST", "/network"}, {"GET", "/network"}} {
 		if code, m := do(c.method, c.path, "{}"); code != 400 || m["error"] == "" {
 			t.Errorf("%s %s: %d %v", c.method, c.path, code, m)
 		}

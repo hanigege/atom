@@ -294,7 +294,7 @@ const S = { routesEdited: false, state: null, step: 0, cfg: null, errors: {}, fr
 function initCfg(st) {
   const ifs = st.ifaces, def = ifs.find(i => i.default) || ifs[0];
   S.cfg = {
-    topology: ifs.length >= 2 ? '' : 'bypass',
+    topology: ifs.length >= 2 && !isContainer() ? '' : 'bypass',
     lan: def ? [def.name] : [], wan: '', lan_gateway: '', client_nets: '',
     reply_via: false, router: '',
     panel_port: st.defaults.panel_port, panel_user: '', panel_password: '', panel_login_off: false,
@@ -315,6 +315,7 @@ async function loadState() {
   if (!S.cfg) initCfg(S.state);
 }
 
+function isContainer() { return !!S.state && S.state.deployment === 'container'; }
 function envProblems() { return S.state.system.problems; }
 function envReady() { return envProblems().length === 0 && S.state.port53.length === 0; }
 
@@ -326,7 +327,24 @@ function head(title) {
   return `<div class="head"><div class="k">第 ${S.step + 1} 步，共 ${list.length} 步</div><h1>${esc(title)}</h1></div>`;
 }
 
+// the container's environment step: what the network rules need, tried
+function viewEnvContainer() {
+  const st = S.state, c = st.container;
+  let h = head('环境检查') + '<div class="checks">';
+  c.checks.forEach(k => {
+    h += `<div class="check">${badge(k.ok ? 'ok' : 'bad', k.ok ? I.ok : I.bad)}<div class="grow">${esc(k.label)}${k.reason ? `<div class="s">${esc(k.reason)}</div>` : ''}</div></div>`;
+  });
+  h += '</div>';
+  const r = st.reset;
+  if (r && r.phase === 'ready') {
+    const at = r.auto_install ? new Date(r.auto_install).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+    h += `<div class="alert">${I.warn}<div class="grow"><div>已重置。原来的数据备份在 <span class="mono">${esc(r.backup || '')}</span>。</div>${at ? `<div>${esc(at)} 前没有完成安装时，将按原来的网络设置、面板端口和登录，其余用默认配置自动安装。</div>` : ''}</div></div>`;
+  }
+  return h;
+}
+
 function viewEnv() {
+  if (isContainer()) return viewEnvContainer();
   const st = S.state, sys = st.system;
   const osBad = sys.problems.some(p => /Debian|Ubuntu/.test(p));
   let h = head('环境检查') + '<div class="checks">';
@@ -373,7 +391,9 @@ function viewNet() {
     <span class="art">${ART[v]}</span>
     <span class="nm"><span class="tk">${c.topology === v ? I.ok : ''}</span>${name}</span>
   </label>`;
-  let h = head('网络') + '<div class="sec"><div class="lbl">部署方式</div><div class="topos">' + topo('bypass', '单网卡旁路由') + topo('gateway', '双网卡网关') + '</div>' + errOf('topology') + '</div>';
+  // the container is always a single-NIC bypass; with one interface there is nothing to choose
+  const ct = isContainer();
+  let h = head('网络') + (ct ? '' : '<div class="sec"><div class="lbl">部署方式</div><div class="topos">' + topo('bypass', '单网卡旁路由') + topo('gateway', '双网卡网关') + '</div>' + errOf('topology') + '</div>');
   if (c.topology === 'bypass') {
     h += '<div class="sec"><div class="lbl">网卡</div><div class="ifs">' + ifs.map(i => ifRow(i, { name: 'lan_one', bind: 'lan_one', selected: c.lan[0] === i.name })).join('') + '</div>' + errOf('lan') + '</div>';
     h += `<div class="sec"><label class="agree"><input type="checkbox" data-bind="reply_via" ${c.reply_via ? 'checked' : ''}>回包经主路由</label></div>`;

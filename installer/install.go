@@ -22,6 +22,9 @@ type Installer struct {
 	Version       string
 	InstallerPort int
 	Reconfigure   bool // the wizard runs on an installed machine (reconfigure.go)
+	// PanelTemp (container): the wizard listens on the port the panel is to have, so the installation runs
+	// atomdns on this port instead; the entry process moves it to the real one when the wizard has closed.
+	PanelTemp int
 }
 
 // Job is one run of the installation, observed by the wizard page.
@@ -133,6 +136,16 @@ func hasData(p Paths) bool {
 
 var installSteps = []string{"依赖", "程序", "配置", "网络", "启动", "设置", "自检"}
 
+// containerInstallSteps: the programs and what they need are in the image (docs/container.md 6.2).
+var containerInstallSteps = installSteps[2:]
+
+func (ins *Installer) stepNames() []string {
+	if ins.Paths.Container {
+		return containerInstallSteps
+	}
+	return installSteps
+}
+
 // runInstall performs the installation. A failure after the network files were written takes the live
 // network changes back (nft tables, policy routing, ip_forward) so the machine is left reachable.
 func (ins *Installer) runInstall(cfg Config, j *Job) {
@@ -160,16 +173,24 @@ func (ins *Installer) runInstall(cfg Config, j *Job) {
 			return
 		}
 	}
+	// run is cfg as the services see it: with the temporary panel port when the wizard holds the real one
+	run := cfg
+	if ins.PanelTemp != 0 {
+		run.PanelPort = ins.PanelTemp
+	}
 	err := func() error {
 		steps := []func() error{
 			func() error { return ins.stepDeps(cfg, j) },
 			func() error { return ins.stepBinaries(j) },
-			func() error { return ins.stepConfig(cfg, j) },
+			func() error { return ins.stepConfig(run, j) },
 			func() error {
 				if err := ins.checkRouteTable(cfg); err != nil { // nothing has been changed yet: no teardown for a refusal
 					return err
 				}
 				netStarted = true
+				if ins.Paths.Container {
+					return ins.stepNetworkContainer(cfg, j)
+				}
 				return ins.stepNetwork(cfg, j)
 			},
 			func() error {
@@ -187,16 +208,18 @@ func (ins *Installer) runInstall(cfg Config, j *Job) {
 						return err
 					}
 				}
-				return ins.stepStart(cfg, j)
+				return ins.stepStart(run, j)
 			},
-			func() error { return ins.stepSettings(cfg, j) },
-			func() error { return ins.stepCheck(cfg, j) },
+			func() error { return ins.stepSettings(run, j) },
+			func() error { return ins.stepCheck(run, j) },
 		}
+		names := ins.stepNames()
+		steps = steps[len(steps)-len(names):]
 		for i, fn := range steps {
 			j.setStep(i, "running")
 			if err := fn(); err != nil {
 				j.setStep(i, "fail")
-				return fmt.Errorf("%s：%w", installSteps[i], err)
+				return fmt.Errorf("%s：%w", names[i], err)
 			}
 			j.setStep(i, "ok")
 		}
@@ -576,7 +599,11 @@ func (ins *Installer) checkRouteTable(cfg Config) error {
 		if err != nil {
 			return err
 		}
-		if c := replyConflict(rules, routes, ch.Reply); c != "" {
+		ours := ch.Reply
+		if old, err := loadState(ins.Paths); ins.Paths.Container && err == nil && old.ReplyVia != "" {
+			ours = true // the container keeps no record: the installed state says the option was ours
+		}
+		if c := replyConflict(rules, routes, ours); c != "" {
 			return fmt.Errorf("策略路由表 %s 已经被其他配置使用（%s），安装器不会动它", replyTable, c)
 		}
 	}
@@ -925,6 +952,10 @@ func lookupVia(server, name string) ([]net.IP, error) {
 // rollbackNetwork takes the live network changes back after a failed installation (files stay, so a retry or
 // the uninstaller finds them). It does nothing when the installer has not changed the network.
 func (ins *Installer) rollbackNetwork(log Logger) {
+	if ins.Paths.Container {
+		containerTeardown(ins.Paths, log)
+		return
+	}
 	ch, err := loadChanges(ins.Paths)
 	if err != nil {
 		log.Logf("无法撤销网络：%v", err)

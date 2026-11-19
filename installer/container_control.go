@@ -23,8 +23,21 @@ type svcRequest struct {
 	Name   string `json:"name"`
 }
 
-func controlHandler(sup *supervisor) http.Handler {
+func controlHandler(sup *supervisor, host *wizardHost) http.Handler {
 	mux := http.NewServeMux()
+	// `atom-installer reconfigure` asks for a wizard beside the panel (container.md 6.3)
+	mux.HandleFunc("POST /reconfigure", func(w http.ResponseWriter, r *http.Request) {
+		if host == nil {
+			writeErr(w, 503, "没有安装向导的宿主")
+			return
+		}
+		out, err := host.reconfigure()
+		if err != nil {
+			writeErr(w, 409, err.Error())
+			return
+		}
+		writeResp(w, 200, out)
+	})
 	mux.HandleFunc("POST /svc", func(w http.ResponseWriter, r *http.Request) {
 		var req svcRequest
 		if decodeMaintenance(r, &req) != nil {
@@ -84,7 +97,7 @@ func listenUnix(path string) (net.Listener, error) {
 }
 
 // serveContainerSockets serves the control socket and the maintenance socket; the returned function closes both.
-func serveContainerSockets(p Paths, sup *supervisor) (func(), error) {
+func serveContainerSockets(p Paths, sup *supervisor, host *wizardHost) (func(), error) {
 	if err := os.MkdirAll(p.Run(""), 0o700); err != nil {
 		return nil, err
 	}
@@ -107,7 +120,7 @@ func serveContainerSockets(p Paths, sup *supervisor) (func(), error) {
 		path    string
 		handler http.Handler
 	}{
-		{p.Run(controlSocket), controlHandler(sup)},
+		{p.Run(controlSocket), controlHandler(sup, host)},
 		{p.Run(maintenanceSocket), http.HandlerFunc(containerMaintenance(p).handler)},
 	} {
 		ln, err := listenUnix(s.path)

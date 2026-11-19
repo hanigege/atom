@@ -218,6 +218,9 @@ type backupItem struct {
 // and the copy of the shipped package a reset installs from.
 func (ins *Installer) backupItems() []backupItem {
 	p := ins.Paths
+	if p.Container {
+		return ins.containerBackupItems()
+	}
 	items := []backupItem{
 		{path: filepath.Join(p.Root, "bin"), name: "bin"},
 		{path: filepath.Join(p.Root, "etc"), name: "etc"},

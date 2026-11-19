@@ -94,14 +94,20 @@ func loadContainerNetwork(p Paths) error {
 		return err
 	}
 	if st.ReplyVia != "" {
+		// With forwarding off the kernel takes a redirect when either "all" or the interface accepts them, so both
+		// are turned off. /proc/sys is read-only in Docker: the values are then to come from the compose file.
+		var lines []string
 		for _, dev := range []string{"all", st.LAN[0]} {
 			f := "/proc/sys/net/ipv4/conf/" + dev + "/accept_redirects"
 			if v, err := os.ReadFile(f); err == nil && strings.TrimSpace(string(v)) == "0" {
 				continue
 			}
 			if err := os.WriteFile(f, []byte("0"), 0o644); err != nil {
-				return fmt.Errorf("不能关闭 %s（%v）：在 compose 的 sysctls 里加 net.ipv4.conf.%s.accept_redirects=0", f, err, dev)
+				lines = append(lines, "net.ipv4.conf."+dev+".accept_redirects=0")
 			}
+		}
+		if len(lines) > 0 {
+			return fmt.Errorf("不能关闭 accept_redirects（/proc/sys 是只读的）：在 compose 的 sysctls 里加 [%s]", strings.Join(lines, ", "))
 		}
 	}
 	out, err := exec.Command("/bin/sh", p.Lib("policy-route.sh")).CombinedOutput()
@@ -143,17 +149,28 @@ func cmdContainer([]string) int {
 	sup := newSupervisor(p, containerSpecs(p), os.Stdout)
 	sigs := make(chan os.Signal, 4)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
-	closeSockets, err := serveContainerSockets(p, sup)
+	host := newWizardHost(p, sup)
+	setWizardHost(host)
+	closeSockets, err := serveContainerSockets(p, sup, host)
 	if err != nil {
 		sup.Logf("%v", err)
 		return 1
 	}
 	defer closeSockets()
 
+	failed := make(chan struct{})
 	st, err := loadState(p)
 	if err != nil || !st.Complete {
-		sup.Logf("%s 没有已完成的安装；安装向导还没有实现", p.State())
-		return 1
+		// no installation: the wizard, then the services it started carry on
+		sup.Logf("还没有完成的安装，启动安装向导")
+		stop := make(chan struct{})
+		go func() {
+			if err := runFirstWizard(p, sup, host, stop); err != nil {
+				sup.Logf("%v", err)
+				close(failed)
+			}
+		}()
+		return waitForStop(sup, sigs, failed, stop)
 	}
 	if c := compareVersions(version, st.Version); version != "dev" && c < 0 {
 		sup.Logf("镜像版本 %s 比数据的版本 %s 旧，拒绝启动；请换回新版镜像", version, st.Version)
@@ -162,8 +179,11 @@ func cmdContainer([]string) int {
 		sup.Logf("镜像版本 %s 比数据的版本 %s 新；数据迁移还没有实现，数据照原样使用", version, st.Version)
 	}
 	// the network and the start run beside the signal wait: a SIGTERM in the middle of them is answered
-	failed := make(chan struct{})
 	go func() {
+		// a stop before the first wizard moved the panel from its temporary port: it moves now
+		if _, err := ensurePanelPort(p, st); err != nil {
+			sup.Logf("面板端口 %d 没有写进配置：%v", st.PanelPort, err)
+		}
 		if err := loadContainerNetwork(p); err != nil {
 			sup.Logf("加载网络失败（检查 NET_ADMIN 和内核的 nft_tproxy、nft_socket）：%v", err)
 			close(failed)
@@ -172,11 +192,20 @@ func cmdContainer([]string) int {
 		sup.Logf("atom %s 启动，面板端口 %d", st.Version, st.PanelPort)
 		sup.boot()
 	}()
+	return waitForStop(sup, sigs, failed, nil)
+}
+
+// waitForStop runs the container until a signal comes (the services stop, 0) or failed is closed (1). stop, when
+// not nil, is closed at the signal.
+func waitForStop(sup *supervisor, sigs <-chan os.Signal, failed <-chan struct{}, stop chan struct{}) int {
 	select {
 	case <-failed:
 		return 1
 	case sig := <-sigs:
 		go sup.Logf("收到 %v，停止服务", sig) // a log sink that does not read must not hold the shutdown
+	}
+	if stop != nil {
+		close(stop)
 	}
 	start := time.Now()
 	sup.shutdown()

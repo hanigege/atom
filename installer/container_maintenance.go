@@ -25,8 +25,8 @@ func (c containerMaint) handler(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "容器版通过更换镜像更新")
 	case r.URL.Path == "/network":
 		writeErr(w, 400, "容器版的网络设置在容器里运行 atom-installer reconfigure 修改")
-	case r.URL.Path == "/reset":
-		writeErr(w, 400, "容器版的重置还没有实现")
+	case r.Method == "POST" && r.URL.Path == "/reset":
+		c.start(w, r) // the same job as on a machine; the wizard it starts is the entry process's own (container_wizard.go)
 	default:
 		writeErr(w, 404, "没有这个维护接口")
 	}
@@ -38,5 +38,19 @@ func (c containerMaint) overview(w http.ResponseWriter) {
 		writeErr(w, 503, "没有已完成的 Atom 安装")
 		return
 	}
-	writeResp(w, 200, map[string]any{"version": st.Version, "online": false, "deployment": "container"})
+	view := map[string]any{"version": st.Version, "online": false, "deployment": "container"}
+	if job := c.currentJob(); job != nil && !(job.Done && job.Kind == "reset" && job.Phase == "reset" && st.InstalledAt.After(job.Updated)) {
+		view["job"] = job // a reset the panel is following; one that was done before this installation is not
+	}
+	writeResp(w, 200, view)
+}
+
+func (c containerMaint) currentJob() *maintenanceJob {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.job == nil {
+		return nil
+	}
+	job := *c.job
+	return &job
 }

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,10 +39,15 @@ type Server struct {
 	opMu    sync.Mutex // one free action at a time, and not while a job starts
 
 	reset *resetRun // the wizard resets the installed atom first (reset.go); nil otherwise
+
+	// container.go: the first installation of a container. The wizard has no idle limit and only a successful
+	// installation closes it; it holds the port of the panel, which atomdns takes over afterwards.
+	firstRun bool
+	probe    *probeCache // the capability probe of the environment step (container)
 }
 
 func newServer(ins *Installer, code string) *Server {
-	return &Server{ins: ins, code: code, seen: time.Now(), quit: make(chan struct{})}
+	return &Server{ins: ins, code: code, seen: time.Now(), quit: make(chan struct{}), probe: &probeCache{env: realProbeEnv()}}
 }
 
 func isPrivateRemote(remoteAddr string) bool {
@@ -170,6 +176,8 @@ type defaults struct {
 }
 
 type stateResp struct {
+	Deployment    string            `json:"deployment,omitempty"` // "container" in the container version
+	Container     *containerProbe   `json:"container,omitempty"`  // what the environment step shows there
 	Version       string            `json:"version"`
 	System        SystemInfo        `json:"system"`
 	Ifaces        []Iface           `json:"ifaces"`
@@ -198,9 +206,50 @@ type stateResp struct {
 	Reset *resetView `json:"reset,omitempty"`
 }
 
+// container says whether this is the container version.
+func (s *Server) container() bool { return s.ins.Paths.Container }
+
+// system is checkSystem for the machine, and for the container the capability probe: what is wrong with it is
+// listed as the problems of the system, which the page shows and does not go on with.
+func (s *Server) system(fresh bool) (SystemInfo, *containerProbe) {
+	if !s.container() {
+		return checkSystem(), nil
+	}
+	info := SystemInfo{Arch: runtime.GOARCH, Problems: []string{}}
+	info.Hostname, _ = os.Hostname()
+	data, _ := os.ReadFile("/etc/os-release")
+	info.OS = parseOSRelease(string(data))["PRETTY_NAME"]
+	pr := s.probe.get(fresh)
+	info.Problems = append(info.Problems, pr.Problems...)
+	return info, &pr
+}
+
+// validateConfig is Config.Validate with what the container changes: the topology is always the single NIC, the
+// only interface is the LAN, nobody else listens on a port, and the port of the wizard is free for the panel
+// (the installation moves it, see Installer.PanelTemp).
+func (s *Server) validateConfig(cfg *Config) []FieldError {
+	ifaces := listInterfaces()
+	if !s.container() {
+		return cfg.Validate(ifaces, s.ins.InstallerPort, s.busy())
+	}
+	cfg.Topology, cfg.WAN, cfg.LANGateway, cfg.ClientNets = "bypass", "", "", ""
+	if len(cfg.LAN) == 0 && len(ifaces) == 1 {
+		cfg.LAN = []string{ifaces[0].Name}
+	}
+	installerPort := s.ins.InstallerPort
+	if s.firstRun {
+		installerPort = 0
+	}
+	return cfg.Validate(ifaces, installerPort, func(int) string { return "" })
+}
+
 func (s *Server) state() stateResp {
-	r := stateResp{Version: s.ins.Version, System: checkSystem(), Ifaces: listInterfaces(), Addrs: privateAddrs(), InstallerPort: s.ins.InstallerPort,
+	sys, probe := s.system(false)
+	r := stateResp{Version: s.ins.Version, System: sys, Container: probe, Ifaces: listInterfaces(), Addrs: privateAddrs(), InstallerPort: s.ins.InstallerPort,
 		Defaults: defaults{defaultDomestic, defaultForeign, defaultFakeIP, defaultMixed, defaultPanel}}
+	if s.container() {
+		r.Deployment = "container"
+	}
 	if r.Ifaces == nil {
 		r.Ifaces = []Iface{}
 	}
@@ -210,7 +259,8 @@ func (s *Server) state() stateResp {
 	out, _ := quietCmd("ip", "-4", "route", "show")
 	r.Routes = parseViaRoutes(out)
 	r.Gateways = parseDefaultVia(out)
-	if occ, err := portOccupants(53); err != nil {
+	if s.container() { // the container has a network namespace of its own: nobody else is on port 53
+	} else if occ, err := portOccupants(53); err != nil {
 		r.ScanError = err.Error()
 		r.System.Problems = append(r.System.Problems, "需要 ss 命令（iproute2）来检查端口")
 	} else {
@@ -248,6 +298,10 @@ func (s *Server) state() stateResp {
 }
 
 func (s *Server) handleFree(w http.ResponseWriter, r *http.Request) {
+	if s.container() {
+		writeErr(w, 409, "容器里没有 53 端口的占用者")
+		return
+	}
 	var req struct {
 		Kind string `json:"kind"`
 		Unit string `json:"unit"`
@@ -346,11 +400,20 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 	cfg.fillDefaults()
 	cfg.keepData = s.keepExistingData()
 	cfg.currentUser = s.currentLoginUser()
-	errs := cfg.Validate(listInterfaces(), s.ins.InstallerPort, s.busy())
+	errs := s.validateConfig(&cfg)
 	if errs == nil {
 		errs = []FieldError{}
 	}
 	writeResp(w, 200, map[string]any{"errors": errs})
+}
+
+// panelTemp is the port atomdns runs on during the installation when the panel's port is the wizard's own (the
+// first wizard of a container holds it until it closes); 0: the panel's own.
+func (s *Server) panelTemp(panelPort int) (int, error) {
+	if !s.firstRun || panelPort != s.ins.InstallerPort {
+		return 0, nil
+	}
+	return freePort()
 }
 
 func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
@@ -368,19 +431,26 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 	cfg.fillDefaults()
 	cfg.keepData = s.keepExistingData()
 	cfg.currentUser = s.currentLoginUser()
-	if probs := checkSystem().Problems; len(probs) > 0 {
+	sys, _ := s.system(true)
+	if probs := sys.Problems; len(probs) > 0 {
 		writeErr(w, 400, strings.Join(probs, "；"))
 		return
 	}
-	if occ, err := portOccupants(53); err != nil || len(occ) > 0 {
+	if occ, err := portOccupants(53); !s.container() && (err != nil || len(occ) > 0) {
 		writeErr(w, 409, "53 端口被占用")
 		return
 	}
-	if errs := cfg.Validate(listInterfaces(), s.ins.InstallerPort, s.busy()); len(errs) > 0 {
+	if errs := s.validateConfig(&cfg); len(errs) > 0 {
 		writeResp(w, 400, map[string]any{"error": "配置不对", "errors": errs})
 		return
 	}
-	job := newJob(installSteps)
+	tmp, err := s.panelTemp(cfg.PanelPort)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	s.ins.PanelTemp = tmp
+	job := newJob(s.ins.stepNames())
 	s.mu.Lock()
 	s.job = job
 	s.mu.Unlock()
@@ -399,7 +469,7 @@ func (s *Server) keepExistingData() bool {
 func (s *Server) busyOrClosing() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	expired := time.Since(s.seen) >= idleLimit
+	expired := !s.firstRun && time.Since(s.seen) >= idleLimit
 	if s.reset != nil {
 		if s.reset.phase != resetReady {
 			return true
@@ -431,6 +501,9 @@ func (s *Server) requestClose() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.job != nil && !s.job.view(0).Done {
+		return false
+	}
+	if s.firstRun && (s.job == nil || !s.job.view(0).OK) { // nothing runs in the container until it is installed
 		return false
 	}
 	// after a reset began, only a successful installation ends the wizard: the machine has no DNS until then
@@ -481,7 +554,7 @@ func (s *Server) idleClose() bool {
 		}
 	}
 	s.mu.Lock()
-	expired := time.Since(s.seen) >= idleLimit
+	expired := !s.firstRun && time.Since(s.seen) >= idleLimit
 	var done, ok bool
 	var sinceFinish time.Duration
 	if s.job != nil {

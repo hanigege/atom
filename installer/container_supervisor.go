@@ -748,6 +748,14 @@ func (s *supervisor) Enable(ctx context.Context, name string) error {
 	})
 }
 
+// markReady lets requests through without starting anything: the wizard installs with the services it asks for.
+func (s *supervisor) markReady() {
+	done := make(chan struct{})
+	if s.post(func() { s.ready = true; close(done) }) {
+		<-done
+	}
+}
+
 // boot starts what services.json says, the kernels first and atomdns when they have started (or failed: they are
 // then tried again). It returns when that is done.
 func (s *supervisor) boot() {

@@ -130,6 +130,9 @@ var resetFiles = []string{"installer.json", "installer.pid", "installer.log"}
 // DNS service would keep port 53 and the data it serves) or a service file cannot be removed; and etc/ (the
 // install record and changes.json) goes last, so that a removal that failed half way can be tried again in full.
 func uninstallForReset(p Paths, keep []string, log Logger) (warning string, err error) {
+	if p.Container {
+		return containerUninstallForReset(p, log)
+	}
 	if err := stopForReset(p, log); err != nil {
 		return "", fmt.Errorf("旧的服务没有停下，未删除任何数据：%w", err)
 	}
