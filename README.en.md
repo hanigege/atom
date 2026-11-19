@@ -51,7 +51,7 @@ Each FakeIP answer carries the chosen group to the proxy core in an EDNS0 option
 
 ## Quick start
 
-A Debian 12+, Ubuntu 22.04+ or Alpine 3.19+ machine (x86_64 or aarch64, bare metal or VM; Docker and LXC containers are not supported), as root:
+A Debian 12+, Ubuntu 22.04+ or Alpine 3.19+ machine (x86_64 or aarch64, bare metal or VM), as root:
 
 ```bash
 curl -fsSL https://github.com/jasonxtt/atom/releases/latest/download/install.sh | sudo bash
@@ -63,6 +63,10 @@ Then, on your **main router**:
 
 1. Route the FakeIP range (default `28.0.0.0/8`) and any ranges you want proxied to atom's LAN IP.
 2. Set the clients' DNS server to atom's LAN IP, usually in the router's DHCP settings.
+
+### Docker and RouterOS
+
+atom also runs as a container (single-NIC side router): the image [`jasonxtt/atom`](https://hub.docker.com/r/jasonxtt/atom) for Docker with macvlan, or `atom-<version>-container-{amd64,arm64}.tar` from the Release for RouterOS. The container log shows the wizard's address and code. See section 7 of [docs/container.md](docs/container.md) (Chinese) for the compose file and the RouterOS setup.
 
 ## Repositories
 
