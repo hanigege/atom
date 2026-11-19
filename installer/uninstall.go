@@ -213,19 +213,19 @@ var serviceStopWait = 10 * time.Second
 // stopForReset stops atom's services and checks that they are stopped, before the reset deletes anything: a
 // stop or disable that fails, a service the service manager still reports running, or a process of atom's
 // programs that is still there is an error. It can be repeated: what an earlier attempt stopped and disabled
-// passes. The stops have their own time limits (runCmd); the wait after them, every query in it included, ends
-// at one deadline.
+// passes. The stops have their own time limits (runCmd); the status queries of the services whose files are gone
+// share one deadline, and the wait after the stops, every query in it included, ends at another.
 func stopForReset(p Paths, log Logger) error {
 	in := p.Init()
+	probe, cancelProbe := context.WithTimeout(context.Background(), serviceStopWait)
+	defer cancelProbe()
 	var failed []string
 	for _, n := range atomServices {
 		var err error
 		if _, statErr := os.Lstat(p.unitFile(n)); statErr == nil {
 			err = in.DisableNow(log, n)
 		} else {
-			ctx, cancel := context.WithTimeout(context.Background(), serviceStopWait)
-			running, rerr := serviceRunning(ctx, p, n)
-			cancel()
+			running, rerr := serviceRunning(probe, p, n)
 			if rerr != nil {
 				err = rerr
 			} else if running { // its file went in an earlier attempt, the service did not

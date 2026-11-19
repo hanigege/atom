@@ -1151,3 +1151,60 @@ func TestStatusQueriesKeepTheDeadline(t *testing.T) {
 	check("OpenRC stopForReset", func() error { return stopForReset(p, &recLogger{}) })
 	check("OpenRC verifyPurged", func() error { return verifyPurged(Paths{Root: t.TempDir(), OpenRC: true}) })
 }
+
+// Review finding (round 4, P2): a status query that times out once after the data is gone leaves the reset in
+// reset_failed; with nobody at the page, the idle timer tries the removal again and reaches ready, from which
+// the default installation is due.
+func TestResetRetriesARemovalThatDidNotComplete(t *testing.T) {
+	s := resetServer(t)
+	p := s.ins.Paths
+	installedForReset(t, s)
+	defer func() { resetUninstall = uninstallForReset }()
+	resetUninstall = func(p Paths, keep []string, log Logger) (string, error) {
+		for _, d := range []string{"data", "bin", "etc"} {
+			os.RemoveAll(filepath.Join(p.Root, d))
+		}
+		return "", nil
+	}
+	stub := fakeSystemctl(t, "")
+	os.WriteFile(filepath.Join(stub, "slow"), []byte("0.5"), 0o644)
+	setStopWait(t, 100*time.Millisecond)
+	s.runReset()
+	if v := s.state().Reset; v.Phase != resetPurgeFailed || hasData(p) || v.AutoInstall != nil {
+		t.Fatalf("the data is gone but the check timed out: %+v", v)
+	}
+
+	// before resetRetryEvery the timer waits; after it, it tries again
+	if _, hold := s.resetIdle(); !hold || s.state().Reset.Phase != resetPurgeFailed {
+		t.Fatal("no retry right after the failure")
+	}
+	os.Remove(filepath.Join(stub, "slow"))
+	s.mu.Lock()
+	s.reset.failedAt = time.Now().Add(-resetRetryEvery)
+	s.mu.Unlock()
+	if closed, hold := s.resetIdle(); closed || !hold {
+		t.Fatalf("the wizard stays: %v %v", closed, hold)
+	}
+	waitResetPhase(t, s, resetReady)
+	if v := s.state().Reset; v.AutoInstall == nil || v.Job.Steps[1].Status != "ok" {
+		t.Errorf("the default installation is due after the retry: %+v", v)
+	}
+}
+
+// Review finding (round 4, P3): on a retry whose service files are gone, the status queries of those services
+// share one deadline instead of one each.
+func TestStopForResetProbesShareTheDeadline(t *testing.T) {
+	p := Paths{Root: t.TempDir(), UnitDir: t.TempDir()}
+	stub := fakeSystemctl(t, "")
+	os.WriteFile(filepath.Join(stub, "slow"), []byte("1"), 0o644)
+	setStopWait(t, 100*time.Millisecond)
+	start := time.Now()
+	err := stopForReset(p, &recLogger{})
+	// one query may run past the deadline by queryCmd's WaitDelay (200ms); four of them, one each, took 1.2s
+	if took := time.Since(start); took > 500*time.Millisecond {
+		t.Errorf("%d queries of missing services took %v with a deadline of 100ms", len(atomServices), took)
+	}
+	if err == nil {
+		t.Error("a service manager that does not answer in time is not an answer")
+	}
+}

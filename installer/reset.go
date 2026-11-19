@@ -38,11 +38,16 @@ const (
 	resetBackingUp = "resetting" // checks and the data backup; nothing changed yet
 	resetPurging   = "purging"   // atom is being taken off the machine
 	resetFailed    = "failed"    // refused before anything changed; the wizard exits
-	// resetPurgeFailed: the data is backed up but atom is not (all) off the machine; the wizard stays and the page
-	// offers to try the removal again (POST /api/reset). No installation is possible until it succeeded.
+	// resetPurgeFailed: the data is backed up but atom is not (all) off the machine; the wizard stays, the page
+	// offers to try the removal again (POST /api/reset) and the idle timer tries it every resetRetryEvery. No
+	// installation is possible until it succeeded.
 	resetPurgeFailed = "reset_failed"
 	resetReady       = "ready" // atom is verified gone; a new installation follows
 )
+
+// resetRetryEvery is how often the wizard tries a removal that did not complete again by itself, so that a
+// passing failure does not keep the network down when nobody is at the page; a variable for the tests.
+var resetRetryEvery = time.Minute
 
 // resetUninstall takes atom off the machine for the reset; a variable for the tests.
 var resetUninstall = uninstallForReset
@@ -421,6 +426,7 @@ type resetRun struct {
 	backup   string    // the copy of the data
 	plan     resetPlan // the default installation
 	purgedAt time.Time
+	failedAt time.Time // the last removal that did not complete
 
 	listen  listenInfo // published in runFile for the maintenance service
 	runFile string
@@ -501,11 +507,30 @@ func (s *Server) publishReset() {
 func (s *Server) setResetPhase(phase, msg string) {
 	s.mu.Lock()
 	s.reset.phase, s.reset.err = phase, msg
-	if phase == resetReady {
+	switch phase {
+	case resetReady:
 		s.reset.purgedAt = time.Now()
+	case resetPurgeFailed:
+		s.reset.failedAt = time.Now()
 	}
 	s.mu.Unlock()
 	s.publishReset()
+}
+
+// retryPurge tries the removal again from resetPurgeFailed (the data is backed up already: only the removal
+// runs); false when the reset is not there. With s.opMu held.
+func (s *Server) retryPurge() bool {
+	s.mu.Lock()
+	retry := s.reset.phase == resetPurgeFailed && !s.closing
+	if retry {
+		s.reset.phase, s.reset.err = resetPurging, ""
+	}
+	s.mu.Unlock()
+	if retry {
+		s.publishReset()
+		go s.purgeForReset()
+	}
+	return retry
 }
 
 // handleReset starts the reset: the browser has the code, so this is the user who confirmed it in the panel.
@@ -516,25 +541,20 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
-	s.mu.Lock()
-	phase, closing, late := s.reset.phase, s.closing, time.Now().After(s.reset.deadline)
-	retry := phase == resetPurgeFailed && !closing
-	if phase == resetWaiting && !closing && !late {
-		s.reset.phase = resetBackingUp
-	} else if retry {
-		s.reset.phase, s.reset.err = resetPurging, ""
-	}
-	s.mu.Unlock()
-	switch {
-	case retry:
-		// the data is backed up already: only the removal is tried again
-		s.publishReset()
-		go s.purgeForReset()
+	if s.retryPurge() {
 		s.mu.Lock()
 		v := s.resetState()
 		s.mu.Unlock()
 		writeResp(w, 202, v)
 		return
+	}
+	s.mu.Lock()
+	phase, closing, late := s.reset.phase, s.closing, time.Now().After(s.reset.deadline)
+	if phase == resetWaiting && !closing && !late {
+		s.reset.phase = resetBackingUp
+	}
+	s.mu.Unlock()
+	switch {
 	case phase != resetWaiting:
 		s.mu.Lock()
 		v := s.resetState()
@@ -777,12 +797,12 @@ func freeForDefault(p Paths, plan resetPlan, log Logger) error {
 	return nil
 }
 
-// resetIdle decides for the idle timer while the wizard resets: it keeps the wizard open (and starts the
-// default installation when it is due) until an installation succeeded; a reset nobody asked for in time ends
+// resetIdle decides for the idle timer while the wizard resets: it keeps the wizard open (tries a removal that
+// did not complete again, and starts the default installation when it is due) until an installation succeeded; a reset nobody asked for in time ends
 // the wizard (closed). hold false: the normal rules apply.
 func (s *Server) resetIdle() (closed, hold bool) {
 	s.mu.Lock()
-	phase, deadline := s.reset.phase, s.reset.deadline
+	phase, deadline, failedAt := s.reset.phase, s.reset.deadline, s.reset.failedAt
 	installed := s.job != nil && s.job.view(0).Done && s.job.view(0).OK
 	at, due := time.Time{}, false
 	if phase == resetReady {
@@ -795,6 +815,14 @@ func (s *Server) resetIdle() (closed, hold bool) {
 			stderrLogger{}.Logf("%d 分钟内没有浏览器打开安装向导，重置已取消", int(resetWait/time.Minute))
 			s.stop(false)
 			return true, true
+		}
+	case resetPurgeFailed:
+		if time.Since(failedAt) >= resetRetryEvery {
+			s.opMu.Lock()
+			if s.retryPurge() {
+				s.reset.steps.Logf("自动重试移除旧的安装")
+			}
+			s.opMu.Unlock()
 		}
 	case resetReady:
 		if installed {
