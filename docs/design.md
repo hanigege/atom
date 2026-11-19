@@ -569,6 +569,10 @@ Atom 在侧栏和「设置 → 系统更新」显示已提交的整包版本。D
 
 **组件状态和重启（2026-11-19，用户定）**：「设置 → 系统」的「组件」表格经管理 API 转到维护服务，代码在 `installer/maintenance_services.go`。`GET /services` 列出已安装的 `atom-maintenance`、`atom-dns` 和当前选中的代理内核（`atom-sing-box` 或 `atom-mihomo`，按 `atom_proxy.json` 的 `backend`；没选中的那个和它共用端口与 nft 集合，必须保持停止，所以不列出、不能重启）和状态（`running`、`stopped`、`failed`、`unknown`；systemd 看 `systemctl is-active`，OpenRC 看 `rc-service status` 的退出码，几个查询并行、共用 3 秒时限，答不上来就是 `unknown`）。`POST /restart`（`{"service":"atom-dns"}`）先回 202 再重启：未知、没安装的服务和没选中的内核 400；有维护任务、待恢复的记录或别的命令持有操作锁时 409；重启期间持有操作锁，并像升级一样独占面板写锁 `maintenance-writes.lock`（面板切换内核时持有它的共享锁），拿到写锁后才判断当前内核；`atom_proxy.json` 的 `backend` 只认 `sing-box`、`singbox`、`mihomo`，读不到、`null` 或其他值都按「无法确定当前内核」处理，拒绝重启内核。维护服务重启自己时：systemd 用 `systemctl restart --no-block` 交出任务，然后一直持锁，直到被停掉（锁随进程释放），2 分钟还没被停才放锁；OpenRC 在单独的会话里跑 `rc-service atom-maintenance restart`，服务管理器停掉维护服务时它还在，它先返回就说明没重启成功，放锁；同样最多等 2 分钟，到时放锁，`rc-service` 不杀，可能还在跑。普通服务的重启走 `runCmd`（60 秒超时）；超时后关掉输出管道，即使重启脚本派生的子进程还拿着输出，也一定返回并放锁。
 
+### 9.8 容器版（草案）
+
+2026-11-19 用户定：支持 Docker（macvlan）和 RouterOS container，只做单网卡，仍走网页向导，用 nft redirect + TProxy。设计和 ROS 实测见 [container.md](container.md)。
+
 ## 10. 仓库与版本
 
 ```text
