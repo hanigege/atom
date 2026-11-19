@@ -34,15 +34,15 @@ func controlHandler(sup *supervisor) http.Handler {
 		var err error
 		switch req.Action {
 		case "start":
-			err = sup.Start(req.Name)
+			err = sup.Start(r.Context(), req.Name)
 		case "stop":
-			err = sup.Stop(req.Name)
+			err = sup.Stop(r.Context(), req.Name)
 		case "restart":
-			err = sup.Restart(req.Name)
+			err = sup.Restart(r.Context(), req.Name)
 		case "reload":
-			err = sup.Reload(req.Name)
+			err = sup.Reload(r.Context(), req.Name)
 		case "enable":
-			err = sup.Enable(req.Name)
+			err = sup.Enable(r.Context(), req.Name)
 		default:
 			writeErr(w, 400, "无效的操作 "+req.Action)
 			return

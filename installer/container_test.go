@@ -36,6 +36,8 @@ func (s *syncBuf) String() string {
 	return s.b.String()
 }
 
+var bg = context.Background()
+
 func containerPaths(t *testing.T) Paths {
 	t.Helper()
 	run, err := os.MkdirTemp("", "ac") // a short path: unix socket paths are limited to about 100 bytes
@@ -65,7 +67,7 @@ func testSup(t *testing.T, p Paths, specs ...serviceSpec) (*supervisor, *syncBuf
 	t.Helper()
 	out := &syncBuf{}
 	s := newSupervisor(p, specs, out)
-	s.ready.Store(true)
+	s.post(func() { s.ready = true })
 	t.Cleanup(s.shutdown)
 	return s, out
 }
@@ -194,7 +196,7 @@ func TestSupervisorStartStopAndLogs(t *testing.T) {
 	if s.list()[0].State != "stopped" {
 		t.Fatal("not stopped at first")
 	}
-	if err := s.Start("atom-dns.service"); err != nil { // the .service suffix is accepted
+	if err := s.Start(bg, "atom-dns.service"); err != nil { // the .service suffix is accepted
 		t.Fatal(err)
 	}
 	if st := s.list()[0]; st.State != "running" || st.PID == 0 || st.Desired != "running" {
@@ -208,13 +210,13 @@ func TestSupervisorStartStopAndLogs(t *testing.T) {
 	if len(lines) != 2 {
 		t.Errorf("ring: %v", lines)
 	}
-	if err := s.Stop("atom-dns"); err != nil {
+	if err := s.Stop(bg, "atom-dns"); err != nil {
 		t.Fatal(err)
 	}
 	if st := s.list()[0]; st.State != "stopped" || st.Desired != "stopped" {
 		t.Fatalf("%+v", st)
 	}
-	if err := s.Start("nope"); err == nil {
+	if err := s.Start(bg, "nope"); err == nil {
 		t.Error("unknown service started")
 	}
 }
@@ -235,7 +237,7 @@ func TestSupervisorRestartsAfterACrashButNotAfterACleanExit(t *testing.T) {
 	crash := shSpec("atom-sing-box", `echo x >> `+marks+`; exec sleep 30`)
 	clean := shSpec("atom-mihomo", `exit 0`)
 	s, _ := testSup(t, p, crash, clean)
-	if err := s.Start("atom-sing-box"); err != nil {
+	if err := s.Start(bg, "atom-sing-box"); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "first start", func() bool { data, _ := os.ReadFile(marks); return strings.Count(string(data), "x") == 1 })
@@ -243,7 +245,7 @@ func TestSupervisorRestartsAfterACrashButNotAfterACleanExit(t *testing.T) {
 	syscall.Kill(pid, syscall.SIGKILL)
 	waitFor(t, "restart", func() bool { st := s.list()[0]; return st.State == "running" && st.PID != pid })
 	waitFor(t, "second start", func() bool { data, _ := os.ReadFile(marks); return strings.Count(string(data), "x") == 2 })
-	if err := s.Start("atom-mihomo"); err != nil {
+	if err := s.Start(bg, "atom-mihomo"); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "clean exit", func() bool { return s.list()[1].State == "stopped" })
@@ -270,7 +272,7 @@ func TestSupervisorPreFailureAndRetry(t *testing.T) {
 		return nil
 	}
 	s, _ := testSup(t, p, sp)
-	if err := s.Start("atom-sing-box"); err == nil {
+	if err := s.Start(bg, "atom-sing-box"); err == nil {
 		t.Fatal("start did not fail")
 	}
 	if s.list()[0].Desired != "stopped" || s.list()[0].State != "stopped" {
@@ -303,7 +305,7 @@ func TestSupervisorReload(t *testing.T) {
 	sp.Reload = func() error { hooks = append(hooks, "reload"); return nil }
 	s, out := testSup(t, p, sp)
 	// not running: a reload starts it (reload-or-restart)
-	if err := s.Reload("atom-sing-box"); err != nil {
+	if err := s.Reload(bg, "atom-sing-box"); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Join(hooks, ",") != "pre" || s.list()[0].State != "running" {
@@ -311,7 +313,7 @@ func TestSupervisorReload(t *testing.T) {
 	}
 	waitFor(t, "trap set", func() bool { return strings.Contains(out.String(), "ready") })
 	pid := s.list()[0].PID
-	if err := s.Reload("atom-sing-box"); err != nil {
+	if err := s.Reload(bg, "atom-sing-box"); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "SIGHUP", func() bool { d, _ := os.ReadFile(hups); return strings.Count(string(d), "h") == 1 })
@@ -322,8 +324,8 @@ func TestSupervisorReload(t *testing.T) {
 	sp2 := shSpec("atom-mihomo", `exec sleep 30`)
 	sp2.Reload = func() error { return os.ErrPermission }
 	s2, _ := testSup(t, p, sp2)
-	s2.Start("atom-mihomo")
-	if err := s2.Reload("atom-mihomo"); err == nil {
+	s2.Start(bg, "atom-mihomo")
+	if err := s2.Reload(bg, "atom-mihomo"); err == nil {
 		t.Error("reload ignored the failing hook")
 	}
 }
@@ -334,16 +336,16 @@ func TestSupervisorRestartAndDesiredState(t *testing.T) {
 	if got := s.desired(); !got["atom-dns"] || got["atom-sing-box"] {
 		t.Errorf("default desired state %v", got)
 	}
-	s.Start("atom-sing-box")
-	s.Start("atom-dns")
+	s.Start(bg, "atom-sing-box")
+	s.Start(bg, "atom-dns")
 	pid := s.list()[0].PID
-	if err := s.Restart("atom-sing-box"); err != nil {
+	if err := s.Restart(bg, "atom-sing-box"); err != nil {
 		t.Fatal(err)
 	}
 	if st := s.list()[0]; st.State != "running" || st.PID == pid {
 		t.Errorf("restart: %+v", st)
 	}
-	s.Stop("atom-sing-box")
+	s.Stop(bg, "atom-sing-box")
 	var m map[string]string
 	if err := readJSON(p.Etc(servicesFile), &m); err != nil || m["atom-dns"] != "running" || m["atom-sing-box"] != "stopped" {
 		t.Errorf("services.json %v %v", m, err)
@@ -376,7 +378,7 @@ func TestShutdownStopsAtomdnsFirstAndKillsWhatIgnoresTerm(t *testing.T) {
 	stopWait = 300 * time.Millisecond
 	defer func() { stopWait = old }()
 	for _, n := range []string{"atom-sing-box", "atom-mihomo", "atom-dns"} {
-		if err := s.Start(n); err != nil {
+		if err := s.Start(bg, n); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -507,7 +509,7 @@ func TestContainerMaintenance(t *testing.T) {
 	}
 	// components: atomdns and the selected kernel only; atom-maintenance is not listed
 	selectKernel(t, p, "mihomo")
-	s.Start("atom-mihomo")
+	s.Start(bg, "atom-mihomo")
 	code, m = do("GET", "/services", "")
 	list, _ := m["services"].([]any)
 	if code != 200 || len(list) != 2 {
@@ -570,7 +572,7 @@ func TestNothingStartsDuringShutdown(t *testing.T) {
 	p := containerPaths(t)
 	s, _ := testSup(t, p, shSpec("atom-dns", `exec sleep 30`))
 	s.shutdown()
-	for name, err := range map[string]error{"start": s.Start("atom-dns"), "restart": s.Restart("atom-dns"), "reload": s.Reload("atom-dns")} {
+	for name, err := range map[string]error{"start": s.Start(bg, "atom-dns"), "restart": s.Restart(bg, "atom-dns"), "reload": s.Reload(bg, "atom-dns")} {
 		if !errors.Is(err, errClosing) {
 			t.Errorf("%s during shutdown: %v", name, err)
 		}
@@ -586,18 +588,18 @@ func TestOnlyOneKernelRuns(t *testing.T) {
 	sb, mh := shSpec("atom-sing-box", `exec sleep 30`), shSpec("atom-mihomo", `exec sleep 30`)
 	sb.Group, mh.Group = "kernel", "kernel"
 	s, _ := testSup(t, p, sb, mh)
-	if err := s.Start("atom-sing-box"); err != nil {
+	if err := s.Start(bg, "atom-sing-box"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Start("atom-mihomo"); err == nil || s.list()[1].State != "stopped" {
+	if err := s.Start(bg, "atom-mihomo"); err == nil || s.list()[1].State != "stopped" {
 		t.Errorf("a second kernel started: %v", err)
 	}
-	if err := s.Reload("atom-mihomo"); err == nil {
+	if err := s.Reload(bg, "atom-mihomo"); err == nil {
 		t.Error("a second kernel was reloaded into running")
 	}
 	// the switch of atomdns: the old one is stopped, then the new one reloaded
-	s.Stop("atom-sing-box")
-	if err := s.Reload("atom-mihomo"); err != nil {
+	s.Stop(bg, "atom-sing-box")
+	if err := s.Reload(bg, "atom-mihomo"); err != nil {
 		t.Fatal(err)
 	}
 	// both marked running (hand edited, or a crash between the two writes): the selected one starts
@@ -641,7 +643,7 @@ func TestReloadDuringTheRetryWaitStartsNow(t *testing.T) {
 	mu.Lock()
 	ready = true
 	mu.Unlock()
-	if err := s.Reload("atom-sing-box"); err != nil || s.list()[0].State != "running" {
+	if err := s.Reload(bg, "atom-sing-box"); err != nil || s.list()[0].State != "running" {
 		t.Errorf("reload in the wait: %v, %s", err, s.list()[0].State)
 	}
 }
@@ -656,7 +658,7 @@ func TestServicesJSONProblems(t *testing.T) {
 		if _, err := s.loadDesired(); !errors.Is(err, errServicesCorrupt) {
 			t.Errorf("%s: %v", bad, err)
 		}
-		if err := s.Enable("atom-sing-box"); err != nil {
+		if err := s.Enable(bg, "atom-sing-box"); err != nil {
 			t.Errorf("%s: %v", bad, err)
 		}
 		var m map[string]string
@@ -667,17 +669,17 @@ func TestServicesJSONProblems(t *testing.T) {
 	// a file that cannot be read or written is an error of the call, not a silent default
 	os.Remove(p.Etc(servicesFile))
 	os.MkdirAll(p.Etc(servicesFile), 0o755) // a directory where the file should be
-	s.Start("atom-dns")                     // fails to record: the start is taken back
+	s.Start(bg, "atom-dns")                 // fails to record: the start is taken back
 	if s.list()[0].State != "stopped" {
 		t.Error("a start that cannot be recorded stayed")
 	}
 	os.Remove(p.Etc(servicesFile))
-	if err := s.Start("atom-dns"); err != nil {
+	if err := s.Start(bg, "atom-dns"); err != nil {
 		t.Fatal(err)
 	}
 	os.Remove(p.Etc(servicesFile))
 	os.MkdirAll(filepath.Join(p.Etc(servicesFile), "x"), 0o755) // a directory where the file should be
-	if err := s.Stop("atom-dns"); err == nil || s.list()[0].State != "running" {
+	if err := s.Stop(bg, "atom-dns"); err == nil || s.list()[0].State != "running" {
 		t.Errorf("a stop that cannot be recorded happened: %v %s", err, s.list()[0].State)
 	}
 }
@@ -686,13 +688,13 @@ func TestStopKillsWhatTheServiceStarted(t *testing.T) {
 	p := containerPaths(t)
 	child := filepath.Join(t.TempDir(), "child")
 	s, _ := testSup(t, p, shSpec("atom-dns", `sleep 30 & echo $! > `+child+`; wait`))
-	if err := s.Start("atom-dns"); err != nil {
+	if err := s.Start(bg, "atom-dns"); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "child", func() bool { d, _ := os.ReadFile(child); return len(d) > 0 })
 	d, _ := os.ReadFile(child)
 	pid, _ := strconv.Atoi(strings.TrimSpace(string(d)))
-	s.Stop("atom-dns")
+	s.Stop(bg, "atom-dns")
 	waitFor(t, "child gone", func() bool { return syscall.Kill(pid, 0) != nil })
 }
 
@@ -715,8 +717,8 @@ func TestOverlappingKernelStartsDoNotBothRun(t *testing.T) {
 	}
 	s, _ := testSup(t, p, mk("atom-sing-box"), mk("atom-mihomo"))
 	errs := make(chan error, 2)
-	go func() { errs <- s.Start("atom-sing-box") }()
-	go func() { errs <- s.Start("atom-mihomo") }()
+	go func() { errs <- s.Start(bg, "atom-sing-box") }()
+	go func() { errs <- s.Start(bg, "atom-mihomo") }()
 	<-in // one is inside its hook; the other must be waiting for the slot, not in its hook
 	select {
 	case <-in:
@@ -758,7 +760,7 @@ func TestFailedReloadInTheRetryWaitKeepsRetrying(t *testing.T) {
 	os.MkdirAll(p.Etc(""), 0o755)
 	os.WriteFile(p.Etc(servicesFile), []byte(`{"atom-sing-box":"running"}`), 0o644)
 	s.boot()
-	if err := s.Reload("atom-sing-box"); err == nil {
+	if err := s.Reload(bg, "atom-sing-box"); err == nil {
 		t.Fatal("reload with a failing hook succeeded")
 	}
 	if s.list()[0].State != "failed" {
@@ -774,10 +776,10 @@ func TestRequestsBeforeTheBootAreRefused(t *testing.T) {
 	p := containerPaths(t)
 	s := newSupervisor(p, []serviceSpec{shSpec("atom-dns", `exec sleep 30`)}, &syncBuf{})
 	defer s.shutdown()
-	if err := s.Start("atom-dns"); !errors.Is(err, errNotReady) {
+	if err := s.Start(bg, "atom-dns"); !errors.Is(err, errNotReady) {
 		t.Errorf("start before the boot: %v", err)
 	}
-	if err := s.Reload("atom-dns"); !errors.Is(err, errNotReady) {
+	if err := s.Reload(bg, "atom-dns"); !errors.Is(err, errNotReady) {
 		t.Errorf("reload before the boot: %v", err)
 	}
 }
@@ -827,17 +829,17 @@ func TestAKernelInTheRetryWaitKeepsItsSlot(t *testing.T) {
 	if s.list()[0].State != "failed" {
 		t.Fatalf("state %s", s.list()[0].State)
 	}
-	if err := s.Start("atom-mihomo"); !errors.Is(err, errGroupBusy) {
+	if err := s.Start(bg, "atom-mihomo"); !errors.Is(err, errGroupBusy) {
 		t.Errorf("the other kernel started in the retry wait: %v", err)
 	}
 	// the one that waits is not ended by a refused start of the other, and its own stop frees the slot
 	if s.list()[0].State != "failed" || s.list()[1].State != "stopped" {
 		t.Errorf("%+v", s.list())
 	}
-	if err := s.Stop("atom-sing-box"); err != nil {
+	if err := s.Stop(bg, "atom-sing-box"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Start("atom-mihomo"); err != nil {
+	if err := s.Start(bg, "atom-mihomo"); err != nil {
 		t.Errorf("after the stop: %v", err)
 	}
 }
@@ -845,13 +847,13 @@ func TestAKernelInTheRetryWaitKeepsItsSlot(t *testing.T) {
 func TestDuplicateStartThatCannotBeRecordedKeepsTheService(t *testing.T) {
 	p := containerPaths(t)
 	s, _ := testSup(t, p, shSpec("atom-dns", `exec sleep 30`))
-	if err := s.Start("atom-dns"); err != nil {
+	if err := s.Start(bg, "atom-dns"); err != nil {
 		t.Fatal(err)
 	}
 	pid := s.list()[0].PID
 	os.Remove(p.Etc(servicesFile))
 	os.MkdirAll(filepath.Join(p.Etc(servicesFile), "x"), 0o755)
-	if err := s.Start("atom-dns"); err == nil {
+	if err := s.Start(bg, "atom-dns"); err == nil {
 		t.Error("no error")
 	}
 	if st := s.list()[0]; st.State != "running" || st.PID != pid {
@@ -859,20 +861,86 @@ func TestDuplicateStartThatCannotBeRecordedKeepsTheService(t *testing.T) {
 	}
 }
 
-func TestTwoStopsWaitForTheSameEnd(t *testing.T) {
+func TestStaleStartResultIsDroppedAndItsProcessKilled(t *testing.T) {
 	p := containerPaths(t)
-	s, _ := testSup(t, p, shSpec("atom-dns", `trap 'sleep 0.3; exit 0' TERM; echo up; while :; do sleep 0.05; done`))
-	if err := s.Start("atom-dns"); err != nil {
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	sp := shSpec("atom-dns", `sleep 0.4; echo started > `+pidFile+`; exec sleep 30`)
+	hold := make(chan struct{})
+	sp.Pre = func() error { <-hold; return nil }
+	s, _ := testSup(t, p, sp)
+	first := make(chan error, 1)
+	go func() { first <- s.Start(bg, "atom-dns") }()
+	waitFor(t, "start under way", func() bool { return startingPhase(s) })
+	if err := s.Stop(bg, "atom-dns"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(200 * time.Millisecond)
-	v := s.svcs[0]
-	first := make(chan struct{})
-	go func() { v.end(); close(first) }()
-	time.Sleep(50 * time.Millisecond)
-	v.end() // returns only when the process is gone
-	if st := v.state(); st != "stopped" {
-		t.Errorf("second end returned with the service %s", st)
+	if err := <-first; !errors.Is(err, errSuperseded) {
+		t.Errorf("the start that was stopped: %v", err)
 	}
-	<-first
+	close(hold) // the hook comes back after the stop: its result is old, its process is killed at once
+	time.Sleep(800 * time.Millisecond)
+	if _, err := os.Stat(pidFile); err == nil {
+		t.Error("the process of the old start ran")
+	}
+	if st := s.list()[0]; st.State != "stopped" || st.PID != 0 {
+		t.Errorf("%+v", st)
+	}
+}
+
+func startingPhase(s *supervisor) bool {
+	ph := make(chan string, 1)
+	s.post(func() { ph <- s.svcs[0].phase })
+	return <-ph == phStarting
+}
+
+func TestCanceledRequestIsDropped(t *testing.T) {
+	p := containerPaths(t)
+	s, _ := testSup(t, p, shSpec("atom-dns", `exec sleep 30`))
+	ctx, cancel := context.WithCancel(bg)
+	cancel()
+	if err := s.Start(ctx, "atom-dns"); err == nil {
+		t.Error("a canceled request was served")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if s.list()[0].State != "stopped" {
+		t.Error("a canceled request started the service")
+	}
+}
+
+func TestStopDuringShutdownIsRefused(t *testing.T) {
+	p := containerPaths(t)
+	s, _ := testSup(t, p, shSpec("atom-sing-box", `exec sleep 30`),
+		shSpec("atom-dns", `trap 'sleep 0.4; exit 0' TERM; echo up; while :; do sleep 0.05; done`))
+	s.Start(bg, "atom-sing-box")
+	s.Start(bg, "atom-dns")
+	time.Sleep(200 * time.Millisecond)
+	down := make(chan struct{})
+	go func() { s.shutdown(); close(down) }()
+	waitFor(t, "shutdown under way", func() bool { return s.Stop(bg, "atom-sing-box") != nil })
+	if err := s.Stop(bg, "atom-sing-box"); !errors.Is(err, errClosing) {
+		t.Errorf("stop during shutdown: %v", err)
+	}
+	<-down
+}
+
+func TestShutdownTakesNoMoreThanTwiceStopWait(t *testing.T) {
+	p := containerPaths(t)
+	stubborn := func(n string) serviceSpec { return shSpec(n, `trap '' TERM; echo up; while :; do sleep 0.05; done`) }
+	s, out := testSup(t, p, stubborn("atom-sing-box"), stubborn("atom-dns"))
+	old := stopWait
+	stopWait = 400 * time.Millisecond
+	defer func() { stopWait = old }()
+	s.Start(bg, "atom-sing-box")
+	s.Start(bg, "atom-dns")
+	waitFor(t, "traps", func() bool { return strings.Count(out.String(), "up") == 2 })
+	start := time.Now()
+	s.shutdown()
+	if d := time.Since(start); d > 2*stopWait+500*time.Millisecond {
+		t.Errorf("shutdown took %v", d)
+	}
+	for _, st := range s.list() {
+		if st.State != "stopped" {
+			t.Errorf("%+v", st)
+		}
+	}
 }
