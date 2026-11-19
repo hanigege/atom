@@ -133,7 +133,7 @@ func TestServicesOnlyTheSelectedKernel(t *testing.T) {
 	waitUnlocked(t, p)
 
 	// a setting that cannot be read selects neither: the wrong kernel would rewrite the shared nft sets
-	for _, setting := range []string{"{", "null", "{}", `{"settings":null}`, `{"settings":{}}`, `{"settings":{"backend":null}}`, "", "xray"} {
+	for _, setting := range []string{"{", "null", "{}", `{"settings":null}`, `{"settings":{"backend":null}}`, `{"settings":{"backend":1}}`, "", "xray"} {
 		selectKernel(t, p, setting)
 		got := getServices(t, m)
 		if want := []serviceStatus{{"atom-maintenance", "running"}, {"atom-dns", "running"}}; !reflect.DeepEqual(got, want) {
@@ -149,6 +149,16 @@ func TestServicesOnlyTheSelectedKernel(t *testing.T) {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
 	waitCall(t, stub, "rc-service atom-sing-box restart")
+	waitUnlocked(t, p)
+
+	// atomdns writes no backend for its default, sing-box: what the file holds after any panel change
+	selectKernel(t, p, `{"version":1,"settings":{"fakeip_range":"28.0.0.0/8","mixed_port":7890}}`)
+	if got := getServices(t, m); len(got) != 3 || got[2].Name != "atom-sing-box" {
+		t.Errorf("no backend: %+v", got)
+	}
+	if w := postRestart(m, `{"service":"atom-sing-box"}`); w.Code != 202 {
+		t.Fatalf("no backend: %d %s", w.Code, w.Body.String())
+	}
 	waitUnlocked(t, p)
 }
 

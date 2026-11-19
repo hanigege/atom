@@ -79,19 +79,26 @@ func installedServices(p Paths) []string {
 
 func isKernel(unit string) bool { return unit == singBoxUnitName || unit == mihomoUnitName }
 
-// selectedKernel is the unit of the proxy kernel atom_proxy.json selects. Only "sing-box" (or the alias
-// "singbox") and "mihomo" select one; a file that cannot be read, null or anything else: "", neither.
+// selectedKernel is the unit of the proxy kernel atom_proxy.json selects. "sing-box" (or the alias "singbox"),
+// and no backend at all (atomdns leaves out its default when it writes the settings), select sing-box;
+// "mihomo" selects mihomo. A file that cannot be read, no settings, null or anything else: "", neither.
 func selectedKernel(p Paths) string {
 	var state struct {
-		Settings *struct {
-			Backend *string `json:"backend"`
-		} `json:"settings"`
+		Settings map[string]json.RawMessage `json:"settings"`
 	}
 	data, err := os.ReadFile(filepath.Join(p.Data(), "webinfo", "atom_proxy.json"))
-	if err != nil || json.Unmarshal(data, &state) != nil || state.Settings == nil || state.Settings.Backend == nil {
+	if err != nil || json.Unmarshal(data, &state) != nil || state.Settings == nil {
 		return ""
 	}
-	switch *state.Settings.Backend {
+	raw, ok := state.Settings["backend"]
+	if !ok {
+		return singBoxUnitName
+	}
+	var backend string
+	if json.Unmarshal(raw, &backend) != nil {
+		return ""
+	}
+	switch backend {
 	case "sing-box", "singbox":
 		return singBoxUnitName
 	case "mihomo":
