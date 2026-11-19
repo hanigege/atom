@@ -126,15 +126,16 @@ func (m *maintenance) restartService(w http.ResponseWriter, r *http.Request) {
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+	delay, hold := restartDelay, selfRestartHold
 	go func() {
 		defer lock.Close()
-		time.Sleep(restartDelay)
+		time.Sleep(delay)
 		unit := req.Service + ".service"
 		err := restartUnit(m.paths, unit)
 		if err != nil {
 			stderrLogger{}.Logf("重启 %s：%v", req.Service, err)
 		} else if unit == maintenanceUnitName && !m.paths.OpenRC {
-			time.Sleep(selfRestartHold)
+			time.Sleep(hold)
 		}
 	}()
 }
