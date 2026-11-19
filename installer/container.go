@@ -176,11 +176,16 @@ func cmdContainer([]string) int {
 	case <-failed:
 		return 1
 	case sig := <-sigs:
-		sup.Logf("收到 %v，停止服务", sig)
+		go sup.Logf("收到 %v，停止服务", sig) // a log sink that does not read must not hold the shutdown
 	}
 	start := time.Now()
 	sup.shutdown()
-	sup.Logf("已停止（%s）", time.Since(start).Round(time.Millisecond))
+	done := make(chan struct{})
+	go func() { sup.Logf("已停止（%s）", time.Since(start).Round(time.Millisecond)); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(300 * time.Millisecond):
+	}
 	return 0
 }
 

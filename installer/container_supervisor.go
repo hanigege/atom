@@ -99,21 +99,25 @@ func (s *supervisor) run() {
 		case <-s.wake:
 		case <-s.quit:
 		}
-		s.qmu.Lock()
-		batch := s.queue
-		s.queue = nil
-		ended := false
-		select {
-		case <-s.quit:
-			ended, s.dead = true, true
-		default:
-		}
-		s.qmu.Unlock()
-		for _, f := range batch {
-			f()
-		}
-		if ended {
-			return
+		for {
+			s.qmu.Lock()
+			batch := s.queue
+			s.queue = nil
+			if len(batch) == 0 {
+				select {
+				case <-s.quit: // after the end nothing is accepted; this is after the last mutation
+					s.dead = true
+					s.qmu.Unlock()
+					return
+				default:
+				}
+				s.qmu.Unlock()
+				break
+			}
+			s.qmu.Unlock()
+			for _, f := range batch {
+				f()
+			}
 		}
 	}
 }
@@ -296,7 +300,11 @@ func (s *supervisor) spawn(v *service) (*proc, error) {
 		return nil, err
 	}
 	go s.pump(v, pr)
-	return &proc{cmd}, nil
+	p := &proc{cmd}
+	s.pmu.Lock()
+	s.procs[p] = struct{}{}
+	s.pmu.Unlock()
+	return p, nil
 }
 
 // ---- everything below runs in the loop ----
@@ -333,7 +341,7 @@ func (s *supervisor) begin(v *service) {
 		default:
 		}
 		if err == nil {
-			p, err = s.spawn(v)
+			p, err = s.spawn(v) // registered for the last stage of the shutdown before the loop knows of it
 		}
 		if !s.post(func() { s.started(v, g, p, err) }) && p != nil {
 			s.kill(p) // the loop has ended: the process is ours to end
@@ -344,7 +352,12 @@ func (s *supervisor) begin(v *service) {
 // kill ends a process nobody supervises.
 func (s *supervisor) kill(p *proc) {
 	signalGroup(p, syscall.SIGKILL)
-	go p.cmd.Wait()
+	go func() {
+		p.cmd.Wait()
+		s.pmu.Lock()
+		delete(s.procs, p)
+		s.pmu.Unlock()
+	}()
 }
 
 func (s *supervisor) started(v *service, g uint64, p *proc, err error) {
@@ -362,9 +375,6 @@ func (s *supervisor) started(v *service, g uint64, p *proc, err error) {
 		return
 	}
 	v.proc, v.phase, v.retry = p, phRunning, true
-	s.pmu.Lock()
-	s.procs[p] = struct{}{}
-	s.pmu.Unlock()
 	go func() {
 		err := p.cmd.Wait()
 		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL) // what it left behind goes with it, as in a systemd cgroup
@@ -376,7 +386,13 @@ func (s *supervisor) started(v *service, g uint64, p *proc, err error) {
 	if v.record { // one decision for every request that waits for this start
 		v.record = false
 		if err := s.setDesired(v.spec.Name, true); err != nil {
-			s.stop(v, stopWait, func() { s.answer(v, err) }) // the start is taken back, then the requests are answered
+			ws := v.waiters // this start's requests; a start that comes while it is taken back has its own
+			v.waiters = nil
+			s.stop(v, stopWait, func() {
+				for _, w := range ws {
+					w(err)
+				}
+			})
 			return
 		}
 	}
@@ -398,6 +414,10 @@ func (s *supervisor) failStart(v *service, err error) {
 	switch {
 	case s.closing:
 		v.phase = phStopped
+	case errors.Is(err, errGroupBusy): // the rejected service claims nothing
+		s.stopTimer(v)
+		v.gen++
+		v.phase, v.retry = phStopped, false
 	case v.retry:
 		s.backoff(v)
 	default:
@@ -486,8 +506,13 @@ func (s *supervisor) stop(v *service, wait time.Duration, w func()) {
 		time.AfterFunc(wait, func() {
 			s.post(func() {
 				if v.gen == g && v.phase == phStopping && v.proc == nil {
-					s.Logf("%s 的启动没有在 %s 内结束，不再等待", v.spec.Name, wait)
-					s.stopped(v)
+					// the caller stops waiting, the slot stays taken until the worker has ended
+					s.Logf("%s 的启动没有在 %s 内结束，请求不再等待", v.spec.Name, wait)
+					ws := v.stopWaiters
+					v.stopWaiters = nil
+					for _, w := range ws {
+						w()
+					}
 				}
 			})
 		})
@@ -545,7 +570,7 @@ func (s *supervisor) settled() {
 		return
 	}
 	dns := s.svcs[len(s.svcs)-1]
-	if dns.phase == phStopped && !s.kernelsSignaled {
+	if down(dns) && !s.kernelsSignaled {
 		s.kernelsSignaled = true
 		left := time.Until(s.shutdownAt) - 100*time.Millisecond // the kill has time to take effect before the end
 		if left > stopWait {
@@ -559,12 +584,15 @@ func (s *supervisor) settled() {
 		}
 	}
 	for _, v := range s.svcs {
-		if v.phase != phStopped {
+		if !down(v) {
 			return
 		}
 	}
 	s.finish()
 }
+
+// down: no process. A cancelled start whose worker has not ended yet holds its slot but runs nothing the shutdown can stop.
+func down(v *service) bool { return v.phase == phStopped || (v.phase == phStopping && v.proc == nil) }
 
 func (s *supervisor) finish() { s.finishOnce.Do(func() { close(s.quit) }) }
 
@@ -763,7 +791,6 @@ func (s *supervisor) shutdown() {
 		}
 		s.closing = true
 		s.shutdownAt = time.Now().Add(2 * stopWait)
-		time.AfterFunc(2*stopWait, func() { s.post(s.finish) })
 		for _, v := range s.svcs {
 			v.startAfterStop = false
 			if v.phase == phStarting || v.phase == phBackoff {
@@ -810,7 +837,9 @@ func (s *supervisor) list() []serviceInfo {
 			st := phStopped
 			switch v.phase {
 			case phRunning, phStopping:
-				st = "running"
+				if v.proc != nil {
+					st = "running"
+				}
 			case phBackoff:
 				st = "failed"
 			}

@@ -994,3 +994,47 @@ func TestWaitingStartsShareOneRecordingDecision(t *testing.T) {
 	}
 	waitFor(t, "taken back", func() bool { return s.list()[0].State == "stopped" })
 }
+
+func TestARejectedKernelClaimsNoSlot(t *testing.T) {
+	p := containerPaths(t)
+	hold := make(chan struct{})
+	sb, mh := shSpec("atom-sing-box", `exec sleep 30`), shSpec("atom-mihomo", `exec sleep 30`)
+	sb.Group, mh.Group = "kernel", "kernel"
+	sb.Pre = func() error { <-hold; return nil }
+	s, _ := testSup(t, p, sb, mh)
+	os.MkdirAll(p.Etc(""), 0o755)
+	os.WriteFile(p.Etc(servicesFile), []byte(`{"atom-sing-box":"running"}`), 0o644)
+	go s.boot()
+	waitFor(t, "sing-box starting", func() bool { return phaseOf(s, 0) == phStarting })
+	if err := s.Enable(bg, "atom-mihomo"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(bg, "atom-mihomo"); !errors.Is(err, errGroupBusy) {
+		t.Fatalf("start of the other kernel: %v", err)
+	}
+	if ph := phaseOf(s, 1); ph != phStopped {
+		t.Errorf("the rejected kernel is %s", ph)
+	}
+	close(hold)
+	waitFor(t, "sing-box runs", func() bool { return s.list()[0].State == "running" })
+}
+
+func TestADrainingStartIsNotActive(t *testing.T) {
+	p := containerPaths(t)
+	hold := make(chan struct{})
+	defer close(hold)
+	sp := shSpec("atom-dns", `exec sleep 30`)
+	sp.Pre = func() error { <-hold; return nil }
+	s, _ := testSup(t, p, sp)
+	old := stopWait
+	stopWait = 100 * time.Millisecond
+	defer func() { stopWait = old }()
+	go s.Start(bg, "atom-dns")
+	waitFor(t, "starting", func() bool { return phaseOf(s, 0) == phStarting })
+	if err := s.Stop(bg, "atom-dns"); err != nil { // returns after stopWait: the hook is still running
+		t.Fatal(err)
+	}
+	if st := s.list()[0].State; st != "stopped" {
+		t.Errorf("state %s", st)
+	}
+}
