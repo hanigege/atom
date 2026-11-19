@@ -43,7 +43,11 @@ done
 rm -f "$DATA/config_custom.yaml.bak" "$DATA/sub_config/atom_rules.yaml.bak"
 grep -q "http: \"0.0.0.0:$PORT\"" "$DATA/config_custom.yaml" || { echo "could not set the panel port" >&2; exit 1; }
 ! grep -q systemctl "$DATA/sub_config/atom_rules.yaml" || { echo "atom_rules.yaml still calls systemctl" >&2; exit 1; }
-[ "$(grep -c "atom-installer, svc, " "$DATA/sub_config/atom_rules.yaml")" = 4 ] || { echo "atom_rules.yaml has not got the four svc commands" >&2; exit 1; }
+for k in sing-box mihomo; do
+  for a in reload stop; do
+    [ "$(grep -c -E "^ +$a: \\[$INSTALLER, svc, $a, atom-$k\\]\$" "$DATA/sub_config/atom_rules.yaml")" = 1 ] || { echo "atom_rules.yaml has not got exactly one '$a' command for $k" >&2; exit 1; }
+  done
+done
 
 cat > "$DATA/webinfo/atom_proxy.json" <<JSON
 {

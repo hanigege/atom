@@ -361,7 +361,7 @@ func (v *service) begin() error {
 		v.end()
 	}
 	err := v.tryStart()
-	if err != nil && retrying && !v.sup.closing.Load() {
+	if err != nil && retrying && !v.sup.closing.Load() && !errors.Is(err, errGroupBusy) {
 		v.mu.Lock()
 		if v.stop == nil {
 			v.startLoopLocked()
@@ -371,14 +371,21 @@ func (v *service) begin() error {
 	return err
 }
 
-func (v *service) tryStart() error {
+var errGroupBusy = errors.New("同时只能运行一个代理内核")
+
+// begin's start: a first start (which makes the loop), or the retry of the loop itself.
+func (v *service) tryStart() error { return v.launch(nil) }
+
+// launch is the start hook and the process. loopStop is the stop channel of the loop that is retrying, nil for a
+// first start, which makes the loop.
+func (v *service) launch(loopStop chan struct{}) error {
 	if v.spec.Group != "" {
 		// one proxy kernel at a time, also for starts that overlap: the slot is held through the hook
 		v.sup.groupMu.Lock()
 		defer v.sup.groupMu.Unlock()
 		for _, o := range v.sup.svcs {
 			if o != v && o.spec.Group == v.spec.Group && o.active() {
-				return fmt.Errorf("%s 在运行或等着重启，同时只能运行一个代理内核", o.spec.Name)
+				return fmt.Errorf("%s 在运行或等着重启：%w", o.spec.Name, errGroupBusy)
 			}
 		}
 	}
@@ -392,10 +399,19 @@ func (v *service) tryStart() error {
 	if v.sup.closing.Load() { // shutdown began while the hook ran: it ends what it finds, so nothing starts here
 		return errClosing
 	}
+	if loopStop != nil {
+		select {
+		case <-loopStop:
+			return errClosing
+		default:
+		}
+	}
 	if err := v.spawnLocked(); err != nil {
 		return err
 	}
-	v.startLoopLocked()
+	if loopStop == nil {
+		v.startLoopLocked()
+	}
 	return nil
 }
 
@@ -405,9 +421,17 @@ func (v *service) startLoopLocked() {
 }
 
 // loop waits for the process and starts it again after Delay when it did not exit cleanly (Restart=on-failure).
-// With no process (a start that failed at boot) it begins with the retry.
+// With no process (a start that failed at boot) it begins with the retry. v.stop stays set until the loop is over,
+// so that a stop that comes while another one is under way can wait for the same end.
 func (v *service) loop(stop, done chan struct{}) {
-	defer close(done)
+	defer func() {
+		v.mu.Lock()
+		if v.done == done {
+			v.stop = nil
+		}
+		v.mu.Unlock()
+		close(done)
+	}()
 	for {
 		v.mu.Lock()
 		cmd := v.cur
@@ -424,13 +448,11 @@ func (v *service) loop(stop, done chan struct{}) {
 				return
 			default:
 			}
-			if err == nil {
-				v.stop = nil // it ended by itself and well: stopped, not restarted
-				v.mu.Unlock()
+			v.mu.Unlock()
+			if err == nil { // it ended by itself and well: stopped, not restarted
 				v.sup.Logf("%s 已退出", v.spec.Name)
 				return
 			}
-			v.mu.Unlock()
 			v.sup.Logf("%s 异常退出：%v，%s 后重启", v.spec.Name, err, v.spec.Delay)
 		}
 		select {
@@ -438,29 +460,20 @@ func (v *service) loop(stop, done chan struct{}) {
 			return
 		case <-time.After(v.spec.Delay):
 		}
-		if v.spec.Pre != nil {
-			if err := v.spec.Pre(); err != nil {
-				v.sup.Logf("%s 启动前的准备失败：%v，%s 后再试", v.spec.Name, err, v.spec.Delay)
-				continue
-			}
-		}
-		v.mu.Lock()
-		select {
-		case <-stop:
-			v.mu.Unlock()
+		if v.sup.closing.Load() {
 			return
-		default:
 		}
-		if err := v.spawnLocked(); err != nil {
-			v.mu.Unlock()
+		if err := v.launch(stop); err != nil {
+			if errors.Is(err, errClosing) {
+				return
+			}
 			v.sup.Logf("%s 启动失败：%v，%s 后再试", v.spec.Name, err, v.spec.Delay)
-			continue
 		}
-		v.mu.Unlock()
 	}
 }
 
-// end stops the loop and the process: SIGTERM, and SIGKILL after stopWait. The caller holds v.op.
+// end stops the loop and the process: SIGTERM, and SIGKILL after stopWait. It gives up on a loop that does not end
+// (a start hook that hangs) after stopWait more. A second caller waits for the same end. It does not take v.op.
 func (v *service) end() {
 	v.mu.Lock()
 	stop, done, cmd := v.stop, v.done, v.cur
@@ -468,20 +481,29 @@ func (v *service) end() {
 		v.mu.Unlock()
 		return
 	}
-	close(stop)
-	v.stop = nil
+	select {
+	case <-stop:
+	default:
+		close(stop)
+	}
 	v.mu.Unlock()
 	if cmd != nil {
 		signalGroup(cmd, syscall.SIGTERM)
-		select {
-		case <-done:
-			return
-		case <-time.After(stopWait):
-			v.sup.Logf("%s 没有在 %s 内停下，强制结束", v.spec.Name, stopWait)
-			signalGroup(cmd, syscall.SIGKILL)
-		}
 	}
-	<-done
+	select {
+	case <-done:
+		return
+	case <-time.After(stopWait):
+	}
+	if cmd != nil {
+		v.sup.Logf("%s 没有在 %s 内停下，强制结束", v.spec.Name, stopWait)
+		signalGroup(cmd, syscall.SIGKILL)
+	}
+	select {
+	case <-done:
+	case <-time.After(stopWait):
+		v.sup.Logf("%s 的循环没有结束，不再等待", v.spec.Name)
+	}
 }
 
 // signalGroup signals the process and what it started (it leads a process group of its own).
@@ -510,9 +532,11 @@ func (s *supervisor) mutating(name string) (*service, error) {
 
 // committed records that a service that has just been started is to run; when that cannot be saved the start is
 // taken back, so that the service is as the file says.
-func (s *supervisor) committed(v *service) error {
+func (s *supervisor) committed(v *service, wasRunning bool) error {
 	if err := s.setDesired(v.spec.Name, true); err != nil {
-		v.end()
+		if !wasRunning {
+			v.end()
+		}
 		return err
 	}
 	return nil
@@ -525,10 +549,11 @@ func (s *supervisor) Start(name string) error {
 	}
 	v.op.Lock()
 	defer v.op.Unlock()
+	was := v.state() == "running"
 	if err := v.begin(); err != nil {
 		return err
 	}
-	return s.committed(v)
+	return s.committed(v, was)
 }
 
 // Stop saves first: a stop that cannot be saved does not happen, or the service would come back with the container.
@@ -559,7 +584,7 @@ func (s *supervisor) Restart(name string) error {
 	if err := v.begin(); err != nil {
 		return err
 	}
-	return s.committed(v)
+	return s.committed(v, false)
 }
 
 // Reload is `systemctl reload-or-restart`: the service runs, so it gets its hook and SIGHUP; else it starts.
@@ -580,7 +605,7 @@ func (s *supervisor) Reload(name string) error {
 		if err := v.begin(); err != nil {
 			return err
 		}
-		return s.committed(v)
+		return s.committed(v, false)
 	}
 	if err := v.spec.Reload(); err != nil {
 		return err
@@ -607,7 +632,6 @@ func (s *supervisor) boot() {
 	if _, err := s.loadDesired(); err != nil {
 		s.Logf("%v，按新安装处理", err)
 	}
-	s.ready.Store(true)
 	want := s.desired()
 	// the kernels share ports and rules: of two that are marked running only the selected one starts
 	if want["atom-sing-box"] && want["atom-mihomo"] {
@@ -622,16 +646,21 @@ func (s *supervisor) boot() {
 			s.Logf("%v", err)
 		}
 	}
+	s.ready.Store(true)
 	for _, v := range s.svcs {
 		if s.closing.Load() {
 			return
 		}
-		// what a request changed since the first read counts: the file is read again for every service
-		if !want[v.spec.Name] || !s.desired()[v.spec.Name] {
+		if !want[v.spec.Name] {
 			continue
 		}
 		v.op.Lock()
-		if err := v.begin(); err != nil && !errors.Is(err, errClosing) {
+		// what a request changed since the first read counts: the file is read again, under the operation lock
+		if !s.desired()[v.spec.Name] {
+			v.op.Unlock()
+			continue
+		}
+		if err := v.begin(); err != nil && !errors.Is(err, errClosing) && !errors.Is(err, errGroupBusy) {
 			s.Logf("%v，%s 后再试", err, v.spec.Delay)
 			v.mu.Lock()
 			if v.stop == nil && !s.closing.Load() {

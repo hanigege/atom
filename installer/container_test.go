@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -779,4 +780,99 @@ func TestRequestsBeforeTheBootAreRefused(t *testing.T) {
 	if err := s.Reload("atom-dns"); !errors.Is(err, errNotReady) {
 		t.Errorf("reload before the boot: %v", err)
 	}
+}
+
+func TestShutdownIsBoundedByAHangingStartHook(t *testing.T) {
+	p := containerPaths(t)
+	hang := make(chan struct{})
+	defer close(hang)
+	sp := shSpec("atom-sing-box", `exec sleep 30`)
+	sp.Delay = 10 * time.Millisecond
+	var calls atomic.Int32
+	sp.Pre = func() error { // the first try fails (the loop is set up), the retries hang
+		if calls.Add(1) == 1 {
+			return os.ErrNotExist
+		}
+		<-hang
+		return nil
+	}
+	s, _ := testSup(t, p, sp, shSpec("atom-dns", `exec sleep 30`))
+	os.MkdirAll(p.Etc(""), 0o755)
+	os.WriteFile(p.Etc(servicesFile), []byte(`{"atom-sing-box":"running","atom-dns":"running"}`), 0o644)
+	old := stopWait
+	stopWait = 200 * time.Millisecond
+	defer func() { stopWait = old }()
+	s.boot()
+	waitFor(t, "the retry hangs in its hook", func() bool { return calls.Load() >= 2 })
+	start := time.Now()
+	s.shutdown()
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("shutdown took %v", time.Since(start))
+	}
+	if s.list()[1].State != "stopped" {
+		t.Error("atomdns left running")
+	}
+}
+
+func TestAKernelInTheRetryWaitKeepsItsSlot(t *testing.T) {
+	p := containerPaths(t)
+	sb, mh := shSpec("atom-sing-box", `exec sleep 30`), shSpec("atom-mihomo", `exec sleep 30`)
+	sb.Group, mh.Group = "kernel", "kernel"
+	sb.Delay = time.Hour
+	sb.Pre = func() error { return os.ErrNotExist }
+	s, _ := testSup(t, p, sb, mh)
+	os.MkdirAll(p.Etc(""), 0o755)
+	os.WriteFile(p.Etc(servicesFile), []byte(`{"atom-sing-box":"running"}`), 0o644)
+	s.boot()
+	if s.list()[0].State != "failed" {
+		t.Fatalf("state %s", s.list()[0].State)
+	}
+	if err := s.Start("atom-mihomo"); !errors.Is(err, errGroupBusy) {
+		t.Errorf("the other kernel started in the retry wait: %v", err)
+	}
+	// the one that waits is not ended by a refused start of the other, and its own stop frees the slot
+	if s.list()[0].State != "failed" || s.list()[1].State != "stopped" {
+		t.Errorf("%+v", s.list())
+	}
+	if err := s.Stop("atom-sing-box"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start("atom-mihomo"); err != nil {
+		t.Errorf("after the stop: %v", err)
+	}
+}
+
+func TestDuplicateStartThatCannotBeRecordedKeepsTheService(t *testing.T) {
+	p := containerPaths(t)
+	s, _ := testSup(t, p, shSpec("atom-dns", `exec sleep 30`))
+	if err := s.Start("atom-dns"); err != nil {
+		t.Fatal(err)
+	}
+	pid := s.list()[0].PID
+	os.Remove(p.Etc(servicesFile))
+	os.MkdirAll(filepath.Join(p.Etc(servicesFile), "x"), 0o755)
+	if err := s.Start("atom-dns"); err == nil {
+		t.Error("no error")
+	}
+	if st := s.list()[0]; st.State != "running" || st.PID != pid {
+		t.Errorf("the running service was taken down: %+v", st)
+	}
+}
+
+func TestTwoStopsWaitForTheSameEnd(t *testing.T) {
+	p := containerPaths(t)
+	s, _ := testSup(t, p, shSpec("atom-dns", `trap 'sleep 0.3; exit 0' TERM; echo up; while :; do sleep 0.05; done`))
+	if err := s.Start("atom-dns"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	v := s.svcs[0]
+	first := make(chan struct{})
+	go func() { v.end(); close(first) }()
+	time.Sleep(50 * time.Millisecond)
+	v.end() // returns only when the process is gone
+	if st := v.state(); st != "stopped" {
+		t.Errorf("second end returned with the service %s", st)
+	}
+	<-first
 }
