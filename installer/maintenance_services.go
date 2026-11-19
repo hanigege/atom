@@ -34,7 +34,7 @@ type serviceStatus struct {
 // serviceState asks the service manager within ctx; an answer that cannot be had is "unknown".
 func serviceState(ctx context.Context, p Paths, name string) string {
 	if p.Container {
-		return containerServiceState(p, name)
+		return containerServiceState(ctx, p, name)
 	}
 	if p.OpenRC {
 		code, err := openRCStatus(ctx, name)

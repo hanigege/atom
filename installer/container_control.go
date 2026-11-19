@@ -136,12 +136,18 @@ func (c containerInit) client(timeout time.Duration) *http.Client {
 }
 
 func (c containerInit) call(timeout time.Duration, method, path string, body, out any) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return c.callCtx(ctx, timeout, method, path, body, out)
+}
+
+func (c containerInit) callCtx(ctx context.Context, timeout time.Duration, method, path string, body, out any) error {
 	var rd io.Reader
 	if body != nil {
 		data, _ := json.Marshal(body)
 		rd = bytes.NewReader(data)
 	}
-	req, err := http.NewRequest(method, "http://atom"+path, rd)
+	req, err := http.NewRequestWithContext(ctx, method, "http://atom"+path, rd)
 	if err != nil {
 		return err
 	}
@@ -210,6 +216,10 @@ func (c containerInit) Restart(log Logger, name string) error { return c.action(
 func (containerInit) Forget(Logger, ...string)                {}
 
 func (c containerInit) state(name string) string {
+	return c.stateCtx(context.Background(), name)
+}
+
+func (c containerInit) stateCtx(ctx context.Context, name string) string {
 	name = strings.TrimSuffix(name, ".service")
 	if name == "atom-maintenance" {
 		return "running"
@@ -217,7 +227,7 @@ func (c containerInit) state(name string) string {
 	var out struct {
 		Services []serviceInfo `json:"services"`
 	}
-	if err := c.call(5*time.Second, "GET", "/svc", nil, &out); err != nil {
+	if err := c.callCtx(ctx, 5*time.Second, "GET", "/svc", nil, &out); err != nil {
 		return "unknown"
 	}
 	for _, s := range out.Services {
@@ -249,8 +259,8 @@ func (c containerInit) Logs(name string) string {
 }
 
 // containerServiceState is serviceState (maintenance_services.go) of the container version.
-func containerServiceState(p Paths, name string) string {
-	return containerInit{socket: p.Run(controlSocket)}.state(name)
+func containerServiceState(ctx context.Context, p Paths, name string) string {
+	return containerInit{socket: p.Run(controlSocket)}.stateCtx(ctx, name)
 }
 
 // cmdSvc is `atom-installer svc <start|stop|restart|reload|is-active> <service>`: what atomdns runs as the

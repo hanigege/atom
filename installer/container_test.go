@@ -64,6 +64,7 @@ func testSup(t *testing.T, p Paths, specs ...serviceSpec) (*supervisor, *syncBuf
 	t.Helper()
 	out := &syncBuf{}
 	s := newSupervisor(p, specs, out)
+	s.ready.Store(true)
 	t.Cleanup(s.shutdown)
 	return s, out
 }
@@ -649,7 +650,7 @@ func TestServicesJSONProblems(t *testing.T) {
 	s, _ := testSup(t, p, shSpec("atom-dns", `exec sleep 30`), shSpec("atom-sing-box", `exec sleep 30`))
 	os.MkdirAll(p.Etc(""), 0o755)
 	// unreadable content: counts as new, and the next change rewrites it
-	for _, bad := range []string{`{`, `{"atom-dns":"maybe"}`, `[1]`} {
+	for _, bad := range []string{`{`, `{"atom-dns":"maybe"}`, `[1]`, `null`} {
 		os.WriteFile(p.Etc(servicesFile), []byte(bad), 0o644)
 		if _, err := s.loadDesired(); !errors.Is(err, errServicesCorrupt) {
 			t.Errorf("%s: %v", bad, err)
@@ -665,8 +666,18 @@ func TestServicesJSONProblems(t *testing.T) {
 	// a file that cannot be read or written is an error of the call, not a silent default
 	os.Remove(p.Etc(servicesFile))
 	os.MkdirAll(p.Etc(servicesFile), 0o755) // a directory where the file should be
-	if err := s.Stop("atom-dns"); err == nil {
-		t.Error("Stop did not report that services.json cannot be recorded")
+	s.Start("atom-dns")                     // fails to record: the start is taken back
+	if s.list()[0].State != "stopped" {
+		t.Error("a start that cannot be recorded stayed")
+	}
+	os.Remove(p.Etc(servicesFile))
+	if err := s.Start("atom-dns"); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(p.Etc(servicesFile))
+	os.MkdirAll(filepath.Join(p.Etc(servicesFile), "x"), 0o755) // a directory where the file should be
+	if err := s.Stop("atom-dns"); err == nil || s.list()[0].State != "running" {
+		t.Errorf("a stop that cannot be recorded happened: %v %s", err, s.list()[0].State)
 	}
 }
 
@@ -688,5 +699,84 @@ func TestSetReloadCommandForTheContainerNeedsAllFourCommands(t *testing.T) {
 	yaml := "  reload: [systemctl, reload-or-restart, atom-sing-box.service]\n  stop: [systemctl, stop, atom-sing-box.service]\n"
 	if _, err := setReloadCommand(yaml, "/opt/atom/bin/atom-installer"); err == nil {
 		t.Error("rules without the mihomo commands were accepted")
+	}
+}
+
+func TestOverlappingKernelStartsDoNotBothRun(t *testing.T) {
+	p := containerPaths(t)
+	in := make(chan struct{}, 2)
+	release := make(chan struct{})
+	mk := func(n string) serviceSpec {
+		sp := shSpec(n, `exec sleep 30`)
+		sp.Group = "kernel"
+		sp.Pre = func() error { in <- struct{}{}; <-release; return nil }
+		return sp
+	}
+	s, _ := testSup(t, p, mk("atom-sing-box"), mk("atom-mihomo"))
+	errs := make(chan error, 2)
+	go func() { errs <- s.Start("atom-sing-box") }()
+	go func() { errs <- s.Start("atom-mihomo") }()
+	<-in // one is inside its hook; the other must be waiting for the slot, not in its hook
+	select {
+	case <-in:
+		t.Fatal("both starts were in their hooks")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	e1, e2 := <-errs, <-errs
+	if (e1 == nil) == (e2 == nil) {
+		t.Errorf("results %v %v: exactly one start must win", e1, e2)
+	}
+	n := 0
+	for _, st := range s.list() {
+		if st.State == "running" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d kernels run", n)
+	}
+}
+
+func TestFailedReloadInTheRetryWaitKeepsRetrying(t *testing.T) {
+	p := containerPaths(t)
+	var mu sync.Mutex
+	ready := false
+	sp := shSpec("atom-sing-box", `exec sleep 30`)
+	sp.Delay = 30 * time.Millisecond
+	sp.Pre = func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		if !ready {
+			return os.ErrNotExist
+		}
+		return nil
+	}
+	sp.Reload = func() error { return nil }
+	s, _ := testSup(t, p, sp)
+	os.MkdirAll(p.Etc(""), 0o755)
+	os.WriteFile(p.Etc(servicesFile), []byte(`{"atom-sing-box":"running"}`), 0o644)
+	s.boot()
+	if err := s.Reload("atom-sing-box"); err == nil {
+		t.Fatal("reload with a failing hook succeeded")
+	}
+	if s.list()[0].State != "failed" {
+		t.Errorf("the retry loop was lost: %s", s.list()[0].State)
+	}
+	mu.Lock()
+	ready = true
+	mu.Unlock()
+	waitFor(t, "recovery without another request", func() bool { return s.list()[0].State == "running" })
+}
+
+func TestRequestsBeforeTheBootAreRefused(t *testing.T) {
+	p := containerPaths(t)
+	s := newSupervisor(p, []serviceSpec{shSpec("atom-dns", `exec sleep 30`)}, &syncBuf{})
+	defer s.shutdown()
+	if err := s.Start("atom-dns"); !errors.Is(err, errNotReady) {
+		t.Errorf("start before the boot: %v", err)
+	}
+	if err := s.Reload("atom-dns"); !errors.Is(err, errNotReady) {
+		t.Errorf("reload before the boot: %v", err)
 	}
 }

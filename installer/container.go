@@ -162,9 +162,14 @@ type supervisor struct {
 
 	stateMu sync.Mutex
 	closing atomic.Bool // the container is stopping: nothing starts any more
+	ready   atomic.Bool // the network is loaded and the services are being started: requests are served
+	groupMu sync.Mutex  // one start of a group (the kernels) at a time
 }
 
-var errClosing = errors.New("容器正在停止")
+var (
+	errClosing  = errors.New("容器正在停止")
+	errNotReady = errors.New("容器还在启动")
+)
 
 func newSupervisor(p Paths, specs []serviceSpec, out io.Writer) *supervisor {
 	s := &supervisor{p: p, out: out}
@@ -239,6 +244,9 @@ func (s *supervisor) loadDesired() (map[string]string, error) {
 			return nil, fmt.Errorf("%s %w", servicesFile, errServicesCorrupt)
 		}
 		return nil, err
+	}
+	if m == nil { // null
+		return nil, fmt.Errorf("%s %w", servicesFile, errServicesCorrupt)
 	}
 	for n, v := range m {
 		if v != "running" && v != "stopped" {
@@ -337,7 +345,8 @@ func (v *service) active() bool {
 }
 
 // begin runs the start hook and the process; it fails when either does. With the process running it does
-// nothing; with the loop waiting to try again, the start is that try. The caller holds v.op.
+// nothing; with the loop waiting to try again, the start is that try, and when it fails the loop goes on trying.
+// The caller holds v.op.
 func (v *service) begin() error {
 	if v.sup.closing.Load() {
 		return errClosing
@@ -351,7 +360,22 @@ func (v *service) begin() error {
 	if retrying {
 		v.end()
 	}
+	err := v.tryStart()
+	if err != nil && retrying && !v.sup.closing.Load() {
+		v.mu.Lock()
+		if v.stop == nil {
+			v.startLoopLocked()
+		}
+		v.mu.Unlock()
+	}
+	return err
+}
+
+func (v *service) tryStart() error {
 	if v.spec.Group != "" {
+		// one proxy kernel at a time, also for starts that overlap: the slot is held through the hook
+		v.sup.groupMu.Lock()
+		defer v.sup.groupMu.Unlock()
 		for _, o := range v.sup.svcs {
 			if o != v && o.spec.Group == v.spec.Group && o.active() {
 				return fmt.Errorf("%s 在运行或等着重启，同时只能运行一个代理内核", o.spec.Name)
@@ -365,6 +389,9 @@ func (v *service) begin() error {
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if v.sup.closing.Load() { // shutdown began while the hook ran: it ends what it finds, so nothing starts here
+		return errClosing
+	}
 	if err := v.spawnLocked(); err != nil {
 		return err
 	}
@@ -467,19 +494,44 @@ func signalGroup(cmd *exec.Cmd, sig syscall.Signal) {
 // Start, Stop, Restart and Reload are what the control socket offers; each one also records whether the service
 // is to run when the container starts again.
 
-func (s *supervisor) Start(name string) error {
+// mutating is the common start of the operations that change a service: the container is up, not going down.
+func (s *supervisor) mutating(name string) (*service, error) {
 	v := s.find(name)
-	if v == nil {
-		return fmt.Errorf("没有这个服务：%s", name)
+	switch {
+	case v == nil:
+		return nil, fmt.Errorf("没有这个服务：%s", name)
+	case s.closing.Load():
+		return nil, errClosing
+	case !s.ready.Load():
+		return nil, errNotReady
+	}
+	return v, nil
+}
+
+// committed records that a service that has just been started is to run; when that cannot be saved the start is
+// taken back, so that the service is as the file says.
+func (s *supervisor) committed(v *service) error {
+	if err := s.setDesired(v.spec.Name, true); err != nil {
+		v.end()
+		return err
+	}
+	return nil
+}
+
+func (s *supervisor) Start(name string) error {
+	v, err := s.mutating(name)
+	if err != nil {
+		return err
 	}
 	v.op.Lock()
 	defer v.op.Unlock()
 	if err := v.begin(); err != nil {
 		return err
 	}
-	return s.setDesired(v.spec.Name, true)
+	return s.committed(v)
 }
 
+// Stop saves first: a stop that cannot be saved does not happen, or the service would come back with the container.
 func (s *supervisor) Stop(name string) error {
 	v := s.find(name)
 	if v == nil {
@@ -487,41 +539,40 @@ func (s *supervisor) Stop(name string) error {
 	}
 	v.op.Lock()
 	defer v.op.Unlock()
+	if !s.closing.Load() {
+		if err := s.setDesired(v.spec.Name, false); err != nil {
+			return err
+		}
+	}
 	v.end()
-	return s.setDesired(v.spec.Name, false)
+	return nil
 }
 
 func (s *supervisor) Restart(name string) error {
-	v := s.find(name)
-	if v == nil {
-		return fmt.Errorf("没有这个服务：%s", name)
+	v, err := s.mutating(name)
+	if err != nil {
+		return err
 	}
 	v.op.Lock()
 	defer v.op.Unlock()
-	if s.closing.Load() {
-		return errClosing
-	}
 	v.end()
 	if err := v.begin(); err != nil {
 		return err
 	}
-	return s.setDesired(v.spec.Name, true)
+	return s.committed(v)
 }
 
 // Reload is `systemctl reload-or-restart`: the service runs, so it gets its hook and SIGHUP; else it starts.
 func (s *supervisor) Reload(name string) error {
-	v := s.find(name)
-	if v == nil {
-		return fmt.Errorf("没有这个服务：%s", name)
+	v, err := s.mutating(name)
+	if err != nil {
+		return err
 	}
 	if v.spec.Reload == nil {
 		return s.Restart(name)
 	}
 	v.op.Lock()
 	defer v.op.Unlock()
-	if s.closing.Load() {
-		return errClosing
-	}
 	v.mu.Lock()
 	cmd := v.cur
 	v.mu.Unlock()
@@ -529,24 +580,24 @@ func (s *supervisor) Reload(name string) error {
 		if err := v.begin(); err != nil {
 			return err
 		}
-	} else {
-		if err := v.spec.Reload(); err != nil {
-			return err
-		}
-		// SIGHUP goes to the main process only (ExecReload=kill -HUP $MAINPID). One that has died on the way is
-		// started again by the loop, with the files the hook just wrote.
-		if err := cmd.Process.Signal(syscall.SIGHUP); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			return err
-		}
+		return s.committed(v)
+	}
+	if err := v.spec.Reload(); err != nil {
+		return err
+	}
+	// SIGHUP goes to the main process only (ExecReload=kill -HUP $MAINPID). One that has died on the way is
+	// started again by the loop, with the files the hook just wrote.
+	if err := cmd.Process.Signal(syscall.SIGHUP); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
 	}
 	return s.setDesired(v.spec.Name, true)
 }
 
 // Enable records that the service is to run when the container starts; it does not start it.
 func (s *supervisor) Enable(name string) error {
-	v := s.find(name)
-	if v == nil {
-		return fmt.Errorf("没有这个服务：%s", name)
+	v, err := s.mutating(name)
+	if err != nil {
+		return err
 	}
 	return s.setDesired(v.spec.Name, true)
 }
@@ -556,6 +607,7 @@ func (s *supervisor) boot() {
 	if _, err := s.loadDesired(); err != nil {
 		s.Logf("%v，按新安装处理", err)
 	}
+	s.ready.Store(true)
 	want := s.desired()
 	// the kernels share ports and rules: of two that are marked running only the selected one starts
 	if want["atom-sing-box"] && want["atom-mihomo"] {
@@ -571,7 +623,11 @@ func (s *supervisor) boot() {
 		}
 	}
 	for _, v := range s.svcs {
-		if !want[v.spec.Name] || s.closing.Load() {
+		if s.closing.Load() {
+			return
+		}
+		// what a request changed since the first read counts: the file is read again for every service
+		if !want[v.spec.Name] || !s.desired()[v.spec.Name] {
 			continue
 		}
 		v.op.Lock()
@@ -591,18 +647,14 @@ func (s *supervisor) boot() {
 // has begun. Both steps are bounded by stopWait, so that `docker stop` (10 s) is enough.
 func (s *supervisor) shutdown() {
 	s.closing.Store(true)
-	stop := func(v *service) {
-		v.op.Lock()
-		v.end()
-		v.op.Unlock()
-	}
-	stop(s.svcs[len(s.svcs)-1])
+	// end does not wait for the operation in progress: a start sees the flag before it spawns
+	s.svcs[len(s.svcs)-1].end()
 	var wg sync.WaitGroup
 	for _, v := range s.svcs[:len(s.svcs)-1] {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			stop(v)
+			v.end()
 		}()
 	}
 	wg.Wait()
@@ -658,15 +710,23 @@ func cmdContainer([]string) int {
 	} else if version != "dev" && c > 0 {
 		sup.Logf("镜像版本 %s 比数据的版本 %s 新；数据迁移还没有实现，数据照原样使用", version, st.Version)
 	}
-	if err := loadContainerNetwork(p); err != nil {
-		sup.Logf("加载网络失败（检查 NET_ADMIN 和内核的 nft_tproxy、nft_socket）：%v", err)
+	// the network and the start run beside the signal wait: a SIGTERM in the middle of them is answered
+	failed := make(chan struct{})
+	go func() {
+		if err := loadContainerNetwork(p); err != nil {
+			sup.Logf("加载网络失败（检查 NET_ADMIN 和内核的 nft_tproxy、nft_socket）：%v", err)
+			close(failed)
+			return
+		}
+		sup.Logf("atom %s 启动，面板端口 %d", st.Version, st.PanelPort)
+		sup.boot()
+	}()
+	select {
+	case <-failed:
 		return 1
+	case sig := <-sigs:
+		sup.Logf("收到 %v，停止服务", sig)
 	}
-	sup.Logf("atom %s 启动，面板端口 %d", st.Version, st.PanelPort)
-	go sup.boot()
-
-	sig := <-sigs
-	sup.Logf("收到 %v，停止服务", sig)
 	start := time.Now()
 	sup.shutdown()
 	sup.Logf("已停止（%s）", time.Since(start).Round(time.Millisecond))
