@@ -304,3 +304,37 @@ networks:
 - 入口进程不回收孤儿子进程（僵尸进程）。要正确回收，需要接管所有子进程的 wait（`exec.Cmd` 的 wait 会和通用回收冲突）；atomdns、sing-box、mihomo 的子进程都是自己 wait 的，目前没见到孤儿。需要的话 Docker 可以加 `init: true`。
 - `docker stop` 的宽限期：监督器在 8 秒内收尾，Docker 默认的 10 秒够用；镜像里不能设置停止宽限期（Docker 的 `--stop-timeout`、compose 的 `stop_grace_period`、ROS 的 `stop-time` 是运行时设置），文档里写明不要把它设得比 10 秒短。
 - 入口进程在 C1 没有安装向导，没有完成安装就退出；镜像版本比数据新时只打印一行日志，数据迁移留给 C4。
+
+### C2 向导的容器模式（2026-11-20）
+
+**做了什么**（代码在 `installer/`，新文件 `container_wizard.go`、`container_install.go`、`container_probe.go`）：
+
+- **向导在入口进程里**。没有完成的安装时，入口进程先开好控制 socket 和维护 socket，再用 `wizardHost` 起向导（`Server` 就是 Linux 版的那个）：监听 80（被占就随机），日志里打印地址和 6 位安装码；访问控制同 Linux 版（安装码、私网来源、Host、同源）。容器里没有闲置超时，只有一次成功的安装才能关闭它（`/api/finish`，或成功 5 分钟后）。装完后入口进程接着跑，不重启服务；SIGTERM 照旧停服务再退出。
+- **面板端口和向导端口相同**（默认都是 80）：向导还占着 80，atomdns 不能同时监听它，所以安装期间 atomdns 用一个临时端口（`Installer.PanelTemp`，配置、启动、设置、自检都用它），向导关闭后入口进程把 `config_custom.yaml` 的面板端口改成 `install.json` 里的值并重启 atomdns（`handOverPanel`）。`ensurePanelPort` 在每次启动时也做一遍（装完还没交接容器就被停掉的情况）。向导页面在 `/api/finish` 之后等到应答的不再是向导（响应头 `X-Atom-Wizard`）才跳转。交接做完之前，不会再开别的向导。
+- `/api/state` 返回 `deployment: "container"` 和 `container: {checks, problems, nics}`。环境一步是能力探测（`container_probe.go`）：CapEff 里的 `NET_ADMIN`；依次加载带 `redirect`、`tproxy`、`fib` 的临时表 `atom_probe`（成功就删，失败时按语句说“内核缺少 nft_redir / nft_tproxy / nft_fib”）；加删一条 `ip rule`（优先级 9990，不碰 atom 的）；网卡数（除 `lo`）和有没有 IPv4。探测结果缓存 5 秒，原因列表放进 `system.problems`，页面据此不让继续。不检查系统和 53 端口。
+- 网络一步：服务端把拓扑强制成单网卡（`validateConfig`），只有一块网卡时自动选定；页面不显示拓扑，一块网卡时只列出这一块；面板端口、面板登录、“回包经主路由”照旧。容器里没有别的程序，端口占用检查恒为空；向导自己的端口对第一次安装的面板端口不算占用（用上面的临时端口绕开）。
+- 安装步骤是 配置 → 网络 → 启动 → 设置 → 自检（`containerInstallSteps`），没有依赖和程序。网络步写 `install.json`、渲染规则文件并加载（`stepNetworkContainer` 调 C1 的 `loadContainerNetwork`），启动和停止经 `containerInit`。失败时 `containerTeardown`：停三个服务，删 `inet atom` 表、表 233 的规则和路由，回包选项的规则和表 234 的默认路由（只在规则正是安装器加的那一条时才删），把回包选项改过的 `accept_redirects` 写回去；文件留着，向导可以返回修改再试。
+- **“回包经主路由”**：内核在没开转发时，只要 `all` 或网卡其中一项允许就会收 ICMP 重定向，所以两项都要是 0。Docker 里 `/proc/sys` 只读，C2 实测 `all` 默认是 0、`eth0` 是 1，`conf.default` 对已有的网卡没用，`conf.eth0` 在 compose 里可以设。写失败时网络一步报错并列出要加的行：`sysctls: [net.ipv4.conf.all.accept_redirects=0, net.ipv4.conf.eth0.accept_redirects=0]`（只列写不了的）。**偏离设计**：设计写的是自检报错，实际在网络一步（比自检早；而且 atomdns 的启动前钩子也会用同一段代码失败，所以到不了自检）。
+- **重新配置**：`atom-installer reconfigure` 发 `POST /reconfigure` 给入口进程，入口进程在 9996（被占就随机）另开一个向导，地址和安装码打印在运行命令的终端，也写进容器日志；已经有一个重新配置的向导时返回同一个。网络一步按 `install.json` 预填。重新配置的向导持有操作锁（`/run/atom/operation.lock`），所以不会和重置同时进行。备份和恢复用容器版的备份项（`containerBackupItems`：`install.json`、`atom.nft`、`policy-route.sh` 和会被改的数据文件，不含镜像里的程序），失败就恢复文件、重启服务、去掉新加的回包规则。
+- **重置**：面板侧不需要任何容器专用逻辑。维护 socket 的 `POST /reset` 用的还是 `maintenance.start`/`runReset`/`watchReset` 那一套任务记录（`GET /` 里的 `job`：`awaiting_browser`、`wizard_port`、`wizard_code`、`wizard_urls`），区别只是向导是入口进程里的（`startContainerReset`）。向导确认后：持有面板写锁，把 `data/` 复制到 `data/.atom/backup/reset-<时间>/data/`（备份目录本身不复制，链接按链接保存；另存一份 `etc/install.json`），停三个服务并确认停了，撤销网络规则（撤不掉就不继续），写 `data/.atom/backup/.reset-pending`，清空 `data/` 里除备份以外的内容（`install.json` 最后删）。清空到一半入口进程被停掉的话，下次启动先接着清（`resumeReset`），不会启动半个安装。清空完成后向导继续，网络一步按备份的 `install.json` 预填；30 分钟没人装就按原来的网络设置自动装（同 Linux 版）。重置开始后的 `job` 不再出现在新面板的概览里。
+- 小改动：`loadChanges` 在容器里没有 `changes.json` 时返回空记录；`operationLock` 在容器里用 `/run/atom/operation.lock`；`enableMaintenance`、`removeMaintenance` 在容器里什么也不做（入口进程就是维护服务）；`supervisor.markReady` 让向导在没有 `boot` 时也能启动服务。
+
+**测试环境**：
+
+- `go vet`、`go test ./...`：vm92，`/root/atom-build/atom-c2/installer`（Go 1.24.4，linux/amd64），全部通过。Mac 上 `TestStatusQueriesKeepTheDeadline`、`TestMaintenanceFollowsTheResetWizard`、`TestMaintenanceRestartWhileTheResetWizardStarts`、`TestResetStopsWhileAProgramOfAtomRuns` 在没有这次改动时也失败（计时和 `/proc`），vm92 上通过。
+- 实测：Docker 26.1.5，macvlan（网络 `atom-c3-net`，C3 建的，和我共用；parent `eth0`，10.0.0.0/24），容器 10.0.0.201，客户端 netns 10.0.0.202，镜像 `atom:0.2.1-c2`（0.2.1 包，换成新编的 atom-installer，基础镜像 `atom-base:trixie-slim`），向导的 JSON API 用 `/root/atom-build/atom-c2/drive.py` 按页面的调用顺序走。结果见下表。
+
+RESULTS_TABLE
+
+**codex 审查**（`codex exec -s read-only`，静态审查）：
+
+CODEX_ROUNDS
+
+**已知限制**：
+
+- 向导页面本身（HTML/JS）只验证了语法和关键元素，没有在真浏览器里点过一遍（见交回说明）。
+- 重新配置和重置的向导端口是 9996（被占才随机），ROS 上如果防火墙只放了面板端口，要另放这个端口。
+- 容器里的探测只看 NET_ADMIN、nft 的三种语句、`ip rule` 和网卡；`nft_socket`、`nft_ct` 之类本期规则没用到，不测。
+- 重置的备份是复制不是移动：数据盘要有两份数据的空间（备份在清空前完成）。备份里的套接字等运行时文件不保存。
+- 备份目录下的 `reset-*` 不会自动清理（同 Linux 版）。
+
