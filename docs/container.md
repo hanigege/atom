@@ -72,6 +72,7 @@
   四个程序本身约 170MB，其中 sing-box 92MB，两版差的主要是基础系统。ROS 的内置存储基本放不下（`ros-test` 的系统盘只剩 59MB），文档要写明镜像和卷都放在外接盘或数据盘上。
 - **构建和发布 [建议]**：
   - 做法和 rosboard 的 `.github/workflows/docker.yml` 一样，在 atom 仓库加一个 `docker.yml` 工作流，手动触发，输入 Release 标签。流程：下载这个 Release 的配套包，按 `SHA256SUMS` 校验，用 `docker buildx` 把包里的文件装进镜像（不编译，镜像里的程序就是发布包里那几个），推到 Docker Hub 和 ghcr，再用 `docker save` 出两个 tar 和它们的 sha256，传到同一个 Release 上。
+  - **实际做法（C7）**：`docker.yml` 对每个架构调用 `installer/scripts/build-image.sh`（和本地构建同一个 Dockerfile），推单架构标签 `<版本>-amd64`、`<版本>-arm64`，再用 `docker buildx imagetools create` 合成 `<版本>`、`v<版本>` 的多架构索引（只有这个 Release 是最新 Release 时才加 `latest`，重跑旧版本不会把它改回去）；tar 就是推上去的那个单架构镜像，所以 Docker Hub 上会多两个 `-amd64`、`-arm64` 后缀的标签。说明文件是 `installer/container/DOCKERHUB.md`，由 `peter-evans/dockerhub-description` 推到 Docker Hub。
   - 发版顺序不变：先在 Mac 上打包、签名、建 Release，再跑这个工作流。私钥仍然不离开 Mac，镜像里也没有需要签名的东西。
   - Docker Hub 的登录沿用 rosboard 的两个 secret 名字：`DOCKERHUB_USERNAME`、`DOCKERHUB_TOKEN`。GitHub 的 secret 值读不出来，要用户在 `jasonxtt/atom` 仓库里再设置一次，token 可以和 rosboard 共用。ghcr 用工作流自带的 `GITHUB_TOKEN`。
   - 本地验证用的镜像在 vm92 上构建：2026-11-20 已经装了 Debian 的 `docker.io` 26.1.5 和 `docker-buildx`，是临时用阿里云源装的，系统的 apt 源没改。
@@ -227,7 +228,7 @@ networks:
 1. 把 `install.json` 里的版本和镜像版本比较：版本相同就直接启动；镜像更旧就拒绝启动（见 5.1 节）。
 2. 镜像更新时，先把自带配置（`config_custom.yaml`、`sub_config/`、`rule/atom_catalog.json`、`ui/main/`）备份到 `data/.atom/backup/`，保留最近 3 份。
 3. 用 `share/` 里的新文件覆盖自带配置，保留 `webinfo/`、下载的规则和缓存，重新改写重载命令和面板端口，然后重新生成 nft 规则。这些步骤和 Linux 版的 `upgrade` 共用代码。
-4. 正常启动；接口起不来，或者内核没有加载到最新配置，就把备份恢复回去、写日志，然后退出。退出后由 Docker 或 ROS 的重启策略决定要不要再试。镜像本身回不到旧版，要用户自己换回旧镜像。
+4. 正常启动；接口起不来，或者内核没有加载到最新配置，就把备份恢复回去（`install.json` 的版本也回到旧值）、写日志，然后退出。迁移过程中被停掉（SIGTERM、崩溃）也安全：备份做完后先写 `data/.atom/migrating.json`，验证通过才删；下次启动先看这个文件，在就先把备份恢复回去，再重新迁移（C4 实现，见 11 节）。退出后由 Docker 或 ROS 的重启策略决定要不要再试。镜像本身回不到旧版，要用户自己换回旧镜像。
 
 ## 9. 实施步骤 **[建议]**
 
@@ -382,3 +383,66 @@ networks:
 **codex 审查**（`codex exec -s read-only`，静态）：第一轮 1 条阻断（概览未到时网络表单可编辑，已修：`readOnly`）、2 条小问题（更新卡片的按钮和任务显示按 `deployment` 隐藏，已修；Linux 版原有的“未配置在线升级”句子是旧内容，不动）。第二轮 0 条阻断，1 条小问题：容器里维护接口轮询失败时，更新卡片仍显示错误文案——这是连接中断的提示，保留，记为已知限制。
 
 **已知限制**：容器里的重启确认文案、重置确认里“30 分钟自动安装”等说明沿用 Linux 版；没有在真实浏览器里点过重启和重置。
+
+### C4 升级迁移（2026-11-20）
+
+**做了什么**（`installer/container_migrate.go`，`container.go`、`upgrade.go` 小改）：
+
+- 镜像版本比 `install.json` 新时，入口进程在后台协程里（和网络、启动同一个协程，SIGTERM 照样能响应）先迁移再加载网络、起服务：`checkLegacyTor`、`checkUpgradeConfig`（用镜像里 `/opt/atom/bin/atomdns check`，Linux 版用的是包里的路径，容器版改指向 `Paths.Bin`）、`makeBackup` 到 `data/.atom/backup/<旧版本>-<时间>`、写 `migrating.json`、`installData`（覆盖规则、重写重载命令和面板端口、换 `ui/main`，和 Linux 版 `upgrade` 同一份代码）、`writeNetworkFiles`、写新版本到 `install.json`。检查失败就不动数据、日志说明、退出 1。
+- 启动后 `finishMigration` 等 atomdns 接口，再等内核 `Running && InSync`（同 `applyUpgrade` 的 60 秒、90 秒）；通过就删 `migrating.json`、`pruneBackups` 留 3 份。不通过：先停服务，再恢复备份文件、删记录、退出 1。
+- 恢复备份的文件部分从 `restoreBackup` 拆成 `restoreBackupFiles`（Linux 版行为不变，只是函数拆开），容器版只用文件部分（容器版备份项本来就含 `install.json`、`atom.nft`、`policy-route.sh`、自带配置）。
+- 迁移被停掉：入口进程启动时（向导和 socket 之前，同 `resumeReset` 的位置）先看 `migrating.json`：在就恢复它指的备份（备份目录没有 `absent.txt` 视为不完整，报错、保留记录、退出 1），然后按正常流程重新迁移。
+- 偏离设计：无。第 8 节只补了 `migrating.json` 一句。
+
+**测试**：
+
+- Mac：`go vet ./...`；`container_migrate_test.go` 两项（恢复未完成的迁移；检查失败时不动数据、不写记录、不留备份）；全量里只有已知的四个计时测试失败。
+- vm92（`/root/atom-build/c4`，系统 Go 1.24，`GOTOOLCHAIN=auto`）：全量 `go test ./...` 只有 `TestContainerMaintenance` 失败：它期望 `GET /network` 返回 400，而 C3 的提交（d572706）已经让容器版返回 200，测试没跟着改（不是本步引起的；Mac 上因没有网卡而恰好通过）。这一步没有改它。
+- 实测，vm92，`/root/atom-build/c4`：镜像用 `FROM atom:0.2.1-c2` 加一层换 `atom-installer`（`-X main.version=0.2.1` / `0.2.2` / `0.2.3`）和 `manifest.json`，新版本的 `share/config/config_custom.yaml` 末尾加一行注释以便看出覆盖；macvlan 用 `atom-c3-net`，容器 10.0.0.204，客户端 netns 10.0.0.205；面板登录设了用户名和密码（空密码时面板要安装码，安装器的 `waitStatus` 会一直 401，这是 Linux 版同样的前提）。
+
+| 项目 | 结果 |
+|---|---|
+| 旧镜像 0.2.1 装好（向导 JSON API），经面板加一个节点 | 通过 |
+| 新镜像 0.2.2 配 0.2.1 数据：版本更新、`config_custom.yaml` 被覆盖（带新注释）、`atom_rules.yaml` 不变、节点和登录保留、备份 `0.2.1-…` 生成、没有 `migrating.json`；google 得 FakeIP，baidu 得真实 IP | 通过 |
+| 新镜像的 atomdns `check` 失败 | 通过：退出 1，数据 md5 不变，没有备份目录 |
+| 新镜像的 atomdns 起不来 | 通过：约 60 秒后“数据迁移后服务没有正常”，恢复到 0.2.1（`install.json`、配置 md5 回到旧值），退出 1 |
+| 旧镜像 0.2.1 配 0.2.2 数据 | 通过：拒绝启动，退出 1，数据不动 |
+| 迁移中被 SIGTERM（验证阶段，atomdns 挂着不答；`docker stop` 0.2 秒） | 通过：`migrating.json` 在，`install.json` 已是新版本 |
+| 之后换回 0.2.2 镜像 | 通过：恢复到 0.2.2，配置和 `install.json` 的 md5 与迁移前相同，正常启动，DNS 正常 |
+| 之后换 0.2.3 镜像 | 通过：先恢复再重新迁移，版本 0.2.3，节点还在，DNS 正常，备份只留 3 份 |
+| 迁移的 apply 阶段被打断（文件复制到一半） | 没测（只测了验证阶段被打断；两者用同一条恢复路径） |
+| 换成 mihomo 内核、`reply_via` 选项的数据迁移 | 没测 |
+
+测完已清掉容器、netns、数据目录和自建的镜像（`atom:0.2.1-c4` 等）。
+
+**已知限制**：
+
+- 恢复备份失败（或备份不完整）时退出 1，下次启动会再试恢复；备份在 `data/.atom/backup/` 里，需要用户手动处理。
+- 迁移后如果用户之前把 atomdns 设成了“停止”（`services.json`），验证等不到接口，会被当成失败而回滚。
+- 验证失败后的退出码是 1，由 Docker 或 ROS 的重启策略决定要不要再试；设了 `restart: always` 会每隔一阵重复“迁移、失败、回滚”。
+- “检查失败”的错误里带有 Linux 版的“当前服务继续运行”字样（共用 `checkUpgradeConfig`）。
+
+### C7 arm64 和发布工作流（2026-11-20）
+
+**做了什么**：`installer/scripts/build-image.sh` 的 `--arch` 接受 `arm64`（只改了参数检查）；新增 `.github/workflows/docker.yml`（手动触发，输入 Release 标签）和占位的 `installer/container/DOCKERHUB.md`。工作流流程见第 4 节。构建用 buildx 的 `docker` 驱动，镜像留在本机 daemon 里，`build-image.sh` 才能直接 `docker save`。
+
+**测试**：
+- vm92，`/root/atom-build/c7`：用 mmdebstrap（临时阿里云源装了 `arch-test`，qemu binfmt 本来就有）做出 arm64 的 Debian 基础镜像 `atom-base:trixie-slim-arm64`，再 `build-image.sh --arch arm64 --base ...` 用 0.2.1 的 arm64 glibc 包构建，得到 `atom:0.2.1-arm64`（Architecture arm64）和 `atom-0.2.1-container-arm64.tar`（260MB）。qemu 下运行 `atom-installer version` 输出 0.2.1，`uname -m` 为 aarch64。
+- n1 上没有 Docker，没有强装，真 arm64 机器上的运行没有测。
+- Mac：`actionlint`（装在 NAS 的 `tmp/c7`）检查工作流通过；校验步骤的 `grep` 对 0.2.1 的 `SHA256SUMS` 选出 2 行。
+- 工作流本身没有跑，要合并到 main 并发版后才能真正运行。
+
+**需要用户注意**：`DOCKERHUB_TOKEN` 要有仓库的描述写权限；`jasonxtt/atom` 的 ghcr 包第一次推上去后默认私有，要在 GitHub 里改成公开。
+
+**codex 审查**（`codex exec -s read-only`，静态，2 轮）：
+
+- 第一轮 5 条阻断、1 条小问题。已修 2 项：加网络、改面板端口失败时同样回滚（原来只记录文件留到下次启动再恢复）；回滚后也 `pruneBackups`，避免容器反复重启失败时备份堆满盘。其余 4 项记为已知限制（见下）。
+- 第二轮 1 条阻断（备份目录在写 `migrating.json` 前就建好，磁盘写满时每次重试都留一份残余），记为已知限制，没有第三轮。
+
+**还有这些已知限制**（codex 提的冷僻情形）：
+
+- 迁移期间（备份、覆盖、验证）维护 socket 和向导 socket 已经能收到请求：同时点“重置”或改网络会和迁移互相踩。窗口是几十秒，没有加锁。
+- 面板没设登录（空用户名和密码）时 atomdns 要“安装码”，安装器对 `/status` 一直 401，验证会超时并回滚。Linux 版升级有同样的前提；向导里设了用户名和密码就没有这个问题。
+- `in_sync` 在内核重载成功前可能已经为真，验证有极小的时间窗口会提前通过（同 Linux 版）。
+- `copyTree` 不复制符号链接，上游 YAML 如果是链接，回滚后会丢（同 Linux 版）。
+- 备份目录写到一半磁盘满了：残余目录要手动删（`data/.atom/backup/`，没有 `migrating.json` 指向的那些）。

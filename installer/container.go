@@ -156,6 +156,11 @@ func cmdContainer([]string) int {
 		sup.Logf("%v", err)
 		return 1
 	}
+	// so is a data migration that was stopped half way: its backup goes back, and it starts again below
+	if err := recoverMigration(p, sup); err != nil {
+		sup.Logf("%v", err)
+		return 1
+	}
 	closeSockets, err := serveContainerSockets(p, sup, host)
 	if err != nil {
 		sup.Logf("%v", err)
@@ -177,27 +182,51 @@ func cmdContainer([]string) int {
 		}()
 		return waitForStop(sup, sigs, failed, stop)
 	}
-	if c := compareVersions(version, st.Version); version != "dev" && c < 0 {
+	c := compareVersions(version, st.Version)
+	if version != "dev" && c < 0 {
 		sup.Logf("镜像版本 %s 比数据的版本 %s 旧，拒绝启动；请换回新版镜像", version, st.Version)
 		return 1
-	} else if version != "dev" && c > 0 {
-		sup.Logf("镜像版本 %s 比数据的版本 %s 新；数据迁移还没有实现，数据照原样使用", version, st.Version)
 	}
-	// the network and the start run beside the signal wait: a SIGTERM in the middle of them is answered
+	migrate := version != "dev" && c > 0
+	// the migration, the network and the start run beside the signal wait: a SIGTERM in the middle of them is answered
 	go func() {
+		var m *migration
+		if migrate {
+			sup.Logf("镜像版本 %s 比数据的版本 %s 新，迁移数据", version, st.Version)
+			var err error
+			if m, err = migrateData(p, st, sup); err != nil {
+				sup.Logf("数据迁移没有做，数据保持 %s：%v", st.Version, err)
+				close(failed)
+				return
+			}
+		}
+		// what fails from here on takes the migration back
+		fail := func(format string, args ...any) {
+			sup.Logf(format, args...)
+			if m != nil {
+				sup.shutdown()
+				if err := rollbackMigration(p, m, sup); err != nil {
+					sup.Logf("%v（备份在 %s）", err, filepath.Join(p.Backup(), m.Backup))
+				}
+			}
+			close(failed)
+		}
 		// a stop before the first wizard moved the panel from its temporary port: it moves now
 		if _, err := ensurePanelPort(p, st, false); err != nil {
-			sup.Logf("面板端口 %d 没有写进配置：%v", st.PanelPort, err)
-			close(failed)
+			fail("面板端口 %d 没有写进配置：%v", st.PanelPort, err)
 			return
 		}
 		if err := loadContainerNetwork(p); err != nil {
-			sup.Logf("加载网络失败（检查 NET_ADMIN 和内核的 nft_tproxy、nft_socket）：%v", err)
-			close(failed)
+			fail("加载网络失败（检查 NET_ADMIN 和内核的 nft_tproxy、nft_socket）：%v", err)
 			return
 		}
 		sup.Logf("atom %s 启动，面板端口 %d", st.Version, st.PanelPort)
 		sup.boot()
+		if m != nil {
+			if err := finishMigration(p, st, m); err != nil {
+				fail("数据迁移后服务没有正常：%v", err)
+			}
+		}
 	}()
 	return waitForStop(sup, sigs, failed, nil)
 }
