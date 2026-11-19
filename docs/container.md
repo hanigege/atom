@@ -358,3 +358,27 @@ networks:
 - 重置的备份是复制不是移动：数据盘要有两份数据的空间（备份在清空前完成）。备份里的套接字等运行时文件不保存。
 - 备份目录下的 `reset-*` 不会自动清理（同 Linux 版）。
 
+### C3 面板的容器模式（2026-11-20）
+
+**做了什么**（子模块 `atomdns`，分支 `atom/container`，提交 3a64c68a、f09fe823、14ed4ec7；Rust 没有改）：
+
+- Rust 侧：`atom_maintenance.rs` 把维护 socket 的回答原样转发（只检查状态码在 200/202/400/404/409/500/503 里），所以概览里的 `deployment` 不用改 Rust 就到了面板；400 的错误文案也原样带到。
+- `docs/api/openapi.yaml` 的 `Maintenance` 加可选字段 `deployment`（枚举 `container`），`npm run gen:api` 重新生成 `schema.ts`。
+- WebUI：`src/deployment.ts` 的 `isContainer()`（纯函数，`tests/deployment.test.mjs` 测）；`containerDeployment` 在 `composables/maintenance.ts`。
+  - 系统更新卡片：容器里只有标题和版本，去掉“当前安装包未配置在线升级”，检查更新和升级按钮、任务显示都不出现。
+  - 网络卡片：容器里不显示“试用并保存”，字段整体 `disabled`；概览还没读到时同样只读，`saveNetwork` 也有同样的保护。
+  - 组件表格：容器里不列“Atom 维护服务”行（`/services` 本来也不返回它）；两行的重启按钮照常。
+  - 重置卡片：确认框里的备份路径在容器里写 `/opt/atom/data/.atom/backup/reset-时间`（C2 提的）。其余不变：C2 的重置沿用同一套 `awaiting_browser`、`wizard_port`、`wizard_code`、`wizard_urls`，面板不需要容器专用逻辑。
+
+**需要入口进程配合的一处**：面板读网络设置用 `GET /maintenance/network`，但 C1 的 `container_maintenance.go` 对 `/network` 的所有方法都返回 400，只读页面会显示错误。需要在 `handler` 里加一条 `GET /network` 调用 `c.network(w)`（`maintenance.network` 在容器里可以直接用，实测返回正确的配置和网卡）；POST 仍返回 400。这一处在 `installer/`，C3 没有提交它（补丁见下文实测用的 diff）。
+
+**测试**：
+
+- `npm run typecheck`、`npm test`（23 项）通过，`npm run build:package` 通过，包在 `/Users/tom/nas/u.2/mac-use/atom/tmp/c3/atom-webui.tar.gz`（Mac）。
+- vm92，`/root/atom-build/c3`：镜像 `atom:0.2.1-c3`（0.2.1 包，只换 atom-installer；这个 atom-installer 带上面那一条 `GET /network` 的本地补丁，未提交），macvlan 网络 `atom-c3-net`，容器 `atom-c3`，IP 10.0.0.203，数据目录 `/root/atom-build/c3/data`，WebUI 解到 `ui/main/`。
+- 经面板 `/api/v1/atom/maintenance`（带 `X-Atom-Request`）：概览 `{"deployment":"container","online":false,"version":"0.2.1"}`；`/services` 只有 atom-dns 和 atom-sing-box；`/network` 返回当前配置；`POST /check`、`/upgrade`、`/reset` 都返回 400 和服务端文案；页面和 `app.js` 返回 200。
+- 浏览器（内置浏览器，10.0.0.203）：系统页只有版本、两行组件、重置卡片；网络页字段 `disabled` 且没有保存按钮。没有点重启和重置。
+
+**codex 审查**（`codex exec -s read-only`，静态）：第一轮 1 条阻断（概览未到时网络表单可编辑，已修：`readOnly`）、2 条小问题（更新卡片的按钮和任务显示按 `deployment` 隐藏，已修；Linux 版原有的“未配置在线升级”句子是旧内容，不动）。第二轮 0 条阻断，1 条小问题：容器里维护接口轮询失败时，更新卡片仍显示错误文案——这是连接中断的提示，保留，记为已知限制。
+
+**已知限制**：容器里的重启确认文案、重置确认里“30 分钟自动安装”等说明沿用 Linux 版；没有在真实浏览器里点过重启和重置。
