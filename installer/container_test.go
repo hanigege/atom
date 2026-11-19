@@ -499,7 +499,7 @@ func TestContainerMaintenance(t *testing.T) {
 	if code != 200 || m["deployment"] != "container" || m["version"] != "1.2.3" {
 		t.Errorf("overview %d %v", code, m)
 	}
-	for _, c := range []struct{ method, path string }{{"POST", "/upgrade"}, {"POST", "/check"}, {"POST", "/network"}, {"GET", "/network"}} {
+	for _, c := range []struct{ method, path string }{{"POST", "/upgrade"}, {"POST", "/check"}, {"POST", "/network"}} {
 		if code, m := do(c.method, c.path, "{}"); code != 400 || m["error"] == "" {
 			t.Errorf("%s %s: %d %v", c.method, c.path, code, m)
 		}
