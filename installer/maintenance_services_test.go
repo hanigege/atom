@@ -113,6 +113,19 @@ func TestServicesOnlyTheSelectedKernel(t *testing.T) {
 	}
 	waitCall(t, stub, "rc-service atom-mihomo restart")
 	waitUnlocked(t, p)
+
+	// a setting that cannot be read selects neither: the wrong kernel would rewrite the shared nft sets
+	for _, setting := range []string{"{", `{"settings":{"backend":"xray"}}`} {
+		os.WriteFile(filepath.Join(p.Data(), "webinfo", "atom_proxy.json"), []byte(setting), 0o600)
+		got := getServices(t, m)
+		if want := []serviceStatus{{"atom-maintenance", "running"}, {"atom-dns", "running"}}; !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: %+v", setting, got)
+		}
+		w := postRestart(m, `{"service":"atom-sing-box"}`)
+		if w.Code != 400 || !strings.Contains(w.Body.String(), "无法确定当前使用的代理内核") {
+			t.Errorf("%s: %d %s", setting, w.Code, w.Body.String())
+		}
+	}
 }
 
 func postRestart(m *maintenance, body string) *httptest.ResponseRecorder {
@@ -162,13 +175,27 @@ func TestRestartRequests(t *testing.T) {
 	lock.Close()
 }
 
+// flushCheck records whether the whole answer was there, and no restart yet, when it was flushed.
+type flushCheck struct {
+	*httptest.ResponseRecorder
+	dir     string
+	flushed bool
+}
+
+func (f *flushCheck) Flush() {
+	f.flushed = f.Code == 202 && strings.TrimSpace(f.Body.String()) == `{"ok":true}` &&
+		calls(f.dir, "systemctl restart atom-dns.service") == 0
+	f.ResponseRecorder.Flush()
+}
+
 func TestRestartAnswersThenRestarts(t *testing.T) {
 	p, dir := servicesSystemd(t, nil)
 	os.WriteFile(filepath.Join(dir, "restart-slow"), []byte("1"), 0o644)
 	m := &maintenance{paths: p}
-	w := postRestart(m, `{"service":"atom-dns"}`)
-	if w.Code != 202 || strings.TrimSpace(w.Body.String()) != `{"ok":true}` {
-		t.Fatalf("%d %s", w.Code, w.Body.String())
+	w := &flushCheck{ResponseRecorder: httptest.NewRecorder(), dir: dir}
+	m.handler(w, httptest.NewRequest("POST", "/restart", strings.NewReader(`{"service":"atom-dns"}`)))
+	if !w.flushed {
+		t.Fatalf("the answer was not out before the restart: %d %s", w.Code, w.Body.String())
 	}
 	waitCall(t, dir, "systemctl restart atom-dns.service")
 	if w := postRestart(m, `{"service":"atom-sing-box"}`); w.Code != 409 {
@@ -214,5 +241,18 @@ func TestRestartTheMaintenanceServiceItself(t *testing.T) {
 	}
 	waitCall(t, stub, "rc-service atom-maintenance restart")
 	// rc-service came back without stopping this process: the restart did not happen, the lock goes
+	waitUnlocked(t, p)
+
+	// an rc-service that hangs keeps the lock for the hold only
+	selfRestartHold = 1500 * time.Millisecond
+	hung := fakeCommands(t, map[string]string{"rc-service": `[ "$2" = restart ] && sleep 5`})
+	if w := postRestart(&maintenance{paths: p}, `{"service":"atom-maintenance"}`); w.Code != 202 {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	waitCall(t, hung, "rc-service atom-maintenance restart")
+	if lock, err := operationLock(p); err == nil {
+		lock.Close()
+		t.Error("the lock went while rc-service still runs")
+	}
 	waitUnlocked(t, p)
 }
