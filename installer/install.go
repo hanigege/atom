@@ -370,6 +370,9 @@ func (ins *Installer) refreshConfig(target string, panelPort int) error {
 	if ins.Paths.OpenRC {
 		reload = ins.Paths.Lib("reload-sing-box.sh")
 	}
+	if ins.Paths.Container {
+		reload = ins.Paths.Bin("atom-installer")
+	}
 	return refreshData(filepath.Join(ins.PkgDir, "config"), target, panelPort, reload)
 }
 
@@ -480,6 +483,9 @@ func (ins *Installer) writeNetworkFiles(st *InstallState, log Logger) error {
 		if err := runCmd(log, 30*time.Second, st.NftBin, "-c", "-f", p.Etc(f)); err != nil {
 			return fmt.Errorf("nft 规则检查没通过: %w", err)
 		}
+	}
+	if p.Container { // no service definitions: the entry process starts the services itself
+		return nil
 	}
 	dnsDef, sbDef, mhDef := renderDNSUnit, renderSingBoxUnit, renderMihomoUnit
 	if p.OpenRC {

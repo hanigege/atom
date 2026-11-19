@@ -12,12 +12,23 @@ type Paths struct {
 	Root    string
 	UnitDir string
 	OpenRC  bool // OpenRC service scripts in UnitDir (/etc/init.d) instead of systemd units
+	// Container: the container version (docs/container.md). The programs and the shipped files are in the image
+	// under Root, everything that has to survive a new container is in Data(), the state and the rules in
+	// Data()/.atom, and the runtime files (the sockets) in RunDir. There are no service definitions.
+	Container bool
+	RunDir    string
 }
 
 func defaultPaths() Paths {
 	p := Paths{Root: "/opt/atom", UnitDir: "/etc/systemd/system", OpenRC: useOpenRC()}
 	if p.OpenRC {
 		p.UnitDir = "/etc/init.d"
+	}
+	if os.Getenv("ATOM_DEPLOYMENT") == "container" {
+		p.Container, p.OpenRC, p.RunDir = true, false, "/run/atom"
+		if v := os.Getenv("ATOM_RUN_DIR"); v != "" {
+			p.RunDir = v
+		}
 	}
 	if v := os.Getenv("ATOM_ROOT"); v != "" {
 		p.Root = v
@@ -29,11 +40,7 @@ func defaultPaths() Paths {
 }
 
 func (p Paths) Bin(name string) string { return filepath.Join(p.Root, "bin", name) }
-func (p Paths) Etc(name string) string { return filepath.Join(p.Root, "etc", name) }
-func (p Paths) Lib(name string) string { return filepath.Join(p.Root, "lib", name) }
-func (p Paths) Run(name string) string { return filepath.Join(p.Root, "run", name) }
 func (p Paths) Data() string           { return filepath.Join(p.Root, "data") }
-func (p Paths) Backup() string         { return filepath.Join(p.Root, "backup") }
 func (p Paths) Pkg() string            { return filepath.Join(p.Root, "pkg") }
 func (p Paths) Shipped() string        { return filepath.Join(p.Root, "share") }
 func (p Paths) State() string          { return p.Etc("install.json") }
@@ -41,6 +48,35 @@ func (p Paths) Changes() string        { return p.Etc("changes.json") }
 func (p Paths) DNSUnit() string        { return p.unitFile(dnsUnitName) }
 func (p Paths) SingBoxUnit() string    { return p.unitFile(singBoxUnitName) }
 func (p Paths) MihomoUnit() string     { return p.unitFile(mihomoUnitName) }
+
+// Etc is the state and the rules: etc/ of the installation, in the container the hidden directory of the data.
+func (p Paths) Etc(name string) string {
+	if p.Container {
+		return filepath.Join(p.Data(), ".atom", name)
+	}
+	return filepath.Join(p.Root, "etc", name)
+}
+
+func (p Paths) Lib(name string) string {
+	if p.Container {
+		return filepath.Join(p.Data(), ".atom", name)
+	}
+	return filepath.Join(p.Root, "lib", name)
+}
+
+func (p Paths) Run(name string) string {
+	if p.RunDir != "" {
+		return filepath.Join(p.RunDir, name)
+	}
+	return filepath.Join(p.Root, "run", name)
+}
+
+func (p Paths) Backup() string {
+	if p.Container {
+		return filepath.Join(p.Data(), ".atom", "backup")
+	}
+	return filepath.Join(p.Root, "backup")
+}
 
 func (p Paths) proxyService() (binary, unit, config string) {
 	var state struct {
@@ -64,6 +100,9 @@ func (p Paths) unitFile(name string) string {
 }
 
 func (p Paths) Init() initSystem {
+	if p.Container {
+		return containerInit{socket: p.Run(controlSocket)}
+	}
 	if p.OpenRC {
 		return openRCInit{}
 	}

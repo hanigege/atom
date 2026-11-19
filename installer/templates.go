@@ -341,9 +341,21 @@ exec rc-service %[1]s start
 
 var reloadCmdRe = regexp.MustCompile(`(?m)^([ 	]+reload:[ 	]*)\[[^\]\n]*atom-sing-box\.service\]`)
 
+// setReloadCommand rewrites the reload and stop commands of the two kernels in atom_rules.yaml. cmd is the
+// reload script of sing-box (OpenRC); when it is the installer itself (the container version, which has no
+// service manager), every command becomes `atom-installer svc <action> <service>`.
 func setReloadCommand(yaml, cmd string) (string, error) {
 	if !reloadCmdRe.MatchString(yaml) {
 		return "", fmt.Errorf("atom_rules.yaml has no sing-box reload command")
+	}
+	if filepath.Base(cmd) == "atom-installer" {
+		for _, backend := range []string{"sing-box", "mihomo"} {
+			for _, a := range []struct{ yamlAction, action string }{{"reload-or-restart", "reload"}, {"stop", "stop"}} {
+				yaml = strings.ReplaceAll(yaml, "[systemctl, "+a.yamlAction+", atom-"+backend+".service]",
+					"["+cmd+", svc, "+a.action+", atom-"+backend+"]")
+			}
+		}
+		return yaml, nil
 	}
 	yaml = reloadCmdRe.ReplaceAllString(yaml, "${1}["+strings.ReplaceAll(cmd, "$", "$$")+"]")
 	yaml = strings.ReplaceAll(yaml, "[systemctl, reload-or-restart, atom-mihomo.service]", "["+filepath.Join(filepath.Dir(cmd), "reload-mihomo.sh")+"]")

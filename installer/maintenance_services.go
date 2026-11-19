@@ -33,6 +33,9 @@ type serviceStatus struct {
 
 // serviceState asks the service manager within ctx; an answer that cannot be had is "unknown".
 func serviceState(ctx context.Context, p Paths, name string) string {
+	if p.Container {
+		return containerServiceState(p, name)
+	}
 	if p.OpenRC {
 		code, err := openRCStatus(ctx, name)
 		switch {
@@ -68,6 +71,12 @@ func installedServices(p Paths) []string {
 	for _, n := range panelServices {
 		unit := n + ".service"
 		if isKernel(unit) && unit != kernel {
+			continue
+		}
+		if p.Container { // no service definitions, and the entry process is not a service of its own
+			if n != "atom-maintenance" {
+				names = append(names, n)
+			}
 			continue
 		}
 		if _, err := os.Lstat(p.unitFile(unit)); err == nil {
