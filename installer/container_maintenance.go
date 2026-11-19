@@ -23,6 +23,8 @@ func (c containerMaint) handler(w http.ResponseWriter, r *http.Request) {
 		c.restartService(w, r)
 	case r.URL.Path == "/upgrade" || r.URL.Path == "/check":
 		writeErr(w, 400, "容器版通过更换镜像更新")
+	case r.Method == "GET" && r.URL.Path == "/network":
+		c.network(w)
 	case r.URL.Path == "/network":
 		writeErr(w, 400, "容器版的网络设置在容器里运行 atom-installer reconfigure 修改")
 	case r.Method == "POST" && r.URL.Path == "/reset":
