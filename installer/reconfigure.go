@@ -94,7 +94,7 @@ func (rc *reconfigureRun) undoAdditions(newCh *Changes, log Logger) {
 
 // configFromState is what the wizard shows for an installed machine.
 func configFromState(st *InstallState) Config {
-	c := Config{Topology: st.Topology, LAN: st.LAN, WAN: st.WAN, AcceptGateway: st.Topology == "gateway",
+	c := Config{Topology: st.Topology, LAN: st.LAN, WAN: st.WAN,
 		ReplyVia: st.ReplyVia != "", Router: st.ReplyVia, PanelPort: st.PanelPort}
 	if c.LAN == nil {
 		c.LAN = []string{}

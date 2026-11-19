@@ -181,7 +181,7 @@ ExecStartPre=/usr/sbin/sysctl -w net/ipv4/conf/all/accept_redirects=0 net/ipv4/c
                                                                        └─ 其他（ping）→ 转发 + NAT → WAN 网卡 → 上级
 ```
 
-- 用户的接法（2026-11-12）：VM 的 LAN 接主路由的 WAN2，主路由把 FakeIP 网段和要代理的网段走 WAN2。所以到达 VM 的转发流量都是要代理的，安装器的警告写的是"主路由需要把 FakeIP 网段和要代理的网段转到这台机器"（原来是"LAN 的全部流量都会经过这台机器"）。
+- 用户的接法（2026-11-12）：VM 的 LAN 接主路由的 WAN2，主路由把 FakeIP 网段和要代理的网段走 WAN2。所以到达 VM 的转发流量都是要代理的，安装器的警告写的是"主路由需要把 FakeIP 网段和要代理的网段转到这台机器"（原来是"LAN 的全部流量都会经过这台机器"）。2026-11-19 这条警告和确认从向导里去掉，主路由的要求写在 [安装和接入](guide/install.md)。
 - 规则：3.1 + 3.2 + 3.3，`ip_forward = 1`。客户端不在 LAN 网段时的回程路由（`policy-route.sh` 里的 client routes）和面板只对 LAN 开放的规则见 design.md 9.2，不变。
 - 和 xray 那台机器（10.0.2.1，只读参考过）比：现在一样是把 LAN 进来的所有 TCP/UDP 都导进 sing-box（只放过目标是本机的包）；xray 另外在 `output` 链按目标打标记把本机流量也导回去，并用 mark `0xff` 排除 sing-box 自己的流量，atom 不处理本机流量，所以不需要。xray 的 TProxy 标记是 `0x1`、路由表 100，atom 换成 `0x233`、233，避免和已有配置撞上。
 

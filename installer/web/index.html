@@ -281,7 +281,7 @@ const ART = {
   </svg>`,
 };
 
-const FIELD_STEP = { topology: 'net', lan: 'net', wan: 'net', accept_gateway: 'net', lan_gateway: 'net', client_nets: 'net', router: 'net', panel_port: 'net', panel_user: 'net', panel_password: 'net', panel_login_off: 'net', domestic: 'dns', foreign: 'dns', backend: 'kernel', fakeip_range: 'sb', mixed_port: 'sb', subscription_url: 'sb' };
+const FIELD_STEP = { topology: 'net', lan: 'net', wan: 'net', lan_gateway: 'net', client_nets: 'net', router: 'net', panel_port: 'net', panel_user: 'net', panel_password: 'net', panel_login_off: 'net', domestic: 'dns', foreign: 'dns', backend: 'kernel', fakeip_range: 'sb', mixed_port: 'sb', subscription_url: 'sb' };
 // the DNS, kernel and proxy steps are skipped when the data of an earlier installation is there: its settings stay
 function steps() {
   const all = [{ id: 'env', name: '环境检查', view: viewEnv }, { id: 'net', name: '网络', view: viewNet }, { id: 'dns', name: 'DNS 上游', view: viewDNS },
@@ -295,7 +295,7 @@ function initCfg(st) {
   const ifs = st.ifaces, def = ifs.find(i => i.default) || ifs[0];
   S.cfg = {
     topology: ifs.length >= 2 ? '' : 'bypass',
-    lan: def ? [def.name] : [], wan: '', accept_gateway: false, lan_gateway: '', client_nets: '',
+    lan: def ? [def.name] : [], wan: '', lan_gateway: '', client_nets: '',
     reply_via: false, router: '',
     panel_port: st.defaults.panel_port, panel_user: '', panel_password: '', panel_login_off: false,
     domestic: st.defaults.domestic, foreign: st.defaults.foreign,
@@ -304,7 +304,7 @@ function initCfg(st) {
   // after a reset the network step starts from the network of the installation before it
   const cur = st.reconfigure && st.current ? st.current : st.reset ? st.reset.previous : null;
   if (cur) {
-    Object.assign(S.cfg, { topology: cur.topology, lan: cur.lan || [], wan: cur.wan || '', accept_gateway: !!cur.accept_gateway, lan_gateway: cur.lan_gateway || '',
+    Object.assign(S.cfg, { topology: cur.topology, lan: cur.lan || [], wan: cur.wan || '', lan_gateway: cur.lan_gateway || '',
       client_nets: cur.client_nets || '', reply_via: !!cur.reply_via, router: cur.router || '', panel_port: cur.panel_port });
     if (st.reconfigure && st.login && st.login.enabled) S.cfg.panel_user = st.login.username;
   }
@@ -386,8 +386,6 @@ function viewNet() {
       <div class="sec"><label class="lbl" for="client_nets">客户端网段</label><textarea class="inp${bad('client_nets')}" id="client_nets" data-bind="client_nets" spellcheck="false" placeholder="每行一个，例如 10.0.0.0/24">${esc(c.client_nets)}</textarea>${errOf('client_nets')}</div></div>` + '</div>';
     h += '<div class="side wan">' + sideHead('wan', I.globe, 'WAN 网卡', '外网 · 单选') + '<div class="ifs">' + ifs.map(i => ifRow(i, { name: 'wan', bind: 'wan', selected: c.wan === i.name })).join('') + '</div>' + errOf('wan') + '</div>';
     h += '</div>';
-    h += `<div class="alert">${I.warn}<div class="grow"><div>主路由需要把 FakeIP 网段和要代理的网段转到这台机器：从 LAN 网卡进来的 TCP、UDP 全部进入代理内核，其余（如 ping）转发并 NAT 到 WAN。</div>
-      <label class="agree"><input type="checkbox" data-bind="accept_gateway" ${c.accept_gateway ? 'checked' : ''}>我知道，继续</label>${errOf('accept_gateway')}</div></div>`;
   }
   h += `<div class="sec short"><label class="lbl" for="panel_port">面板端口</label><input class="inp${bad('panel_port')}" id="panel_port" type="number" min="1" max="65535" data-bind="panel_port" value="${esc(c.panel_port)}">${errOf('panel_port')}</div>`;
   h += `<div class="g2">
@@ -723,7 +721,7 @@ document.addEventListener('input', ev => bind(ev.target));
 document.addEventListener('change', ev => {
   bind(ev.target);
   const f = ev.target.dataset && ev.target.dataset.bind;
-  if (['topology', 'backend', 'lan_one', 'lan_multi', 'wan', 'accept_gateway', 'reply_via', 'panel_login_off'].includes(f)) {
+  if (['topology', 'backend', 'lan_one', 'lan_multi', 'wan', 'reply_via', 'panel_login_off'].includes(f)) {
     render();
     const again = document.querySelector(`[data-bind="${f}"][value="${CSS.escape(ev.target.value)}"]`) || document.querySelector(`[data-bind="${f}"]`);
     if (again) again.focus();
@@ -738,7 +736,6 @@ function bind(t) {
   if (f === 'lan_one') c.lan = [t.value];
   else if (f === 'lan_multi') { c.lan = [...document.querySelectorAll('[data-bind=lan_multi]:checked')].map(x => x.value); if (c.lan.includes(c.wan)) c.wan = ''; }
   else if (f === 'wan') { c.wan = t.value; c.lan = c.lan.filter(x => x !== c.wan); }
-  else if (f === 'accept_gateway') c.accept_gateway = t.checked;
   else if (f === 'panel_login_off') c.panel_login_off = t.checked;
   else if (f === 'reply_via') { c.reply_via = t.checked; if (c.reply_via && !c.router) c.router = (S.state.gateways || {})[c.lan[0]] || ''; }
   else if (f === 'topology') {

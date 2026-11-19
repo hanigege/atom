@@ -14,7 +14,6 @@ type Config struct {
 	Topology      string   `json:"topology"` // bypass | gateway
 	LAN           []string `json:"lan"`
 	WAN           string   `json:"wan"`
-	AcceptGateway bool     `json:"accept_gateway"`
 	LANGateway    string   `json:"lan_gateway"` // gateway only: the router on the LAN side, for clients not on the LAN
 	ClientNets    string   `json:"client_nets"` // gateway only: those clients' networks, one per line
 	ReplyVia      bool     `json:"reply_via"`   // bypass only: answers to the LAN go back through the main router
@@ -99,9 +98,6 @@ func (c *Config) Validate(ifaces []Iface, installerPort int, busy func(port int)
 		}
 		if c.WAN == "" {
 			add("wan", "选择 WAN 网卡")
-		}
-		if !c.AcceptGateway {
-			add("accept_gateway", "需要确认")
 		}
 	default:
 		add("topology", "选择拓扑")
