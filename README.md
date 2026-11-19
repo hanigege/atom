@@ -76,6 +76,7 @@ curl -fsSL https://github.com/jasonxtt/atom/releases/latest/download/install.sh 
 |---|---|
 | [安装和接入](docs/guide/install.md) | 系统要求、安装向导、两种拓扑、主路由设置 |
 | [规则](docs/guide/rules.md) | 规则表怎么匹配、条件和动作、规则集、改动后多久生效 |
+| [DNS 和域名学习](docs/guide/dns.md) | 一次查询怎么走、域名学习和有效期、定期刷新、缓存、上游组、统计 |
 | [节点、节点组和订阅](docs/guide/proxy.md) | 导入节点、各类节点组、兜底分组、mihomo 订阅、切换内核 |
 | [升级和维护](docs/guide/maintenance.md) | 面板升级、修改网络、卸载、应急恢复、文件位置 |
 | [常见问题](docs/guide/faq.md) | 部分设备不走代理、改了规则没生效、DoH 和 IPv6 |
