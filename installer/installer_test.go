@@ -1195,13 +1195,20 @@ func TestOwnRoutes(t *testing.T) {
 
 // The gateway warning says what the topology needs (the main router sends this machine what is to be
 // proxied), not that all LAN traffic passes through it.
-func TestGatewayWarning(t *testing.T) {
+// The gateway topology has no warning or confirmation in the wizard (2026-11-19): what the main router must do
+// is in docs/guide/install.md.
+func TestNoGatewayConfirmation(t *testing.T) {
 	page := string(indexHTML)
-	if !strings.Contains(page, "主路由需要把 FakeIP 网段和要代理的网段转到这台机器") {
-		t.Error("the gateway warning lacks what the main router must send here")
+	for _, gone := range []string{"主路由需要把 FakeIP 网段", "accept_gateway", "我知道，继续"} {
+		if strings.Contains(page, gone) {
+			t.Errorf("the wizard still has %q", gone)
+		}
 	}
-	if strings.Contains(page, "全部流量都会经过这台机器") {
-		t.Error("the old gateway warning is still there")
+	// an older panel still sends the field: it is ignored, not refused
+	var n networkRequest
+	r := httptest.NewRequest("POST", "/network", strings.NewReader(`{"topology":"gateway","lan":["eth1"],"wan":"eth0","accept_gateway":false,"panel_port":80,"revision":"x"}`))
+	if err := decodeMaintenance(r, &n); err != nil || n.Topology != "gateway" {
+		t.Errorf("%+v %v", n, err)
 	}
 }
 
