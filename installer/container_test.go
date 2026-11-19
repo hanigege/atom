@@ -234,6 +234,7 @@ func TestSupervisorRestartsAfterACrashButNotAfterACleanExit(t *testing.T) {
 	if err := s.Start("atom-sing-box"); err != nil {
 		t.Fatal(err)
 	}
+	waitFor(t, "first start", func() bool { data, _ := os.ReadFile(marks); return strings.Count(string(data), "x") == 1 })
 	pid := s.list()[0].PID
 	syscall.Kill(pid, syscall.SIGKILL)
 	waitFor(t, "restart", func() bool { st := s.list()[0]; return st.State == "running" && st.PID != pid })

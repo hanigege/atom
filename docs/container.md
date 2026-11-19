@@ -248,3 +248,47 @@ networks:
 - **镜像仓库 [定]**：Docker Hub 加 ghcr（第 4 节）。
 - **重新配置 [定]**：`atom-installer reconfigure`（6.3 节）。
 - **ROS 接法 [定]**：两种都支持，“回包经主路由”允许打开（7.2 节）。
+
+## 11. 实施和验证记录
+
+### C1 入口进程和镜像（2026-11-20）
+
+**做了什么**（代码在 `installer/`，只用标准库）：
+
+- `atom-installer container`（`container.go`）：PID 1。启动顺序是先开控制 socket 和维护 socket，再读 `install.json`，再加载网络，再按 `services.json` 起服务（内核在前，atomdns 在后）；SIGTERM 后先停 atomdns 再停内核，每个服务 SIGTERM 后最多等 4 秒再 SIGKILL。
+- 三个服务的命令行、`sync-nft --start`、重载前的 `sync-nft` 和 RestartSec（atomdns 2 秒，内核 1 秒）与 systemd 单元一致，有单元测试对比。退出码为 0 的进程不重启（同 `Restart=on-failure`），被信号杀死或非 0 退出会重启；启动前的准备（`sync-nft --start`、`config.json` 在不在）失败也按同样的间隔重试。
+- 加载网络放在 atomdns 的启动前（同单元里的 `ExecStartPre`），启动时先做一次，失败就退出并提示检查 `NET_ADMIN` 和内核模块。**每次都从 `install.json` 重新渲染 `atom.nft` 和 `policy-route.sh`**（偏离 5.1 节的字面：5.1 只说加载），所以没有向导的 C1 也能起来，向导（C2）直接复用 `writeNetworkFiles`。
+- `services.json` 是 `{"atom-dns": "running", ...}`。`start`、`reload`、`restart` 记为 running，`stop` 记为 stopped；SIGTERM 关机不改它。没有这个文件时只有 atomdns 是 running，内核由 atomdns 自己拉起，和 systemd 版第一次安装一样。
+- `containerInit`（`container_control.go`）是第三个 `initSystem`，经 `/run/atom/control.sock`（HTTP over unix）通信。`atom-maintenance` 在容器里就是入口进程自己，对它的启停是空操作。`atom-installer svc <start|stop|restart|reload|is-active> <服务>` 是同一个客户端的命令行；`reload` 先 `sync-nft` 再 SIGHUP，没运行就启动。
+- 路径（`paths.go`）：`ATOM_DEPLOYMENT=container` 时 `Paths.Container` 为真；`Etc`、`Lib` 都指向 `data/.atom/`，`Backup` 是 `data/.atom/backup`，`Run` 是 `/run/atom`（`ATOM_RUN_DIR` 可改，给测试用）；`Bin`、`Shipped` 仍在 `/opt/atom/bin`、`/opt/atom/share`。`Paths.Init()` 返回 `containerInit`，安装、自检的代码没有分支；只有 `writeNetworkFiles` 在容器里不写服务定义、`serviceState`/`installedServices` 在容器里走入口进程。
+- `setReloadCommand` 在命令是 `atom-installer` 时改写成 `[atom-installer, svc, reload|stop, atom-sing-box|atom-mihomo]`（`refreshConfig` 在容器里这样调用）。
+- 维护 socket（`container_maintenance.go`，路径同 Linux 版 `maintenance.sock`）：`GET /` 返回 `{"version", "online": false, "deployment": "container"}`；`GET /services` 列出 atomdns 和当前内核（不列 atom-maintenance）；`POST /restart` 复用 Linux 版的判断（未选中的内核 400，有任务时 409）；`/check`、`/upgrade`、`/network` 返回 400 和说明；`/reset` 返回 400“还没有实现”（留给 C2）。
+- 日志：每行加 `[atom-dns]` 之类的前缀写到标准输出，入口进程自己的行是 `[atom]`；每个服务在内存里留 200 行给 `Logs()`。
+- `installer/container/Dockerfile`、`installer/scripts/build-image.sh`：输入 `build-package.sh` 的产物目录（校验 `SHA256SUMS`）或单个 glibc 包，可用 `--installer` 换掉包里的 atom-installer（开发用）；`--base` 指定已经装好依赖的基础镜像（此时不跑 apt）。输出 `atom-<版本>-container-amd64.tar`。镜像里 `PATH` 含 `/opt/atom/bin`，`docker exec atom atom-installer ...` 可以直接用。
+- `installer/scripts/dev-container-seed.sh`：**只用于开发**，在向导做出来之前，把包里的配置、WebUI、`install.json`（完成、单网卡）和初始 `atom_proxy.json` 放进数据目录。
+
+**测试环境**：
+
+- `go vet`、`go test ./...`：vm92，`/root/atom-build/atom-c1/installer`（Go 1.24.4，linux/amd64），全部通过；新增的 `container_test.go` 连跑 5 遍通过。Mac 上 `TestStatusQueriesKeepTheDeadline` 在没有这次改动时也失败（1.2 秒对 100ms 的时限），是 Mac 上已有的计时问题，vm92 上通过。
+- vm92 不能访问 GitHub、Docker Hub 和 deb.debian.org，源码用 rsync 同步（没有在 vm92 上改代码）；基础镜像用 mmdebstrap（阿里云源，minbase，去掉文档、man、locale）构建后 `docker import` 成 `atom-base:trixie-slim`（88.7MB，含 nftables、iproute2、ca-certificates、tzdata）。镜像 `atom:0.2.1` 264MB，内容是 0.2.1 正式包，只把 atom-installer 换成新编的。
+- 实测：Docker 26.1.5，macvlan（parent `eth0`，10.0.0.0/24），容器 10.0.0.201，`cap_add: NET_ADMIN`，数据目录挂 `/root/atom-build/c1/data`；客户端是接在同一块网卡上的 macvlan netns（10.0.0.202）。结果见下表。
+
+| 项目 | 结果 |
+|---|---|
+| 容器起来，atomdns 加 sing-box 都在运行，面板 `http://10.0.0.201/` 从局域网可访问 | 通过 |
+| 容器里有 `table inet atom`、`ip rule 9233 fwmark 0x233 lookup 233` 和表 233 的 local 路由（宿主已加载 `nft_tproxy`，`nft_socket` 本期的规则用不到） | 通过 |
+| `PUT /api/v1/atom/settings` 把 backend 改成 mihomo：mihomo 起来，sing-box 被 `svc stop` 停掉，`services.json` 同步；再改回 sing-box 同样 | 通过 |
+| `kill -9` 内核：1 秒后拉起；`kill -9` atomdns：2 秒后拉起 | 通过 |
+| `docker restart`、`docker stop` 后再 `start`：`services.json` 恢复，mihomo 和 atomdns 重新起来 | 通过 |
+| `docker stop`：179 毫秒退出，退出码 0，日志有“已停止” | 通过 |
+| 客户端查 `www.google.com`：FakeIP（28.0.0.x）；`www.baidu.com`：真实 IP；UDP 和 TCP 都查过；两个内核各查过一遍 | 通过 |
+| `GET /api/v1/atom/maintenance` 返回 `deployment: container`；`/services` 返回两项；`/restart` 重启 atom-sing-box 和 atom-dns；`/network` 返回 400 | 通过 |
+| 没有 `NET_ADMIN`：容器退出（1），日志写明“检查 NET_ADMIN 和内核的 nft_tproxy、nft_socket” | 通过 |
+| 没有 `install.json`：容器退出（1），日志说明向导还没有实现 | 通过 |
+
+没有节点，所以没测代理流量能不能出去；没测“回包经主路由”（5.1 节第 4 步里的 `accept_redirects` 逻辑只有单元测试没有实测）；没测 arm64、`mihomo` 作为初始内核以外的数据迁移。
+
+**已知限制**：
+
+- 入口进程不回收孤儿子进程（僵尸进程）。要正确回收，需要接管所有子进程的 wait（`exec.Cmd` 的 wait 会和通用回收冲突）；atomdns、sing-box、mihomo 的子进程都是自己 wait 的，目前没见到孤儿。需要的话 Docker 可以加 `init: true`。
+- 入口进程在 C1 没有安装向导，没有完成安装就退出；镜像版本比数据新时只打印一行日志，数据迁移留给 C4。

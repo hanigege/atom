@@ -11,7 +11,8 @@ RUN if [ "$DEPS" = install ]; then \
     fi \
     && command -v nft >/dev/null && command -v ip >/dev/null
 COPY atom/ /opt/atom/
-ENV ATOM_DEPLOYMENT=container
+ENV ATOM_DEPLOYMENT=container \
+    PATH=/opt/atom/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 VOLUME /opt/atom/data
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/opt/atom/bin/atom-installer", "container"]
