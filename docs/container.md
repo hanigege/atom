@@ -73,6 +73,7 @@
 - **构建和发布 [建议]**：
   - 做法和 rosboard 的 `.github/workflows/docker.yml` 一样，在 atom 仓库加一个 `docker.yml` 工作流，手动触发，输入 Release 标签。流程：下载这个 Release 的配套包，按 `SHA256SUMS` 校验，用 `docker buildx` 把包里的文件装进镜像（不编译，镜像里的程序就是发布包里那几个），推到 Docker Hub 和 ghcr，再用 `docker save` 出两个 tar 和它们的 sha256，传到同一个 Release 上。
   - **实际做法（C7）**：`docker.yml` 对每个架构调用 `installer/scripts/build-image.sh`（和本地构建同一个 Dockerfile），推单架构标签 `<版本>-amd64`、`<版本>-arm64`，再用 `docker buildx imagetools create` 合成 `<版本>`、`v<版本>` 的多架构索引（只有这个 Release 是最新 Release 时才加 `latest`，重跑旧版本不会把它改回去）；tar 就是推上去的那个单架构镜像，所以 Docker Hub 上会多两个 `-amd64`、`-arm64` 后缀的标签。说明文件是 `installer/container/DOCKERHUB.md`，由 `peter-evans/dockerhub-description` 推到 Docker Hub。
+  - **实际做法（C7）**：`docker.yml` 对每个架构调用 `installer/scripts/build-image.sh`（和本地构建同一个 Dockerfile），推单架构标签 `<版本>-amd64`、`<版本>-arm64`，再用 `docker buildx imagetools create` 合成 `<版本>`、`v<版本>` 的多架构索引（只有这个 Release 是最新 Release 时才加 `latest`，重跑旧版本不会把它改回去）；tar 就是推上去的那个单架构镜像，所以 Docker Hub 上会多两个 `-amd64`、`-arm64` 后缀的标签。说明文件是 `installer/container/DOCKERHUB.md`，由 `peter-evans/dockerhub-description` 推到 Docker Hub。
   - 发版顺序不变：先在 Mac 上打包、签名、建 Release，再跑这个工作流。私钥仍然不离开 Mac，镜像里也没有需要签名的东西。
   - Docker Hub 的登录沿用 rosboard 的两个 secret 名字：`DOCKERHUB_USERNAME`、`DOCKERHUB_TOKEN`。GitHub 的 secret 值读不出来，要用户在 `jasonxtt/atom` 仓库里再设置一次，token 可以和 rosboard 共用。ghcr 用工作流自带的 `GITHUB_TOKEN`。
   - 本地验证用的镜像在 vm92 上构建：2026-11-20 已经装了 Debian 的 `docker.io` 26.1.5 和 `docker-buildx`，是临时用阿里云源装的，系统的 apt 源没改。
@@ -421,6 +422,31 @@ networks:
 - 迁移后如果用户之前把 atomdns 设成了“停止”（`services.json`），验证等不到接口，会被当成失败而回滚。
 - 验证失败后的退出码是 1，由 Docker 或 ROS 的重启策略决定要不要再试；设了 `restart: always` 会每隔一阵重复“迁移、失败、回滚”。
 - “检查失败”的错误里带有 Linux 版的“当前服务继续运行”字样（共用 `checkUpgradeConfig`）。
+
+### C7 arm64 和发布工作流（2026-11-20）
+
+**做了什么**：`installer/scripts/build-image.sh` 的 `--arch` 接受 `arm64`（只改了参数检查）；新增 `.github/workflows/docker.yml`（手动触发，输入 Release 标签）和占位的 `installer/container/DOCKERHUB.md`。工作流流程见第 4 节。构建用 buildx 的 `docker` 驱动，镜像留在本机 daemon 里，`build-image.sh` 才能直接 `docker save`。
+
+**测试**：
+- vm92，`/root/atom-build/c7`：用 mmdebstrap（临时阿里云源装了 `arch-test`，qemu binfmt 本来就有）做出 arm64 的 Debian 基础镜像 `atom-base:trixie-slim-arm64`，再 `build-image.sh --arch arm64 --base ...` 用 0.2.1 的 arm64 glibc 包构建，得到 `atom:0.2.1-arm64`（Architecture arm64）和 `atom-0.2.1-container-arm64.tar`（260MB）。qemu 下运行 `atom-installer version` 输出 0.2.1，`uname -m` 为 aarch64。
+- n1 上没有 Docker，没有强装，真 arm64 机器上的运行没有测。
+- Mac：`actionlint`（装在 NAS 的 `tmp/c7`）检查工作流通过；校验步骤的 `grep` 对 0.2.1 的 `SHA256SUMS` 选出 2 行。
+- 工作流本身没有跑，要合并到 main 并发版后才能真正运行。
+
+**需要用户注意**：`DOCKERHUB_TOKEN` 要有仓库的描述写权限；`jasonxtt/atom` 的 ghcr 包第一次推上去后默认私有，要在 GitHub 里改成公开。
+
+**codex 审查**（`codex exec -s read-only`，静态，2 轮）：
+
+- 第一轮 5 条阻断、1 条小问题。已修 2 项：加网络、改面板端口失败时同样回滚（原来只记录文件留到下次启动再恢复）；回滚后也 `pruneBackups`，避免容器反复重启失败时备份堆满盘。其余 4 项记为已知限制（见下）。
+- 第二轮 1 条阻断（备份目录在写 `migrating.json` 前就建好，磁盘写满时每次重试都留一份残余），记为已知限制，没有第三轮。
+
+**还有这些已知限制**（codex 提的冷僻情形）：
+
+- 迁移期间（备份、覆盖、验证）维护 socket 和向导 socket 已经能收到请求：同时点“重置”或改网络会和迁移互相踩。窗口是几十秒，没有加锁。
+- 面板没设登录（空用户名和密码）时 atomdns 要“安装码”，安装器对 `/status` 一直 401，验证会超时并回滚。Linux 版升级有同样的前提；向导里设了用户名和密码就没有这个问题。
+- `in_sync` 在内核重载成功前可能已经为真，验证有极小的时间窗口会提前通过（同 Linux 版）。
+- `copyTree` 不复制符号链接，上游 YAML 如果是链接，回滚后会丢（同 Linux 版）。
+- 备份目录写到一半磁盘满了：残余目录要手动删（`data/.atom/backup/`，没有 `migrating.json` 指向的那些）。
 
 ### C7 arm64 和发布工作流（2026-11-20）
 

@@ -7,7 +7,7 @@
 #
 # --package   the directory build-package.sh wrote (atom-<version>-linux-<arch>.tar.gz, the glibc one, is taken from
 #             it and checked against SHA256SUMS when that is there), or one such tar.gz
-# --arch      amd64 (arm64 comes with C7)
+# --arch      amd64 or arm64 (default amd64); another architecture than the host's builds under qemu
 # --base      the base image instead of debian:trixie-slim, for a host that cannot reach Docker Hub and the Debian
 #             mirror: it must already have nftables, iproute2, ca-certificates and tzdata (apt is not run then)
 # --installer replace the atom-installer of the package (development: a newly built one)
@@ -33,7 +33,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "--version X.Y.Z is required" >&2; exit 2; }
-[ "$ARCH" = amd64 ] || { echo "only --arch amd64 for now" >&2; exit 2; }
+[ "$ARCH" = amd64 ] || [ "$ARCH" = arm64 ] || { echo "--arch must be amd64 or arm64" >&2; exit 2; }
 [ -n "$PACKAGE" ] || { echo "--package DIR|FILE is required" >&2; exit 2; }
 [ -z "$INSTALLER_BIN" ] || [ -f "$INSTALLER_BIN" ] || { echo "no such file: $INSTALLER_BIN" >&2; exit 2; }
 [ -n "$TAG" ] || TAG="atom:$VERSION"

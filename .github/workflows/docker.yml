@@ -88,12 +88,21 @@ jobs:
 
       - name: Publish the multi-architecture tags
         env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
+          # latest follows the latest Release, so re-running an old tag does not move it back
+          tags=("$VERSION" "v$VERSION")
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" = "$TAG" ]; then
+            tags+=(latest)
+          fi
           for image in "$DOCKERHUB_IMAGE" "$GHCR_IMAGE"; do
-            docker buildx imagetools create \
-              --tag "$image:$VERSION" --tag "$image:v$VERSION" --tag "$image:latest" \
-              "$image:$VERSION-amd64" "$image:$VERSION-arm64"
+            args=()
+            for t in "${tags[@]}"; do
+              args+=(--tag "$image:$t")
+            done
+            docker buildx imagetools create "${args[@]}" "$image:$VERSION-amd64" "$image:$VERSION-arm64"
             docker buildx imagetools inspect "$image:$VERSION"
           done
 
