@@ -79,20 +79,20 @@ func installedServices(p Paths) []string {
 
 func isKernel(unit string) bool { return unit == singBoxUnitName || unit == mihomoUnitName }
 
-// selectedKernel is the unit of the proxy kernel atom_proxy.json selects; no backend there is sing-box, as for
-// installations before the choice. A file that cannot be read or a backend it does not know: "", neither.
+// selectedKernel is the unit of the proxy kernel atom_proxy.json selects. Only "sing-box" (or the alias
+// "singbox") and "mihomo" select one; a file that cannot be read, null or anything else: "", neither.
 func selectedKernel(p Paths) string {
 	var state struct {
-		Settings struct {
-			Backend string `json:"backend"`
+		Settings *struct {
+			Backend *string `json:"backend"`
 		} `json:"settings"`
 	}
 	data, err := os.ReadFile(filepath.Join(p.Data(), "webinfo", "atom_proxy.json"))
-	if err != nil || json.Unmarshal(data, &state) != nil {
+	if err != nil || json.Unmarshal(data, &state) != nil || state.Settings == nil || state.Settings.Backend == nil {
 		return ""
 	}
-	switch state.Settings.Backend {
-	case "", "sing-box":
+	switch *state.Settings.Backend {
+	case "sing-box", "singbox":
 		return singBoxUnitName
 	case "mihomo":
 		return mihomoUnitName
@@ -117,24 +117,25 @@ func (m *maintenance) services(w http.ResponseWriter) {
 	writeResp(w, 200, map[string]any{"services": list})
 }
 
+// notRestartable says why the service cannot be restarted, "" if it can.
+func notRestartable(p Paths, service string) string {
+	switch {
+	case slices.Contains(installedServices(p), service):
+		return ""
+	case !isKernel(service + ".service"):
+		return "没有安装这个服务"
+	case selectedKernel(p) == "":
+		return "无法确定当前使用的代理内核"
+	}
+	return "不是当前使用的代理内核"
+}
+
 func (m *maintenance) restartService(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Service string `json:"service"`
 	}
 	if decodeMaintenance(r, &req) != nil || !slices.Contains(panelServices, req.Service) {
 		writeErr(w, 400, "无效的服务")
-		return
-	}
-	if !slices.Contains(installedServices(m.paths), req.Service) {
-		if unit := req.Service + ".service"; isKernel(unit) {
-			if selectedKernel(m.paths) == "" {
-				writeErr(w, 400, "无法确定当前使用的代理内核")
-			} else {
-				writeErr(w, 400, "不是当前使用的代理内核")
-			}
-			return
-		}
-		writeErr(w, 400, "没有安装这个服务")
 		return
 	}
 	m.mu.Lock()
@@ -150,6 +151,19 @@ func (m *maintenance) restartService(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, err.Error())
 		return
 	}
+	// the panel switches the kernel under the shared write lock: with it held off, the kernel read below stays
+	writes, err := m.holdWrites()
+	if err != nil {
+		lock.Close()
+		writeErr(w, 409, err.Error())
+		return
+	}
+	if msg := notRestartable(m.paths, req.Service); msg != "" {
+		writes.Close()
+		lock.Close()
+		writeErr(w, 400, msg)
+		return
+	}
 	writeResp(w, 202, map[string]bool{"ok": true})
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
@@ -157,6 +171,7 @@ func (m *maintenance) restartService(w http.ResponseWriter, r *http.Request) {
 	delay, hold := restartDelay, selfRestartHold
 	go func() {
 		defer lock.Close()
+		defer writes.Close()
 		time.Sleep(delay)
 		if err := restartUnit(m.paths, req.Service+".service", hold); err != nil {
 			stderrLogger{}.Logf("重启 %s：%v", req.Service, err)

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -32,7 +33,26 @@ esac`})
 	old := restartDelay
 	restartDelay = 0
 	t.Cleanup(func() { restartDelay = old })
+	selectKernel(t, p, "sing-box")
 	return p, dir
+}
+
+func selectKernel(t *testing.T, p Paths, setting string) {
+	t.Helper()
+	if !strings.HasPrefix(setting, "{") && setting != "null" {
+		setting = `{"settings":{"backend":"` + setting + `"}}`
+	}
+	if err := writeFileAtomic(filepath.Join(p.Data(), "webinfo", "atom_proxy.json"), []byte(setting), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// servicesOpenRC is openRCMachine with sing-box selected.
+func servicesOpenRC(t *testing.T) (Paths, string) {
+	t.Helper()
+	p, stub := openRCMachine(t)
+	selectKernel(t, p, "sing-box")
+	return p, stub
 }
 
 func getServices(t *testing.T, m *maintenance) []serviceStatus {
@@ -77,7 +97,7 @@ func TestServicesQueryHasADeadline(t *testing.T) {
 }
 
 func TestServicesOpenRC(t *testing.T) {
-	p, stub := openRCMachine(t)
+	p, stub := servicesOpenRC(t)
 	for name, code := range map[string]string{"atom-dns": "32", "atom-sing-box": "3", "atom-mihomo": "16"} {
 		os.WriteFile(filepath.Join(stub, "status-"+name), []byte(code), 0o644)
 	}
@@ -91,15 +111,13 @@ func TestServicesOpenRC(t *testing.T) {
 // Of the two kernels only the selected one is shown and may be restarted: the other shares its ports and nft
 // sets.
 func TestServicesOnlyTheSelectedKernel(t *testing.T) {
-	p, stub := openRCMachine(t)
+	p, stub := servicesOpenRC(t)
 	m := &maintenance{paths: p}
 	w := postRestart(m, `{"service":"atom-mihomo"}`)
 	if w.Code != 400 || !strings.Contains(w.Body.String(), "不是当前使用的代理内核") {
 		t.Errorf("%d %s", w.Code, w.Body.String())
 	}
-	if err := writeFileAtomic(filepath.Join(p.Data(), "webinfo", "atom_proxy.json"), []byte(`{"settings":{"backend":"mihomo"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	selectKernel(t, p, "mihomo")
 	got := getServices(t, m)
 	want := []serviceStatus{{"atom-maintenance", "running"}, {"atom-dns", "running"}, {"atom-mihomo", "running"}}
 	if !reflect.DeepEqual(got, want) {
@@ -115,8 +133,8 @@ func TestServicesOnlyTheSelectedKernel(t *testing.T) {
 	waitUnlocked(t, p)
 
 	// a setting that cannot be read selects neither: the wrong kernel would rewrite the shared nft sets
-	for _, setting := range []string{"{", `{"settings":{"backend":"xray"}}`} {
-		os.WriteFile(filepath.Join(p.Data(), "webinfo", "atom_proxy.json"), []byte(setting), 0o600)
+	for _, setting := range []string{"{", "null", "{}", `{"settings":null}`, `{"settings":{}}`, `{"settings":{"backend":null}}`, "", "xray"} {
+		selectKernel(t, p, setting)
 		got := getServices(t, m)
 		if want := []serviceStatus{{"atom-maintenance", "running"}, {"atom-dns", "running"}}; !reflect.DeepEqual(got, want) {
 			t.Errorf("%s: %+v", setting, got)
@@ -125,6 +143,62 @@ func TestServicesOnlyTheSelectedKernel(t *testing.T) {
 		if w.Code != 400 || !strings.Contains(w.Body.String(), "无法确定当前使用的代理内核") {
 			t.Errorf("%s: %d %s", setting, w.Code, w.Body.String())
 		}
+	}
+	selectKernel(t, p, "singbox") // the alias atomdns accepts
+	if w := postRestart(m, `{"service":"atom-sing-box"}`); w.Code != 202 {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	waitCall(t, stub, "rc-service atom-sing-box restart")
+	waitUnlocked(t, p)
+}
+
+// A panel write (the kernel switch among them) holds the shared write lock: the restart waits for it, and reads
+// the kernel only after.
+func TestRestartWaitsForPanelWrites(t *testing.T) {
+	p, dir := servicesSystemd(t, nil)
+	if err := os.MkdirAll(p.Run(""), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	panel, err := os.OpenFile(p.Run(panelWriteLock), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer panel.Close()
+	if err := syscall.Flock(int(panel.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan *httptest.ResponseRecorder)
+	go func() { done <- postRestart(&maintenance{paths: p}, `{"service":"atom-sing-box"}`) }()
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case w := <-done:
+		t.Fatalf("answered while a panel write runs: %d %s", w.Code, w.Body.String())
+	default:
+	}
+	selectKernel(t, p, "mihomo") // the write switches the kernel, then ends
+	panel.Close()
+	w := <-done
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "不是当前使用的代理内核") {
+		t.Errorf("%d %s", w.Code, w.Body.String())
+	}
+	if calls(dir, "systemctl restart atom-sing-box.service") != 0 {
+		t.Error("the old kernel was restarted")
+	}
+	waitUnlocked(t, p)
+	if lock, err := exclusiveLock(p.Run(panelWriteLock), true); err != nil {
+		t.Errorf("the write lock was kept: %v", err)
+	} else {
+		lock.Close()
+	}
+}
+
+// A child that keeps the output pipe open must not keep runCmd past its timeout.
+func TestRunCmdReturnsOnTheTimeout(t *testing.T) {
+	fakeCommands(t, map[string]string{"stuck": "sleep 30 &\nsleep 30"})
+	start := time.Now()
+	err := runCmd(stderrLogger{}, 300*time.Millisecond, "stuck")
+	if err == nil || time.Since(start) > 5*time.Second {
+		t.Errorf("%v after %v", err, time.Since(start))
 	}
 }
 
@@ -235,7 +309,7 @@ func TestRestartTheMaintenanceServiceItself(t *testing.T) {
 	}
 	waitUnlocked(t, p)
 
-	p, stub := openRCMachine(t)
+	p, stub := servicesOpenRC(t)
 	if w := postRestart(&maintenance{paths: p}, `{"service":"atom-maintenance"}`); w.Code != 202 {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
