@@ -151,6 +151,11 @@ func cmdContainer([]string) int {
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 	host := newWizardHost(p, sup)
 	setWizardHost(host)
+	// a reset that was stopped half way is finished before anything can change the data
+	if err := resumeReset(p, sup); err != nil {
+		sup.Logf("%v", err)
+		return 1
+	}
 	closeSockets, err := serveContainerSockets(p, sup, host)
 	if err != nil {
 		sup.Logf("%v", err)
@@ -159,10 +164,6 @@ func cmdContainer([]string) int {
 	defer closeSockets()
 
 	failed := make(chan struct{})
-	if err := resumeReset(p, sup); err != nil {
-		sup.Logf("%v", err)
-		return 1
-	}
 	st, err := loadState(p)
 	if err != nil || !st.Complete {
 		// no installation: the wizard, then the services it started carry on
@@ -185,7 +186,7 @@ func cmdContainer([]string) int {
 	// the network and the start run beside the signal wait: a SIGTERM in the middle of them is answered
 	go func() {
 		// a stop before the first wizard moved the panel from its temporary port: it moves now
-		if _, err := ensurePanelPort(p, st); err != nil {
+		if _, err := ensurePanelPort(p, st, false); err != nil {
 			sup.Logf("面板端口 %d 没有写进配置：%v", st.PanelPort, err)
 			close(failed)
 			return

@@ -33,8 +33,10 @@ func (ins *Installer) stepNetworkContainer(cfg Config, j *Job) error {
 		if err := removeReplyRouting(); err != nil { // an installation before this one had the option: its rule and table go
 			return err
 		}
-	} else if ins.redirectsBefore == nil && (st.LAN != nil) {
-		ins.redirectsBefore = readRedirects(st.LAN[0]) // for the rollback
+	}
+	ins.redirectsBefore = nil // per attempt: what a failed one changed goes back
+	if cfg.ReplyVia && len(st.LAN) > 0 {
+		ins.redirectsBefore = readRedirects(st.LAN[0])
 	}
 	if err := loadContainerNetwork(ins.Paths); err != nil {
 		return err
@@ -59,7 +61,10 @@ func absentErr(err error) bool {
 // removeReplyRouting takes the rule of the reply option and its default route away, when the rule is exactly
 // the installer's: another rule or table 234 is not touched.
 func removeReplyRouting() error {
-	rules, _ := quietCmd("ip", "rule", "show")
+	rules, err := quietCmd("ip", "rule", "show")
+	if err != nil {
+		return fmt.Errorf("ip rule show：%w: %s", err, rules)
+	}
 	ours := false
 	for _, l := range strings.Split(rules, "\n") {
 		ours = ours || strings.TrimSpace(l) == replyRule
@@ -68,12 +73,14 @@ func removeReplyRouting() error {
 		return nil
 	}
 	var errs []string
+	// the route first: while the rule is there, a retry finds it and does both again
 	for _, args := range [][]string{
-		{"rule", "del", "fwmark", replyMark, "lookup", replyTable, "priority", replyPriority},
 		{"route", "del", "default", "table", replyTable},
+		{"rule", "del", "fwmark", replyMark, "lookup", replyTable, "priority", replyPriority},
 	} {
 		if err := runCmd(quietLogger{}, 30*time.Second, "ip", args...); err != nil && !absentErr(err) {
 			errs = append(errs, err.Error())
+			break // the rule stays, so that the next try finds it
 		}
 	}
 	if len(errs) > 0 {
@@ -224,6 +231,9 @@ func containerUninstallForReset(p Paths, log Logger) (string, error) {
 	if err := containerTeardown(p, log); err != nil {
 		return "", fmt.Errorf("%w，未删除任何数据", err)
 	}
+	if err := requireRealDirs(p); err != nil {
+		return "", fmt.Errorf("%w，未删除任何数据", err)
+	}
 	if err := os.MkdirAll(keptByReset(p), 0o700); err != nil {
 		return "", err
 	}
@@ -242,6 +252,9 @@ func containerUninstallForReset(p Paths, log Logger) (string, error) {
 // purgeData empties the data directory except for the backups; the install record goes last, so that a removal
 // that failed half way can be tried again in full.
 func purgeData(p Paths, log Logger) error {
+	if err := requireRealDirs(p); err != nil {
+		return err
+	}
 	data := p.Data()
 	keep := keptByReset(p)
 	entries, err := os.ReadDir(data)
@@ -275,10 +288,31 @@ func purgeData(p Paths, log Logger) error {
 	return nil
 }
 
+// requireRealDirs: data/.atom and its backup directory are directories, not links to somewhere else, so that what
+// is deleted below them is what was backed up.
+func requireRealDirs(p Paths) error {
+	for _, d := range []string{filepath.Join(p.Data(), ".atom"), keptByReset(p)} {
+		info, err := os.Lstat(d)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("%s 不是目录（是链接或文件）", d)
+		}
+	}
+	return nil
+}
+
 // resumeReset finishes a reset that the entry process did not (it was stopped while the data was deleted).
 func resumeReset(p Paths, log Logger) error {
 	if _, err := os.Stat(resetPending(p)); err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("读不到重置记录 %s：%w", resetPending(p), err)
 	}
 	log.Logf("上一次重置没有做完，继续清空数据")
 	if err := purgeData(p, log); err != nil {

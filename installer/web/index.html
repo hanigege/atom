@@ -696,13 +696,15 @@ async function openPanel() {
   try { await api('POST', '/api/finish'); } catch (e) {}
   // On the wizard's own address (the container) the panel takes the port over: wait until it is not the wizard that answers.
   const same = new URL(S.panelURL).origin === location.origin;
+  let up = !same;
   for (let i = 0; i < (same ? 60 : 20); i++) {
     try {
       const r = await fetch(S.panelURL, same ? { cache: 'no-store' } : { mode: 'no-cors', cache: 'no-store' });
-      if (!same || !r.headers.get('X-Atom-Wizard')) break;
+      if (!same || (r.ok && !r.headers.get('X-Atom-Wizard'))) { up = true; break; }
     } catch (e) { /* not up yet */ }
     await new Promise(r => setTimeout(r, 500));
   }
+  if (!up) { const el = document.getElementById('countdown'); if (el) el.textContent = '面板还没有起来'; return; }
   location.href = S.panelURL;
 }
 

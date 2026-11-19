@@ -150,6 +150,9 @@ func (h *wizardHost) start(kind wizardKind, id string, after func(*containerWiza
 			w.operation.Close()
 			err = fmt.Errorf("没有已完成的安装")
 		}
+	case wizardFirst:
+		// held through the handover of the panel: a restart asked of the temporary panel waits (is refused)
+		w.operation, err = operationLock(p)
 	}
 	if err != nil {
 		return nil, err
@@ -281,16 +284,19 @@ var panelBindRe = regexp.MustCompile(`(?m)^api:[ \t]*\r?\n[ \t]+http:[ \t]*"([^"
 // ensurePanelPort makes the panel port of config_custom.yaml the one install.json says; it returns whether the
 // file had to change. It is what moves the panel from the temporary port of the installation to the real one,
 // and what a container that was stopped before that does at its next start.
-func ensurePanelPort(p Paths, st *InstallState) (bool, error) {
+func ensurePanelPort(p Paths, st *InstallState, strict bool) (bool, error) {
 	path := p.Data() + "/config_custom.yaml"
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false, err
 	}
-	if m := panelBindRe.FindStringSubmatch(string(data)); m != nil {
+	m := panelBindRe.FindStringSubmatch(string(data))
+	if m != nil {
 		if _, port, err := net.SplitHostPort(m[1]); err == nil && port == strconv.Itoa(st.PanelPort) {
 			return false, nil // the bind address stays as it is
 		}
+	} else if !strict {
+		return false, nil // a layout this does not know: at an ordinary start the file is not touched
 	}
 	out, err := setPanelPort(string(data), st.PanelPort)
 	if err != nil {
@@ -301,7 +307,7 @@ func ensurePanelPort(p Paths, st *InstallState) (bool, error) {
 
 // handOverPanel: the wizard has closed and its port is free; atomdns moves to it.
 func handOverPanel(p Paths, sup *supervisor, st *InstallState) error {
-	if _, err := ensurePanelPort(p, st); err != nil {
+	if _, err := ensurePanelPort(p, st, true); err != nil {
 		return fmt.Errorf("面板端口：%w", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

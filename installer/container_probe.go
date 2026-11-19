@@ -97,8 +97,12 @@ func hasCap(capEff string, bit uint) bool {
 // the probe table: its name is not atom's, so nothing of the installation is touched
 const probeTable = "atom_probe"
 
+// probeIface is an interface name nothing has: the probe's rules begin with `iifname`, so no packet can match them
+// while they are loaded (the wizard of a reconfigure runs beside live traffic).
+const probeIface = "atom-probe0"
+
 func probeNft(chain, rule string) string {
-	return fmt.Sprintf("table inet %[1]s\ndelete table inet %[1]s\ntable inet %[1]s {\n\tchain p {\n\t\t%[2]s\n\t\t%[3]s\n\t}\n}\n", probeTable, chain, rule)
+	return fmt.Sprintf("table inet %[1]s\ndelete table inet %[1]s\ntable inet %[1]s {\n\tchain p {\n\t\t%[2]s\n\t\tiifname %[4]q %[3]s\n\t}\n}\n", probeTable, chain, rule, probeIface)
 }
 
 // the three statements the atom table uses, each in a chain of the kind it is used in
@@ -126,7 +130,9 @@ func (e probeEnv) probeNftTable() (reasons []string) {
 	for _, st := range probeStatements {
 		out, err := e.run(st.script, nft, "-f", "-")
 		if err == nil {
-			e.run("", nft, "delete", "table", "inet", probeTable)
+			if out, err := e.run("", nft, "delete", "table", "inet", probeTable); err != nil {
+				reasons = append(reasons, "不能删除探测用的 nft 表："+firstLine(out))
+			}
 			continue
 		}
 		switch {

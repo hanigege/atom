@@ -289,6 +289,9 @@ func syncBackup(backup string) error {
 			dirs = append(dirs, path)
 			return nil
 		}
+		if entry.Type()&os.ModeSymlink != 0 { // a link (the container's reset keeps them) is not opened: its target may not be there
+			return nil
+		}
 		return syncDir(path)
 	})
 	if err != nil {

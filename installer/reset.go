@@ -740,6 +740,11 @@ func backupForReset(p Paths, log Logger) (string, error) {
 	if p.Container && statErr != nil && !os.IsNotExist(statErr) {
 		return "", statErr // the data cannot be read: it is not deleted either
 	}
+	if p.Container {
+		if err := requireRealDirs(p); err != nil {
+			return "", err
+		}
+	}
 	if statErr == nil {
 		if err := copyData(filepath.Join(dir, "data")); err != nil {
 			return "", err

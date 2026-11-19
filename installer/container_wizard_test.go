@@ -397,7 +397,7 @@ func TestEnsurePanelPort(t *testing.T) {
 	os.MkdirAll(p.Data(), 0o755)
 	cfg := "api:\n  http: \"0.0.0.0:41234\"\n"
 	os.WriteFile(p.Data()+"/config_custom.yaml", []byte(cfg), 0o644)
-	changed, err := ensurePanelPort(p, &InstallState{PanelPort: 80})
+	changed, err := ensurePanelPort(p, &InstallState{PanelPort: 80}, true)
 	if err != nil || !changed {
 		t.Fatalf("%v %v", changed, err)
 	}
@@ -405,7 +405,7 @@ func TestEnsurePanelPort(t *testing.T) {
 	if !strings.Contains(string(data), `"0.0.0.0:80"`) {
 		t.Errorf("%s", data)
 	}
-	if changed, _ := ensurePanelPort(p, &InstallState{PanelPort: 80}); changed {
+	if changed, _ := ensurePanelPort(p, &InstallState{PanelPort: 80}, true); changed {
 		t.Error("changed again")
 	}
 }
@@ -619,7 +619,7 @@ func TestTeardownReportsWhatItCannotRemoveButNotWhatIsGone(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeAll()
-	gone := fakeCommands(t, map[string]string{"nft": `echo "Error: No such file or directory" >&2; exit 1`, "ip": `echo "RTNETLINK answers: No such file or directory" >&2; exit 2`})
+	gone := fakeCommands(t, map[string]string{"nft": `echo "Error: No such file or directory" >&2; exit 1`, "ip": `[ "$1 $2" = "rule show" ] && exit 0; echo "RTNETLINK answers: No such file or directory" >&2; exit 2`})
 	if err := containerTeardown(p, stderrLogger{}); err != nil {
 		t.Errorf("what is gone already is not an error: %v", err)
 	}
@@ -687,15 +687,18 @@ func TestEnsurePanelPortKeepsTheBindAddress(t *testing.T) {
 	os.MkdirAll(p.Data(), 0o755)
 	path := p.Data() + "/config_custom.yaml"
 	os.WriteFile(path, []byte("api:\n  http: \"127.0.0.1:80\"\n"), 0o644)
-	if changed, err := ensurePanelPort(p, &InstallState{PanelPort: 80}); err != nil || changed {
+	if changed, err := ensurePanelPort(p, &InstallState{PanelPort: 80}, true); err != nil || changed {
 		t.Errorf("%v %v", changed, err)
 	}
 	if data, _ := os.ReadFile(path); !strings.Contains(string(data), "127.0.0.1:80") {
 		t.Errorf("%s", data)
 	}
 	os.WriteFile(path, []byte("no api here\n"), 0o644)
-	if _, err := ensurePanelPort(p, &InstallState{PanelPort: 80}); err == nil {
-		t.Error("a config without api.http must be an error")
+	if _, err := ensurePanelPort(p, &InstallState{PanelPort: 80}, true); err == nil {
+		t.Error("the handover of the panel needs an api.http line")
+	}
+	if changed, err := ensurePanelPort(p, &InstallState{PanelPort: 80}, false); err != nil || changed {
+		t.Errorf("an ordinary start leaves a layout it does not know alone: %v %v", changed, err)
 	}
 }
 
@@ -768,5 +771,104 @@ func TestRedirectsAreGivenBackAfterAFailedReconfigure(t *testing.T) {
 	ins.undoRedirects(stderrLogger{})
 	if b, _ := os.ReadFile(f); strings.TrimSpace(string(b)) != "1" || ins.redirectsBefore != nil {
 		t.Errorf("%q %v", b, ins.redirectsBefore)
+	}
+}
+
+func TestProbeRulesCannotMatchPackets(t *testing.T) {
+	for _, st := range probeStatements {
+		if !strings.Contains(st.script, `iifname "`+probeIface+`"`) {
+			t.Errorf("%s probe could match live traffic:\n%s", st.what, st.script)
+		}
+	}
+	// a table that cannot be deleted again is a failed check
+	bin := fakeCommands(t, map[string]string{"nft": `[ "$1" = delete ] && { echo "Error: Operation not permitted" >&2; exit 1; }`, "ip": ""})
+	_ = bin
+	env, _ := fakeProbeEnv("1fffffffff", nil, "", 1, 1)
+	env.run = func(stdin, name string, args ...string) (string, error) {
+		if filepath.Base(name) == "nft" && len(args) > 0 && args[0] == "delete" {
+			return "Error: Operation not permitted", errors.New("exit 1")
+		}
+		return "", nil
+	}
+	pr := env.probe()
+	if len(pr.Problems) == 0 || !strings.Contains(pr.Problems[0], "不能删除探测用的 nft 表") {
+		t.Errorf("%+v", pr)
+	}
+}
+
+func TestResetRefusesAnAtomDirectoryThatIsALink(t *testing.T) {
+	p := containerPaths(t)
+	installedContainer(t, p)
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "keep"), []byte("x"), 0o644)
+	os.Rename(p.Data()+"/.atom", outside+"/atom-real")
+	os.Symlink(outside+"/atom-real", p.Data()+"/.atom")
+	if _, err := backupForReset(p, stderrLogger{}); err == nil {
+		t.Error("the backup of a linked .atom must be refused")
+	}
+	if err := purgeData(p, stderrLogger{}); err == nil {
+		t.Error("the purge of a linked .atom must be refused")
+	}
+	if !fileExists(outside + "/atom-real/install.json") {
+		t.Error("something outside the data directory was deleted")
+	}
+}
+
+func TestResetBackupSyncDoesNotFollowLinks(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(dir+"/f", []byte("x"), 0o644)
+	os.Symlink("/no/such/place", dir+"/dangling")
+	if err := syncBackup(dir); err != nil {
+		t.Errorf("a dangling link stopped the backup: %v", err)
+	}
+}
+
+func TestReplyRoutingRemovalIsRetryable(t *testing.T) {
+	// the route goes first: if it cannot be deleted the rule stays, and the next try finds the rule again
+	dir := fakeCommands(t, map[string]string{"ip": `case "$1 $2" in
+"rule show") cat "$D/rules";;
+"route del") echo "RTNETLINK answers: Operation not permitted" >&2; exit 2;;
+esac`})
+	os.WriteFile(filepath.Join(dir, "rules"), []byte(replyRule+"\n"), 0o644)
+	if err := removeReplyRouting(); err == nil {
+		t.Fatal("a route that cannot be deleted is an error")
+	}
+	calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
+	if !strings.Contains(string(calls), "route del") || strings.Contains(string(calls), "rule del") {
+		t.Errorf("the rule must stay while the route could not be deleted:\n%s", calls)
+	}
+	// `ip rule show` that fails is an error, not "nothing to do"
+	os.WriteFile(filepath.Join(dir, "ip"), []byte("#!/bin/sh\necho broken >&2\nexit 1\n"), 0o755)
+	if err := removeReplyRouting(); err == nil {
+		t.Error("ip rule show failed and nothing was said")
+	}
+}
+
+func TestFirstWizardHoldsTheOperationLock(t *testing.T) {
+	p := containerPaths(t)
+	s, _ := testSup(t, p, shSpec("atom-dns", `exec sleep 30`))
+	host := newWizardHost(p, s)
+	w, err := host.start(wizardFirst, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := operationLock(p); !errors.Is(err, errMaintenanceBusy) {
+		t.Errorf("a restart through the temporary panel could run: %v", err)
+	}
+	w.server.stop(false)
+	<-w.done
+	if l, err := operationLock(p); err != nil {
+		t.Errorf("the lock was kept: %v", err)
+	} else {
+		l.Close()
+	}
+}
+
+func TestResumeResetDoesNotRunAfterAMarkerLookupError(t *testing.T) {
+	p := containerPaths(t)
+	os.MkdirAll(p.Data(), 0o755)
+	os.WriteFile(p.Data()+"/.atom", []byte("a file where the directory should be"), 0o644)
+	if err := resumeReset(p, stderrLogger{}); err == nil {
+		t.Error("an unreadable marker location is not 'no reset pending'")
 	}
 }
