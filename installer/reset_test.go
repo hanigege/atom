@@ -143,7 +143,7 @@ func TestResetBackupIsNeverPruned(t *testing.T) {
 		t.Fatalf("the reset backup is the only copy of the old data: %v", err)
 	}
 
-	previous := Config{Topology: "gateway", LAN: []string{"eth1"}, WAN: "eth0", AcceptGateway: true, PanelPort: 8080}
+	previous := Config{Topology: "gateway", LAN: []string{"eth1"}, WAN: "eth0", PanelPort: 8080}
 	saveChanges(p, &Changes{ResolvedDropIn: true, DisabledUnits: []UnitState{{Unit: "dnsmasq.service"}}})
 	plan, err := planReset(p, previous, backup)
 	if err != nil {

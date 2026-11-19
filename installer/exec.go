@@ -33,6 +33,9 @@ func runCmd(log Logger, timeout time.Duration, name string, args ...string) erro
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	// on the timeout the command is killed, but a child it started may still hold the pipe: close it, so the
+	// reading below ends and this returns
+	go func() { <-ctx.Done(); stdout.Close() }()
 	var tail []string
 	var mu sync.Mutex
 	var wg sync.WaitGroup

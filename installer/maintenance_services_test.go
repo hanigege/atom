@@ -1,0 +1,342 @@
+package main
+
+import (
+	"encoding/json"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// servicesSystemd stands in for systemctl: is-active answers the line in <dir>/state-<unit> (no file: "unknown"
+// with exit 4, as for a unit systemd does not know) and sleeps the seconds in <dir>/slow first; restart sleeps
+// the seconds in <dir>/restart-slow.
+func servicesSystemd(t *testing.T, states map[string]string) (Paths, string) {
+	t.Helper()
+	p := Paths{Root: t.TempDir(), UnitDir: t.TempDir()}
+	installedWithServices(t, p)
+	dir := fakeCommands(t, map[string]string{"systemctl": `case "$1" in
+is-active) [ -e "$D/slow" ] && sleep "$(cat "$D/slow")"
+  [ -e "$D/state-$2" ] || { echo unknown; exit 4; }
+  s="$(cat "$D/state-$2")"; echo "$s"; [ "$s" = active ] && exit 0; exit 3;;
+restart) [ -e "$D/restart-slow" ] && sleep "$(cat "$D/restart-slow")";;
+esac`})
+	for unit, state := range states {
+		if err := os.WriteFile(filepath.Join(dir, "state-"+unit), []byte(state+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := restartDelay
+	restartDelay = 0
+	t.Cleanup(func() { restartDelay = old })
+	selectKernel(t, p, "sing-box")
+	return p, dir
+}
+
+func selectKernel(t *testing.T, p Paths, setting string) {
+	t.Helper()
+	if !strings.HasPrefix(setting, "{") && setting != "null" {
+		setting = `{"settings":{"backend":"` + setting + `"}}`
+	}
+	if err := writeFileAtomic(filepath.Join(p.Data(), "webinfo", "atom_proxy.json"), []byte(setting), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// servicesOpenRC is openRCMachine with sing-box selected.
+func servicesOpenRC(t *testing.T) (Paths, string) {
+	t.Helper()
+	p, stub := openRCMachine(t)
+	selectKernel(t, p, "sing-box")
+	return p, stub
+}
+
+func getServices(t *testing.T, m *maintenance) []serviceStatus {
+	t.Helper()
+	w := httptest.NewRecorder()
+	m.handler(w, httptest.NewRequest("GET", "/services", nil))
+	var body struct {
+		Services []serviceStatus `json:"services"`
+	}
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &body) != nil {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	return body.Services
+}
+
+func TestServicesSystemd(t *testing.T) {
+	p, _ := servicesSystemd(t, map[string]string{
+		"atom-maintenance.service": "active", "atom-dns.service": "failed", "atom-sing-box.service": "inactive",
+	})
+	got := getServices(t, &maintenance{paths: p})
+	want := []serviceStatus{{"atom-maintenance", "running"}, {"atom-dns", "failed"}, {"atom-sing-box", "stopped"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("only the installed services, in order: %+v", got)
+	}
+}
+
+func TestServicesQueryHasADeadline(t *testing.T) {
+	p, dir := servicesSystemd(t, map[string]string{"atom-dns.service": "active"})
+	os.WriteFile(filepath.Join(dir, "slow"), []byte("5"), 0o644)
+	old := serviceQueryWait
+	serviceQueryWait = 300 * time.Millisecond
+	t.Cleanup(func() { serviceQueryWait = old })
+	start := time.Now()
+	for _, s := range getServices(t, &maintenance{paths: p}) {
+		if s.State != "unknown" {
+			t.Errorf("a query cut short says nothing: %+v", s)
+		}
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("the queries share one deadline: %v", time.Since(start))
+	}
+}
+
+func TestServicesOpenRC(t *testing.T) {
+	p, stub := servicesOpenRC(t)
+	for name, code := range map[string]string{"atom-dns": "32", "atom-sing-box": "3", "atom-mihomo": "16"} {
+		os.WriteFile(filepath.Join(stub, "status-"+name), []byte(code), 0o644)
+	}
+	got := getServices(t, &maintenance{paths: p})
+	want := []serviceStatus{{"atom-maintenance", "running"}, {"atom-dns", "failed"}, {"atom-sing-box", "stopped"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("%+v", got)
+	}
+}
+
+// Of the two kernels only the selected one is shown and may be restarted: the other shares its ports and nft
+// sets.
+func TestServicesOnlyTheSelectedKernel(t *testing.T) {
+	p, stub := servicesOpenRC(t)
+	m := &maintenance{paths: p}
+	w := postRestart(m, `{"service":"atom-mihomo"}`)
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "不是当前使用的代理内核") {
+		t.Errorf("%d %s", w.Code, w.Body.String())
+	}
+	selectKernel(t, p, "mihomo")
+	got := getServices(t, m)
+	want := []serviceStatus{{"atom-maintenance", "running"}, {"atom-dns", "running"}, {"atom-mihomo", "running"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("%+v", got)
+	}
+	if w := postRestart(m, `{"service":"atom-sing-box"}`); w.Code != 400 {
+		t.Errorf("%d %s", w.Code, w.Body.String())
+	}
+	if w := postRestart(m, `{"service":"atom-mihomo"}`); w.Code != 202 {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	waitCall(t, stub, "rc-service atom-mihomo restart")
+	waitUnlocked(t, p)
+
+	// a setting that cannot be read selects neither: the wrong kernel would rewrite the shared nft sets
+	for _, setting := range []string{"{", "null", "{}", `{"settings":null}`, `{"settings":{"backend":null}}`, `{"settings":{"backend":1}}`, "", "xray"} {
+		selectKernel(t, p, setting)
+		got := getServices(t, m)
+		if want := []serviceStatus{{"atom-maintenance", "running"}, {"atom-dns", "running"}}; !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: %+v", setting, got)
+		}
+		w := postRestart(m, `{"service":"atom-sing-box"}`)
+		if w.Code != 400 || !strings.Contains(w.Body.String(), "无法确定当前使用的代理内核") {
+			t.Errorf("%s: %d %s", setting, w.Code, w.Body.String())
+		}
+	}
+	selectKernel(t, p, "singbox") // the alias atomdns accepts
+	if w := postRestart(m, `{"service":"atom-sing-box"}`); w.Code != 202 {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	waitCall(t, stub, "rc-service atom-sing-box restart")
+	waitUnlocked(t, p)
+
+	// atomdns writes no backend for its default, sing-box: what the file holds after any panel change
+	selectKernel(t, p, `{"version":1,"settings":{"fakeip_range":"28.0.0.0/8","mixed_port":7890}}`)
+	if got := getServices(t, m); len(got) != 3 || got[2].Name != "atom-sing-box" {
+		t.Errorf("no backend: %+v", got)
+	}
+	if w := postRestart(m, `{"service":"atom-sing-box"}`); w.Code != 202 {
+		t.Fatalf("no backend: %d %s", w.Code, w.Body.String())
+	}
+	waitUnlocked(t, p)
+}
+
+// A panel write (the kernel switch among them) holds the shared write lock: the restart waits for it, and reads
+// the kernel only after.
+func TestRestartWaitsForPanelWrites(t *testing.T) {
+	p, dir := servicesSystemd(t, nil)
+	if err := os.MkdirAll(p.Run(""), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	panel, err := os.OpenFile(p.Run(panelWriteLock), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer panel.Close()
+	if err := syscall.Flock(int(panel.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan *httptest.ResponseRecorder)
+	go func() { done <- postRestart(&maintenance{paths: p}, `{"service":"atom-sing-box"}`) }()
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case w := <-done:
+		t.Fatalf("answered while a panel write runs: %d %s", w.Code, w.Body.String())
+	default:
+	}
+	selectKernel(t, p, "mihomo") // the write switches the kernel, then ends
+	panel.Close()
+	w := <-done
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "不是当前使用的代理内核") {
+		t.Errorf("%d %s", w.Code, w.Body.String())
+	}
+	if calls(dir, "systemctl restart atom-sing-box.service") != 0 {
+		t.Error("the old kernel was restarted")
+	}
+	waitUnlocked(t, p)
+	if lock, err := exclusiveLock(p.Run(panelWriteLock), true); err != nil {
+		t.Errorf("the write lock was kept: %v", err)
+	} else {
+		lock.Close()
+	}
+}
+
+// A child that keeps the output pipe open must not keep runCmd past its timeout.
+func TestRunCmdReturnsOnTheTimeout(t *testing.T) {
+	fakeCommands(t, map[string]string{"stuck": "sleep 30 &\nsleep 30"})
+	start := time.Now()
+	err := runCmd(stderrLogger{}, 300*time.Millisecond, "stuck")
+	if err == nil || time.Since(start) > 5*time.Second {
+		t.Errorf("%v after %v", err, time.Since(start))
+	}
+}
+
+func postRestart(m *maintenance, body string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	m.handler(w, httptest.NewRequest("POST", "/restart", strings.NewReader(body)))
+	return w
+}
+
+// waitCall waits for the stand-ins in dir to have made the call line.
+func waitCall(t *testing.T, dir, line string) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); calls(dir, line) == 0; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			data, _ := os.ReadFile(filepath.Join(dir, "calls"))
+			t.Fatalf("no %q in:\n%s", line, data)
+		}
+	}
+}
+
+func TestRestartRequests(t *testing.T) {
+	p, _ := servicesSystemd(t, nil)
+	m := &maintenance{paths: p}
+	for _, body := range []string{`{"service":"sshd"}`, `{"service":"atom-mihomo"}`, `{}`, `{"service":"atom-dns","x":1}`, `nonsense`} {
+		if w := postRestart(m, body); w.Code != 400 {
+			t.Errorf("%s: %d %s", body, w.Code, w.Body.String())
+		}
+	}
+	if err := m.save(maintenanceJob{ID: "job1", Kind: "upgrade", Phase: "applying"}); err != nil {
+		t.Fatal(err)
+	}
+	if w := postRestart(m, `{"service":"atom-dns"}`); w.Code != 409 {
+		t.Errorf("a maintenance job runs: %d", w.Code)
+	}
+	m.finish("failed", nil)
+	m.job.Blocking = true
+	if w := postRestart(m, `{"service":"atom-dns"}`); w.Code != 409 {
+		t.Errorf("a job waits for its recovery: %d", w.Code)
+	}
+	m.job.Blocking = false
+	lock, err := operationLock(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := postRestart(m, `{"service":"atom-dns"}`); w.Code != 409 {
+		t.Errorf("an installer command runs: %d", w.Code)
+	}
+	lock.Close()
+}
+
+// flushCheck records whether the whole answer was there, and no restart yet, when it was flushed.
+type flushCheck struct {
+	*httptest.ResponseRecorder
+	dir     string
+	flushed bool
+}
+
+func (f *flushCheck) Flush() {
+	f.flushed = f.Code == 202 && strings.TrimSpace(f.Body.String()) == `{"ok":true}` &&
+		calls(f.dir, "systemctl restart atom-dns.service") == 0
+	f.ResponseRecorder.Flush()
+}
+
+func TestRestartAnswersThenRestarts(t *testing.T) {
+	p, dir := servicesSystemd(t, nil)
+	os.WriteFile(filepath.Join(dir, "restart-slow"), []byte("1"), 0o644)
+	m := &maintenance{paths: p}
+	w := &flushCheck{ResponseRecorder: httptest.NewRecorder(), dir: dir}
+	m.handler(w, httptest.NewRequest("POST", "/restart", strings.NewReader(`{"service":"atom-dns"}`)))
+	if !w.flushed {
+		t.Fatalf("the answer was not out before the restart: %d %s", w.Code, w.Body.String())
+	}
+	waitCall(t, dir, "systemctl restart atom-dns.service")
+	if w := postRestart(m, `{"service":"atom-sing-box"}`); w.Code != 409 {
+		t.Errorf("one restart at a time: %d", w.Code)
+	}
+	waitUnlocked(t, p)
+}
+
+// waitUnlocked waits for a restart to let the operation lock go.
+func waitUnlocked(t *testing.T, p Paths) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		lock, err := operationLock(p)
+		if err == nil {
+			lock.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestRestartTheMaintenanceServiceItself(t *testing.T) {
+	old := selfRestartHold
+	selfRestartHold = 500 * time.Millisecond
+	t.Cleanup(func() { selfRestartHold = old })
+	p, dir := servicesSystemd(t, nil)
+	m := &maintenance{paths: p}
+	if w := postRestart(m, `{"service":"atom-maintenance"}`); w.Code != 202 {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	waitCall(t, dir, "systemctl restart --no-block atom-maintenance.service")
+	// systemd only took the job: until it stops this process, nothing else may start
+	if w := postRestart(m, `{"service":"atom-dns"}`); w.Code != 409 {
+		t.Errorf("while the restart is pending: %d", w.Code)
+	}
+	waitUnlocked(t, p)
+
+	p, stub := servicesOpenRC(t)
+	if w := postRestart(&maintenance{paths: p}, `{"service":"atom-maintenance"}`); w.Code != 202 {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	waitCall(t, stub, "rc-service atom-maintenance restart")
+	// rc-service came back without stopping this process: the restart did not happen, the lock goes
+	waitUnlocked(t, p)
+
+	// an rc-service that hangs keeps the lock for the hold only
+	selfRestartHold = 1500 * time.Millisecond
+	hung := fakeCommands(t, map[string]string{"rc-service": `[ "$2" = restart ] && sleep 5`})
+	if w := postRestart(&maintenance{paths: p}, `{"service":"atom-maintenance"}`); w.Code != 202 {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	waitCall(t, hung, "rc-service atom-maintenance restart")
+	if lock, err := operationLock(p); err == nil {
+		lock.Close()
+		t.Error("the lock went while rc-service still runs")
+	}
+	waitUnlocked(t, p)
+}

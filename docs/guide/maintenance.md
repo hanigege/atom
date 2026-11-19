@@ -69,6 +69,8 @@ curl -fsSL https://github.com/jasonxtt/atom/releases/latest/download/install.sh 
 | `atom-sing-box` / `atom-mihomo` | 代理内核，配置由 atom-dns 生成，只运行当前选中的那个 |
 | `atom-maintenance` | 执行面板里的升级和网络修改任务。机器重启时检查有没有未完成的变更，必要时恢复备份 |
 
+「设置 → 系统」的「组件」里可以看到这几个服务是否在运行，并逐个重启。升级、修改网络或重置进行中时不能重启。
+
 systemd 上用 `journalctl -u atom-dns` 等命令查看日志；Alpine（OpenRC）的日志在 `/var/log/atom/`。
 
 ## 应急恢复

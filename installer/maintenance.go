@@ -176,6 +176,10 @@ func (m *maintenance) handler(w http.ResponseWriter, r *http.Request) {
 		m.overview(w)
 	case r.Method == "GET" && r.URL.Path == "/network":
 		m.network(w)
+	case r.Method == "GET" && r.URL.Path == "/services":
+		m.services(w)
+	case r.Method == "POST" && r.URL.Path == "/restart":
+		m.restartService(w, r)
 	case r.Method == "POST" && r.URL.Path == "/confirm":
 		m.confirmNetwork(w, r)
 	case r.Method == "POST" && (r.URL.Path == "/check" || r.URL.Path == "/upgrade" || r.URL.Path == "/network" || r.URL.Path == "/reset"):

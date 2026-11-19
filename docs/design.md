@@ -467,7 +467,7 @@ DNS 和代理在同一台 VM 上。客户端的 DNS 指向这台 VM；FakeIP 网
 | 拓扑 | 流量怎么进来 | 说明 |
 |---|---|---|
 | 单网卡旁路由（和主路由在同一网段） | 主路由加静态路由：FakeIP 网段和要代理的网段 → VM | 普通用户最常见的情况 |
-| 双网卡网关（LAN/WAN） | VM 的 LAN 接主路由（用户的接法是主路由的 WAN2），主路由把 FakeIP 网段和要代理的网段走这个口 | 安装器提示：主路由需要把 FakeIP 网段和要代理的网段转到这台机器。TCP、UDP 进 sing-box，其余（ping 等）NAT 后从 WAN 出去。**[定]** |
+| 双网卡网关（LAN/WAN） | VM 的 LAN 接主路由（用户的接法是主路由的 WAN2），主路由把 FakeIP 网段和要代理的网段走这个口 | TCP、UDP 进 sing-box，其余（ping 等）NAT 后从 WAN 出去。主路由怎么配写在 [安装和接入](guide/install.md)（向导里原来的警告和确认 2026-11-19 去掉，用户定）。**[定]** |
 
 用户的部署（2026-11-12）：atom 在主路由后面，主路由只把 FakeIP 网段和需要代理的网段转给 atom，所以到达 atom 的转发流量都是要代理的。VM 上：TCP 用 redirect，UDP 用 TProxy，从 LAN 网卡进来、目标不是本机的 IPv4 TCP、UDP 全部导进 sing-box（两种拓扑一样，原来只导 FakeIP 网段和 IP 规则网段）；sing-box 里 FakeIP 按绑定或 Final 走，真实 IP 按 IP、端口、网络规则走，没命中走 Final。本机的 `output` 只捕获发往 FakeIP 池的 IPv4 TCP、UDP。安装器检测网卡数量，生成对应的 nft 规则。具体规则写在单独的部署文档里。
 
@@ -477,9 +477,9 @@ DNS 和代理在同一台 VM 上。客户端的 DNS 指向这台 VM；FakeIP 网
 
 - **三层**：用户粘贴 `curl -fsSL <地址>/install.sh | sudo bash`（Alpine：`apk add bash curl && curl -fsSL <地址>/install.sh | bash`）；脚本装好 `atom-installer`（Go 标准库写的单个静态程序，向导页面内嵌）并打印"请在浏览器打开 http://<IP>:<端口>/"；浏览器里配好 DNS 和 sing-box 的基础设置，确定后自动跳转到面板。装完安装器自己退出。
 - **下载**（脚本）：配套包 `atom-<版本>-linux-{amd64,arm64,amd64-musl,arm64-musl}.tar.gz`（脚本按架构和系统选一个，见 9.5；每个包：atomdns、补丁版 sing-box、`atom-installer`、`atom-webui.tar.gz`、默认配置、`manifest.json`），来源按顺序试：GitHub Release 直连，然后加速前缀（`gh-proxy.com`、`ghfast.top`、`down.mxw.xx.kg`、`gh.noki.icu`，可用 `ATOM_MIRRORS` 改）。连接 6 秒没通，或速度低于 50 KB/s 持续 10 秒，就换下一个。四个包的 sha256 在发版时写进 `install.sh`，任何来源下载的都要校验，不过就丢弃换下一个（加速源是第三方）。`ATOM_PKG` 可以指定本地包或地址（开发和离线用）。第 7 步没有发布 Release：下载路径用本地模拟的"GitHub 不通、慢镜像、好镜像"验证过，没有真实访问过 GitHub 上的包；公共加速源的可用性会变（2026-11-11 探测：`gh-proxy.com`、`ghfast.top` 通，`ghproxy.net` 超时，`mirror.ghproxy.com` 连不上），上线前要再核。2026-11-13 在阿里云广州（不走代理）用 38MB 的 v0.1.0 包实测（每个源最多 40 秒，核对 sha256）：直连只有 43 KB/s；`gh-proxy.com` 4.5 MB/s、`ghfast.top` 5.9 MB/s；`ghproxy.net` 90 KB/s，`ghproxy.homeboyc.cn` 403，`toolwa.com` 402（部署停用），这三个不用；`github.akams.cn` 是节点列表页，从它列出的 67 个公益节点里选了较快的 `down.mxw.xx.kg`（10 MB/s）、`gh.noki.icu`（7.9 MB/s）放在后面（个人节点，可能失效，靠 sha256 兜底）。
-- **向导**（`web/index.html`，只放标签、错误和两处必须的提示：网关形态的警告，完成页的两步：主路由加静态路由 FakeIP 网段 → LAN IP、客户端 DNS 设为 LAN IP，两种拓扑一样）：
+- **向导**（`web/index.html`，只放标签、错误和一处必须的提示：完成页的两步：主路由加静态路由 FakeIP 网段 → LAN IP、客户端 DNS 设为 LAN IP，两种拓扑一样）：
   1. 环境：系统（Debian 12+、Ubuntu 22.04+ 用 systemd，Alpine 3.19+ 用 OpenRC；x86_64 或 aarch64；root；Docker/LXC 容器里不支持）；53 端口被占时列出占用者并给按钮：systemd-resolved 的 stub 写 drop-in 关掉并把 `/etc/resolv.conf` 指到上游列表，其他 systemd 服务停止并禁用，OpenRC 服务停止并从运行级别删掉（见 9.5），不是服务的只提示；做完显示"已处理完毕"。
-  2. 网络：单网卡旁路由或双网卡网关，选网卡；选网关必须勾选确认（警告 2026-11-12 改为"主路由需要把 FakeIP 网段和要代理的网段转到这台机器"）；面板端口，默认 **80**；面板用户名和密码（2026-11-14 加，可选：留空就不需要登录，保留数据重装时留空就不改；见第 8 节"面板登录"）。
+  2. 网络：单网卡旁路由或双网卡网关，选网卡（网关形态原有的警告和「我知道，继续」确认 2026-11-19 去掉，用户定：确认没有实际意义，主路由的要求写进 [安装和接入](guide/install.md)；`accept_gateway` 不再校验，旧面板发来的这个字段忽略）；面板端口，默认 **80**；面板用户名和密码（2026-11-14 加，可选：留空就不需要登录，保留数据重装时留空就不改；见第 8 节"面板登录"）。
      - 双网卡网关另有"LAN 侧网关"和"客户端网段"（2026-11-12，用户在 atom 测试机上发现）：客户端不在 LAN 网段、经 LAN 侧的路由器过来时，本机的应答（DNS、redirect 和 TProxy 的回包、NAT 回来的包）会沿默认路由从 WAN 出去。向导按本机已有的、经 LAN 网卡的路由预填这两项；安装器在 `policy-route.sh` 里对每个网段写 `ip route replace <网段> via <LAN 侧网关> dev <LAN 网卡>`，随 `atom-dns.service` 每次启动加回。没用连接标记改道：atomdns 的 UDP 监听在通配地址、按路由选源地址，改道改不了已经选成 WAN 地址的源，DNS 仍然不通。都留空表示客户端都在 LAN 网段。
      - 单网卡旁路由可以勾"回包经主路由"（2026-11-14，用户定），填主路由地址（默认是 LAN 网卡默认路由的网关）：导入 sing-box 的连接打连接标记，回包按标记经表 234 交给主路由，主路由能看到两个方向的包；同时关掉 LAN 网卡接收 ICMP 重定向。默认不勾。规则见 deploy-nft.md 3.4。
      - 所有权：网段原来就有同一网关、同一网卡的路由，就算机器自己的，卸载不删；网关不同就拒绝安装。安装器加的记在 `changes.json` 的 `routes`，拆网络时只删这些；重装时不再需要的旧路由当场删掉。
@@ -566,6 +566,8 @@ Atom 在侧栏和「设置 → 系统更新」显示已提交的整包版本。D
 - 重置：先检查记录、把 `data/`、`install.json`、`changes.json` 复制到 `backup/reset-<时间>/`（名字不在 `pruneBackups` 的规则里，不会被清理，供手动恢复），这一步失败就记为 `failed`、向导退出，面板照常可用。随后向导把阶段写进 `run/installer.json`，等维护服务把任务记为 `reset`，再停用并删除维护服务、拆网络、还原系统设置，删除 `/opt/atom` 下除 `pkg.reset-*`、`backup/`、向导自己的 `run/installer.*` 以外的全部内容。还原失败的项目（服务起不来等）不中止重置，记进新的 `changes.json` 留给下一次安装接管，装过的软件包记录也保留。
 - 之后：向导和新装一样，网络一步预填原来的设置。重置开始后向导不接受关闭（`/api/finish` 返回 409），直到有一次安装成功。重置完成或上一次安装失败后 30 分钟内没有装好，向导自动安装：原来的拓扑、网卡、客户端路由、回包、面板端口，面板登录沿用备份里的 `atom_auth.json`，其余用默认值（sing-box、默认上游、FakeIP 网段和 mixed 端口），53 端口按原来的记录再停用同样的服务；失败就 30 分钟后再试。不恢复旧数据。
 - 并发：维护服务在任务未结束时拒绝新任务，向导已在运行时拒绝重置；向导持有操作锁直到退出，命令行的升级、卸载和第二个向导都会被挡住。维护服务重启时，向导还在就继续跟踪，不在就把任务记为 `cancelled`（准备到一半的包删掉）。
+
+**组件状态和重启（2026-11-19，用户定）**：「设置 → 系统」的「组件」表格经管理 API 转到维护服务，代码在 `installer/maintenance_services.go`。`GET /services` 列出已安装的 `atom-maintenance`、`atom-dns` 和当前选中的代理内核（`atom-sing-box` 或 `atom-mihomo`，按 `atom_proxy.json` 的 `backend`；没选中的那个和它共用端口与 nft 集合，必须保持停止，所以不列出、不能重启）和状态（`running`、`stopped`、`failed`、`unknown`；systemd 看 `systemctl is-active`，OpenRC 看 `rc-service status` 的退出码，几个查询并行、共用 3 秒时限，答不上来就是 `unknown`）。`POST /restart`（`{"service":"atom-dns"}`）先回 202 再重启：未知、没安装的服务和没选中的内核 400；有维护任务、待恢复的记录或别的命令持有操作锁时 409；重启期间持有操作锁，并像升级一样独占面板写锁 `maintenance-writes.lock`（面板切换内核时持有它的共享锁），拿到写锁后才判断当前内核；`atom_proxy.json` 的 `backend` 只认 `sing-box`、`singbox`、`mihomo`，读不到、`null` 或其他值都按「无法确定当前内核」处理，拒绝重启内核。维护服务重启自己时：systemd 用 `systemctl restart --no-block` 交出任务，然后一直持锁，直到被停掉（锁随进程释放），2 分钟还没被停才放锁；OpenRC 在单独的会话里跑 `rc-service atom-maintenance restart`，服务管理器停掉维护服务时它还在，它先返回就说明没重启成功，放锁；同样最多等 2 分钟，到时放锁，`rc-service` 不杀，可能还在跑。普通服务的重启走 `runCmd`（60 秒超时）；超时后关掉输出管道，即使重启脚本派生的子进程还拿着输出，也一定返回并放锁。
 
 ## 10. 仓库与版本
 

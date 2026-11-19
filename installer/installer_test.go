@@ -252,10 +252,10 @@ func TestValidate(t *testing.T) {
 	}
 	c := base
 	c.Topology = "gateway"
-	if f := fields(c, free); !f["wan"] || !f["accept_gateway"] {
-		t.Errorf("a gateway needs a WAN and the confirmation: %v", f)
+	if f := fields(c, free); !f["wan"] || len(f) != 1 {
+		t.Errorf("a gateway needs a WAN, no confirmation: %v", f)
 	}
-	c.WAN, c.AcceptGateway = "eth1", true
+	c.WAN = "eth1"
 	if f := fields(c, free); len(f) != 0 {
 		t.Errorf("a good gateway: %v", f)
 	}
@@ -1139,7 +1139,7 @@ func TestClientRoutes(t *testing.T) {
 			t.Errorf("%q %q: want an error on %s, got %v", c.gw, c.nets, c.field, errs)
 		}
 	}
-	cfg := Config{Topology: "gateway", LAN: lan, WAN: "ens34", AcceptGateway: true, LANGateway: "10.0.3.1", ClientNets: "10.0.0.0/24", PanelPort: 80, Domestic: defaultDomestic, Foreign: defaultForeign, FakeIPRange: defaultFakeIP, MixedPort: 7890, Backend: "sing-box"}
+	cfg := Config{Topology: "gateway", LAN: lan, WAN: "ens34", LANGateway: "10.0.3.1", ClientNets: "10.0.0.0/24", PanelPort: 80, Domestic: defaultDomestic, Foreign: defaultForeign, FakeIPRange: defaultFakeIP, MixedPort: 7890, Backend: "sing-box"}
 	if field(cfg.Validate(ifaces, 9996, func(int) string { return "" }), "lan_gateway") == "" {
 		t.Error("Validate must check the client routes of a gateway")
 	}
@@ -1193,15 +1193,35 @@ func TestOwnRoutes(t *testing.T) {
 	}
 }
 
-// The gateway warning says what the topology needs (the main router sends this machine what is to be
-// proxied), not that all LAN traffic passes through it.
-func TestGatewayWarning(t *testing.T) {
+// The gateway topology has no warning or confirmation in the wizard (2026-11-19): what the main router must do
+// is in docs/guide/install.md.
+func TestNoGatewayConfirmation(t *testing.T) {
 	page := string(indexHTML)
-	if !strings.Contains(page, "主路由需要把 FakeIP 网段和要代理的网段转到这台机器") {
-		t.Error("the gateway warning lacks what the main router must send here")
+	for _, gone := range []string{"主路由需要把 FakeIP 网段", "accept_gateway", "我知道，继续"} {
+		if strings.Contains(page, gone) {
+			t.Errorf("the wizard still has %q", gone)
+		}
 	}
-	if strings.Contains(page, "全部流量都会经过这台机器") {
-		t.Error("the old gateway warning is still there")
+	// an older panel still sends the field: it is ignored, not refused
+	var n networkRequest
+	r := httptest.NewRequest("POST", "/network", strings.NewReader(`{"topology":"gateway","lan":["eth1"],"wan":"eth0","accept_gateway":false,"panel_port":80,"revision":"x"}`))
+	if err := decodeMaintenance(r, &n); err != nil || n.Topology != "gateway" {
+		t.Errorf("%+v %v", n, err)
+	}
+	// and reads it back ticked for a gateway, so its required checkbox does not ask again
+	for topology, want := range map[string]bool{"gateway": true, "bypass": false} {
+		p := Paths{Root: t.TempDir()}
+		if err := writeFileAtomic(p.State(), []byte(`{"complete":true,"topology":"`+topology+`","lan":["eth1"],"wan":"eth0"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		(&maintenance{paths: p}).handler(w, httptest.NewRequest("GET", "/network", nil))
+		var body struct {
+			Config map[string]any `json:"config"`
+		}
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &body) != nil || body.Config["accept_gateway"] != want {
+			t.Errorf("%s: %d %s", topology, w.Code, w.Body.String())
+		}
 	}
 }
 
@@ -1572,11 +1592,11 @@ func TestConfigFromState(t *testing.T) {
 	st := &InstallState{Topology: "gateway", LAN: []string{"eth1"}, WAN: "eth0", PanelPort: 8080,
 		ClientRoutes: []ClientRoute{{"10.1.0.0/24", "192.168.1.2", "eth1"}, {"10.2.0.0/24", "192.168.1.2", "eth1"}}}
 	c := configFromState(st)
-	if c.Topology != "gateway" || c.WAN != "eth0" || c.PanelPort != 8080 || c.LANGateway != "192.168.1.2" || c.ClientNets != "10.1.0.0/24\n10.2.0.0/24" || !c.AcceptGateway {
+	if c.Topology != "gateway" || c.WAN != "eth0" || c.PanelPort != 8080 || c.LANGateway != "192.168.1.2" || c.ClientNets != "10.1.0.0/24\n10.2.0.0/24" {
 		t.Errorf("%+v", c)
 	}
 	c = configFromState(&InstallState{Topology: "bypass", LAN: []string{"eth0"}, ReplyVia: "10.0.0.1", PanelPort: 80})
-	if !c.ReplyVia || c.Router != "10.0.0.1" || c.LANGateway != "" || c.AcceptGateway {
+	if !c.ReplyVia || c.Router != "10.0.0.1" || c.LANGateway != "" {
 		t.Errorf("%+v", c)
 	}
 	if c := configFromState(&InstallState{Topology: "bypass"}); c.LAN == nil {
