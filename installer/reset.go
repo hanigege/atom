@@ -659,7 +659,8 @@ func (s *Server) purgeForReset() {
 }
 
 // verifyPurged checks that nothing of the old installation that a new one could take over is left: the data
-// (and its marker), the install record, the programs and the service definitions.
+// (and its marker), the install record, the programs and the service definitions, and that none of its
+// services or programs still runs.
 func verifyPurged(p Paths) error {
 	left := []string{p.Data(), dataMarker(p), p.State(), filepath.Join(p.Root, "bin"), p.Shipped(), p.Lib("")}
 	if p.UnitDir != "" {
@@ -674,7 +675,8 @@ func verifyPurged(p Paths) error {
 	if len(found) > 0 {
 		return fmt.Errorf("仍然存在：%s", strings.Join(found, "、"))
 	}
-	return nil
+	// an old service still running would keep port 53 from the new installation
+	return checkStopped(p)
 }
 
 // backupForReset copies the data and the install records to backup/reset-<time>/. The name is not one that

@@ -1,7 +1,10 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 )
@@ -157,3 +160,36 @@ func (openRCInit) Logs(name string) string {
 }
 
 func (openRCInit) Forget(Logger, ...string) {}
+
+// serviceRunning asks the service manager whether one of atom's services runs (or is starting or stopping). An
+// answer that cannot be had is an error, never "stopped": the reset deletes the data only once it is sure.
+func serviceRunning(p Paths, name string) (bool, error) {
+	if p.OpenRC {
+		// openrc-run status: 0 started, 3 stopped, 4 stopping, 8 starting, 16 inactive, 32 crashed (the daemon is
+		// gone); a script that does not exist (any more) has nothing started either.
+		out, err := exec.Command("rc-service", rcName(name), "status").CombinedOutput()
+		var ee *exec.ExitError
+		switch {
+		case err == nil:
+			return true, nil
+		case errors.As(err, &ee):
+			code := ee.ExitCode()
+			return code == 4 || code == 8, nil
+		default:
+			return false, fmt.Errorf("查询 %s 的状态：%v %s", name, err, strings.TrimSpace(string(out)))
+		}
+	}
+	out, err := exec.Command("systemctl", "is-active", sysdName(name)).CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	switch state := strings.TrimSpace(lines[len(lines)-1]); state {
+	case "inactive", "failed", "unknown": // unknown: an older systemd, for a unit it does not know
+		return false, nil
+	case "activating", "deactivating", "reloading", "refreshing":
+		return true, nil
+	default:
+		return false, fmt.Errorf("查询 %s 的状态：%v %s", name, err, strings.TrimSpace(string(out)))
+	}
+}

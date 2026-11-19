@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -79,6 +81,7 @@ func TestResetPackageComesFromTheInstalledVersion(t *testing.T) {
 
 func TestUninstallForResetKeepsThePackageBackupsAndWizard(t *testing.T) {
 	p := Paths{Root: t.TempDir(), UnitDir: t.TempDir()}
+	fakeSystemctl(t, "")
 	if err := writeJSON(p.State(), &InstallState{Version: "1.2.3", Complete: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +173,70 @@ func resetServer(t *testing.T) *Server {
 	}
 	s := newServer(&Installer{Paths: p}, "012345")
 	s.reset = r
+	fakeSystemctl(t, "") // the removal asks whether atom's services still run; none does
 	return s
+}
+
+// fakeCommands puts stand-ins for commands (systemctl, rc-service, nft...) first in PATH. Each records its
+// arguments in <dir>/calls; dir is returned so that a test can change the files a stand-in reads.
+func fakeCommands(t *testing.T, scripts map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for name, body := range scripts {
+		script := "#!/bin/sh\nD=\"$(dirname \"$0\")\"\necho \"" + name + " $*\" >> \"$D/calls\"\n" + body + "\nexit 0\n"
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return dir
+}
+
+// fakeSystemctl stands in for systemctl, nft and ip: a service named in <dir>/running is active, one named in
+// <dir>/stuck cannot be disabled; start and enable fail (a service of others cannot be started again).
+func fakeSystemctl(t *testing.T, running string) string {
+	t.Helper()
+	dir := fakeCommands(t, map[string]string{
+		"systemctl": `case "$1" in
+is-active) if grep -qx "$2" "$D/running" 2>/dev/null; then echo active; exit 0; fi; echo inactive; exit 3;;
+disable) for u in "$@"; do if grep -qx "$u" "$D/stuck" 2>/dev/null; then echo "Failed to disable unit $u: Access denied" >&2; exit 1; fi; done;;
+start|enable) exit 1;;
+esac`,
+		"nft": "", "ip": "",
+	})
+	if err := os.WriteFile(filepath.Join(dir, "running"), []byte(running), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// installedWithServices writes an installation with its service definitions (systemd) under p.
+func installedWithServices(t *testing.T, p Paths) {
+	t.Helper()
+	for path, content := range map[string]string{
+		"etc/install.json":             `{"version":"1.2.3","complete":true}`,
+		"data/.atom-data":              `{"version":"1.2.3"}`,
+		"data/webinfo/atom_proxy.json": `{}`,
+		"bin/atomdns":                  "x",
+	} {
+		if err := writeFileAtomic(filepath.Join(p.Root, path), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, u := range []string{maintenanceUnitName, dnsUnitName, singBoxUnitName} {
+		if err := writeFileAtomic(p.unitFile(u), []byte("[Service]\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := saveChanges(p, &Changes{Network: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func noStopWait(t *testing.T) {
+	old := serviceStopWait
+	serviceStopWait = 0
+	t.Cleanup(func() { serviceStopWait = old })
 }
 
 func TestResetWizardWaitsThenHoldsUntilInstalled(t *testing.T) {
@@ -713,5 +779,186 @@ func TestMaintenanceRestartWhileTheResetWizardStarts(t *testing.T) {
 	}
 	if _, err := os.Stat(pkg); err != nil {
 		t.Errorf("a process that may still run from the package keeps it (it removes it when it exits): %v", err)
+	}
+}
+
+// Review finding (round 2): a DNS service that cannot be stopped (`systemctl disable --now` fails, it keeps
+// running) stops the reset before anything is deleted: reset_failed with the data and the backup there and the
+// panel's writes still held; the retry, once the service stops, reaches ready.
+func TestResetStopsWhileTheOldDNSServiceRuns(t *testing.T) {
+	s := resetServer(t)
+	s.ins.Paths.UnitDir = t.TempDir()
+	p := s.ins.Paths
+	installedForReset(t, s)
+	installedWithServices(t, p)
+	noStopWait(t)
+	stub := fakeSystemctl(t, dnsUnitName)
+	os.WriteFile(filepath.Join(stub, "stuck"), []byte(dnsUnitName), 0o644)
+
+	s.runReset()
+	v := s.state().Reset
+	if v.Phase != resetPurgeFailed || !strings.Contains(v.Error, dnsUnitName) || v.Backup == "" {
+		t.Fatalf("a DNS service that did not stop is not ready: %+v", v)
+	}
+	if !hasData(p) || !fileExists(p.State()) || !fileExists(p.DNSUnit()) || !fileExists(p.Bin("atomdns")) {
+		t.Fatal("nothing is deleted while the old service runs")
+	}
+	if _, err := os.Stat(filepath.Join(v.Backup, "data", ".atom-data")); err != nil {
+		t.Errorf("the backup is kept: %v", err)
+	}
+	if s.reset.writes == nil {
+		t.Error("the panel's writes stay held")
+	}
+
+	// a stop that reports success while the service still runs is not enough either
+	os.Remove(filepath.Join(stub, "stuck"))
+	if _, err := uninstallForReset(p, []string{"backup"}, &recLogger{}); err == nil || !strings.Contains(err.Error(), "仍在运行") || !hasData(p) {
+		t.Fatalf("a service still active after its stop: %v (data kept: %v)", err, hasData(p))
+	}
+
+	os.WriteFile(filepath.Join(stub, "running"), nil, 0o644)
+	r := httptest.NewRequest("POST", "http://127.0.0.1/api/reset", strings.NewReader("{}"))
+	r.RemoteAddr = "127.0.0.1:8888"
+	r.Header.Set("X-Atom-Install-Code", "012345")
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handler().ServeHTTP(w, r)
+	if w.Code != 202 {
+		t.Fatalf("retry: %d", w.Code)
+	}
+	waitResetPhase(t, s, resetReady)
+	if err := verifyPurged(p); err != nil || s.reset.writes != nil {
+		t.Errorf("after the retry: %v %v", err, s.reset.writes)
+	}
+	// the check before ready also asks: an old service still running is not a removal
+	os.WriteFile(filepath.Join(stub, "running"), []byte(dnsUnitName), 0o644)
+	if err := verifyPurged(p); err == nil || !strings.Contains(err.Error(), dnsUnitName) {
+		t.Errorf("a service still running: %v", err)
+	}
+}
+
+// A program of atom still running (the service manager lost track of it) stops the reset as well.
+func TestResetStopsWhileAProgramOfAtomRuns(t *testing.T) {
+	p := Paths{Root: t.TempDir(), UnitDir: t.TempDir()}
+	installedWithServices(t, p)
+	noStopWait(t)
+	fakeSystemctl(t, "")
+	sleep, err := os.ReadFile("/bin/sleep")
+	if err != nil {
+		t.Skip(err)
+	}
+	if err := writeFileAtomic(p.Bin("atomdns"), sleep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(p.Bin("atomdns"), "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	_, err = uninstallForReset(p, []string{"backup"}, &recLogger{})
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("atomdns（进程 %d）", cmd.Process.Pid)) {
+		t.Fatalf("the process is named: %v", err)
+	}
+	if !hasData(p) || !fileExists(p.State()) {
+		t.Fatal("nothing is deleted while it runs")
+	}
+	cmd.Process.Kill()
+	cmd.Wait()
+	if _, err := uninstallForReset(p, []string{"backup"}, &recLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyPurged(p); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir()) // no systemctl that answers
+	if err := checkStopped(p); err == nil {
+		t.Error("a service manager that does not answer is not an answer")
+	}
+}
+
+// OpenRC: a stop that fails, or a service that is still starting, stops the reset; stopped (3) or crashed (32,
+// the daemon is gone) lets it go on. A service manager that cannot be asked is never taken for "stopped".
+func TestResetChecksOpenRCServicesStopped(t *testing.T) {
+	p := Paths{Root: t.TempDir(), UnitDir: t.TempDir(), OpenRC: true}
+	for _, u := range atomServices {
+		if err := writeFileAtomic(p.unitFile(u), []byte("#!/sbin/openrc-run\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	noStopWait(t)
+	stub := fakeCommands(t, map[string]string{
+		"rc-service": `case "$2" in
+stop) [ -e "$D/stop-fails" ] && exit 1;;
+status) [ "$1" = atom-dns ] && exit "$(cat "$D/dns-status")"; exit 3;;
+esac`,
+		"rc-update": "",
+	})
+	set := func(name, v string) { os.WriteFile(filepath.Join(stub, name), []byte(v), 0o644) }
+	set("stop-fails", "")
+	set("dns-status", "0")
+	if err := stopForReset(p, &recLogger{}); err == nil || !strings.Contains(err.Error(), "停止失败") {
+		t.Fatalf("a failed stop: %v", err)
+	}
+	os.Remove(filepath.Join(stub, "stop-fails"))
+	for status, stopped := range map[string]bool{"0": false, "8": false, "4": false, "3": true, "32": true} {
+		set("dns-status", status)
+		if err := stopForReset(p, &recLogger{}); (err == nil) != stopped {
+			t.Errorf("status %s: %v", status, err)
+		}
+	}
+	t.Setenv("PATH", t.TempDir()) // no rc-service at all
+	if err := checkStopped(p); err == nil {
+		t.Error("a service manager that does not answer is not an answer")
+	}
+}
+
+// Review finding (round 2): a service file that could not be removed keeps the install record, and a retry
+// removes the service files whatever the records say (as on a machine where an earlier build lost them).
+func TestResetRetryRemovesTheServiceFilesLeftBehind(t *testing.T) {
+	p := Paths{Root: t.TempDir(), UnitDir: t.TempDir()}
+	installedWithServices(t, p)
+	fakeSystemctl(t, "")
+	// an obstacle that also holds for root: a non-empty directory where the file is
+	os.Remove(p.DNSUnit())
+	if err := writeFileAtomic(filepath.Join(p.DNSUnit(), "x"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := uninstallForReset(p, []string{"backup"}, &recLogger{}); err == nil || !strings.Contains(err.Error(), "删除服务文件") {
+		t.Fatalf("a service file that cannot be removed: %v", err)
+	}
+	if !fileExists(p.State()) || !hasData(p) {
+		t.Fatal("the install record and the data stay for the retry")
+	}
+	// the obstacle goes; the file is still there, and install.json is gone as an earlier build left it
+	os.RemoveAll(p.DNSUnit())
+	writeFileAtomic(p.DNSUnit(), []byte("[Service]\n"), 0o644)
+	os.Remove(p.State())
+	if _, err := uninstallForReset(p, []string{"backup"}, &recLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyPurged(p); err != nil {
+		t.Fatalf("the retry reaches ready: %v", err)
+	}
+}
+
+// etc/ (install.json, changes.json) is removed last: a removal that fails on the way keeps the records.
+func TestResetKeepsTheRecordsUntilTheRestIsGone(t *testing.T) {
+	p := Paths{Root: t.TempDir(), UnitDir: t.TempDir()}
+	installedWithServices(t, p)
+	fakeSystemctl(t, "")
+	// share/ (after etc/ by name) cannot be removed: a directory the test cannot write into
+	if err := writeFileAtomic(filepath.Join(p.Shipped(), "sub", "x"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if os.Getuid() == 0 {
+		t.Skip("root removes anything")
+	}
+	os.Chmod(filepath.Join(p.Shipped(), "sub"), 0o555)
+	defer os.Chmod(filepath.Join(p.Shipped(), "sub"), 0o755)
+	if _, err := uninstallForReset(p, []string{"backup"}, &recLogger{}); err == nil {
+		t.Fatal("share/ was not removed")
+	}
+	if !fileExists(p.State()) || !fileExists(p.Changes()) {
+		t.Fatal("the records stay while share/ is there")
 	}
 }
