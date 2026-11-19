@@ -213,7 +213,7 @@ func (ins *Installer) runInstall(cfg Config, j *Job) {
 	if err != nil {
 		j.Logf("安装失败：%v", err)
 		if maintenanceStarted {
-			if cleanupErr := ins.Paths.removeMaintenance(j); cleanupErr != nil {
+			if cleanupErr := ins.Paths.removeMaintenance(j, true); cleanupErr != nil {
 				j.warn("清理维护服务失败：%v", cleanupErr)
 			}
 		}
@@ -924,12 +924,13 @@ func (ins *Installer) rollbackNetwork(log Logger) {
 		log.Logf("无法撤销网络：%v", err)
 		return
 	}
-	teardownNetwork(ins.Paths, ch, log)
+	teardownNetwork(ins.Paths, ch, true, log)
 }
 
 // teardownNetwork stops the services and removes nft tables, policy routing and ip_forward changes, when the
-// record says they are the installer's, and then clears that record.
-func teardownNetwork(p Paths, ch *Changes, log Logger) {
+// record says they are the installer's, and then clears that record. stopServices is false for the reset, whose
+// services stopForReset has stopped and disabled already.
+func teardownNetwork(p Paths, ch *Changes, stopServices bool, log Logger) {
 	if !ch.Network {
 		log.Logf("网络部分不是安装器装的（或已经撤销），不动")
 		return
@@ -940,13 +941,15 @@ func teardownNetwork(p Paths, ch *Changes, log Logger) {
 			log.Logf("  （忽略）%v", err)
 		}
 	}
-	if _, err := os.Stat(p.MihomoUnit()); err == nil {
-		if err := p.Init().Stop(log, mihomoUnitName); err != nil {
-			log.Logf("停止 mihomo 失败：%v", err)
+	if stopServices {
+		if _, err := os.Stat(p.MihomoUnit()); err == nil {
+			if err := p.Init().Stop(log, mihomoUnitName); err != nil {
+				log.Logf("停止 mihomo 失败：%v", err)
+			}
 		}
-	}
-	if err := p.Init().DisableNow(log, dnsUnitName, singBoxUnitName); err != nil {
-		log.Logf("  （忽略）%v", err)
+		if err := p.Init().DisableNow(log, dnsUnitName, singBoxUnitName); err != nil {
+			log.Logf("  （忽略）%v", err)
+		}
 	}
 	ignore("nft", "delete", "table", "inet", "atom")
 	ignore("nft", "delete", "table", "inet", "atom_wan")

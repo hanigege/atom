@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
@@ -193,12 +194,13 @@ func fakeCommands(t *testing.T, scripts map[string]string) string {
 }
 
 // fakeSystemctl stands in for systemctl, nft and ip: a service named in <dir>/running is active, one named in
-// <dir>/stuck cannot be disabled; start and enable fail (a service of others cannot be started again).
+// <dir>/stuck cannot be disabled, is-active takes the seconds in <dir>/slow to answer; start and enable fail (a service of others cannot be started again).
 func fakeSystemctl(t *testing.T, running string) string {
 	t.Helper()
 	dir := fakeCommands(t, map[string]string{
 		"systemctl": `case "$1" in
-is-active) if grep -qx "$2" "$D/running" 2>/dev/null; then echo active; exit 0; fi; echo inactive; exit 3;;
+is-active) [ -e "$D/slow" ] && sleep "$(cat "$D/slow")"
+  if grep -qx "$2" "$D/running" 2>/dev/null; then echo active; exit 0; fi; echo inactive; exit 3;;
 disable) for u in "$@"; do if grep -qx "$u" "$D/stuck" 2>/dev/null; then echo "Failed to disable unit $u: Access denied" >&2; exit 1; fi; done;;
 start|enable) exit 1;;
 esac`,
@@ -233,9 +235,12 @@ func installedWithServices(t *testing.T, p Paths) {
 	}
 }
 
-func noStopWait(t *testing.T) {
+// shortStopWait keeps the wait for a service that does not stop short; the queries of the stand-ins fit in it.
+func shortStopWait(t *testing.T) { setStopWait(t, time.Second) }
+
+func setStopWait(t *testing.T, d time.Duration) {
 	old := serviceStopWait
-	serviceStopWait = 0
+	serviceStopWait = d
 	t.Cleanup(func() { serviceStopWait = old })
 }
 
@@ -791,7 +796,7 @@ func TestResetStopsWhileTheOldDNSServiceRuns(t *testing.T) {
 	p := s.ins.Paths
 	installedForReset(t, s)
 	installedWithServices(t, p)
-	noStopWait(t)
+	shortStopWait(t)
 	stub := fakeSystemctl(t, dnsUnitName)
 	os.WriteFile(filepath.Join(stub, "stuck"), []byte(dnsUnitName), 0o644)
 
@@ -841,7 +846,7 @@ func TestResetStopsWhileTheOldDNSServiceRuns(t *testing.T) {
 func TestResetStopsWhileAProgramOfAtomRuns(t *testing.T) {
 	p := Paths{Root: t.TempDir(), UnitDir: t.TempDir()}
 	installedWithServices(t, p)
-	noStopWait(t)
+	shortStopWait(t)
 	fakeSystemctl(t, "")
 	sleep, err := os.ReadFile("/bin/sleep")
 	if err != nil {
@@ -871,7 +876,7 @@ func TestResetStopsWhileAProgramOfAtomRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", t.TempDir()) // no systemctl that answers
-	if err := checkStopped(p); err == nil {
+	if err := checkStopped(context.Background(), p); err == nil {
 		t.Error("a service manager that does not answer is not an answer")
 	}
 }
@@ -885,7 +890,7 @@ func TestResetChecksOpenRCServicesStopped(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	noStopWait(t)
+	shortStopWait(t)
 	stub := fakeCommands(t, map[string]string{
 		"rc-service": `case "$2" in
 stop) [ -e "$D/stop-fails" ] && exit 1;;
@@ -907,7 +912,7 @@ esac`,
 		}
 	}
 	t.Setenv("PATH", t.TempDir()) // no rc-service at all
-	if err := checkStopped(p); err == nil {
+	if err := checkStopped(context.Background(), p); err == nil {
 		t.Error("a service manager that does not answer is not an answer")
 	}
 }
@@ -961,4 +966,188 @@ func TestResetKeepsTheRecordsUntilTheRestIsGone(t *testing.T) {
 	if !fileExists(p.State()) || !fileExists(p.Changes()) {
 		t.Fatal("the records stay while share/ is there")
 	}
+}
+
+// openRCMachine stands in for OpenRC as Alpine has it, for an installation under p (the scripts of all four
+// services): the default runlevel holds links for the services in inDefault; rc-service fails (1) for a script
+// that does not exist, stop marks a service stopped (a second stop exits 1 when <dir>/old-openrc is there), status
+// answers the code in <dir>/status-<name>, else 3 once stopped and 0 before; `rc-update del` fails for a service
+// that is not in the runlevel, as rc-update does.
+func openRCMachine(t *testing.T, inDefault ...string) (Paths, string) {
+	t.Helper()
+	p := Paths{Root: t.TempDir(), UnitDir: t.TempDir(), OpenRC: true}
+	installedWithServices(t, p)
+	if err := writeFileAtomic(p.unitFile(mihomoUnitName), []byte("#!/sbin/openrc-run\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	levels, oldLevels, oldLogs := t.TempDir(), runlevelsDir, openRCLogDir
+	runlevelsDir, openRCLogDir = levels, filepath.Join(t.TempDir(), "log")
+	t.Cleanup(func() { runlevelsDir, openRCLogDir = oldLevels, oldLogs })
+	for _, n := range inDefault {
+		os.MkdirAll(filepath.Join(levels, "default"), 0o755)
+		if err := os.Symlink(p.unitFile(n), filepath.Join(levels, "default", rcName(n))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stub := fakeCommands(t, map[string]string{
+		"rc-service": `[ -e "` + p.UnitDir + `/$1" ] || { echo " * rc-service: service '$1' does not exist" >&2; exit 1; }
+case "$2" in
+stop) if [ -e "$D/stopped-$1" ]; then echo " * WARNING: $1 is already stopped"; [ -e "$D/old-openrc" ] && exit 1; exit 0; fi
+  touch "$D/stopped-$1";;
+status) [ -e "$D/slow" ] && sleep "$(cat "$D/slow")"
+  [ -e "$D/status-$1" ] && exit "$(cat "$D/status-$1")"
+  [ -e "$D/stopped-$1" ] && exit 3; exit 0;;
+esac`,
+		"rc-update": `[ "$1" = del ] || exit 0
+if [ -L "` + levels + `/$3/$2" ]; then rm "` + levels + `/$3/$2"; exit 0; fi
+echo " * rc-update: service '$2' is not in the runlevel '$3'" >&2; exit 1`,
+		"nft": "", "ip": "",
+	})
+	return p, stub
+}
+
+// calls counts the calls of the stand-ins in dir that are line.
+func calls(dir, line string) int {
+	data, _ := os.ReadFile(filepath.Join(dir, "calls"))
+	n := 0
+	for _, l := range strings.Split(string(data), "\n") {
+		if l == line {
+			n++
+		}
+	}
+	return n
+}
+
+// Review finding (round 3, P1): a service whose script is there but that is not in the default runlevel (Alpine:
+// atom-mihomo) is disabled already; `rc-update del` would fail for it and stop the reset in reset_failed.
+func TestResetOpenRCServiceOutsideTheRunlevel(t *testing.T) {
+	p, stub := openRCMachine(t, maintenanceUnitName, dnsUnitName, singBoxUnitName)
+	if _, err := uninstallForReset(p, []string{"backup"}, &recLogger{}); err != nil {
+		t.Fatalf("a service outside the runlevel is no reason to stop: %v", err)
+	}
+	if err := verifyPurged(p); err != nil {
+		t.Fatal(err)
+	}
+	if n := calls(stub, "rc-update del atom-mihomo default"); n != 0 {
+		t.Errorf("rc-update del for a service outside the runlevel: %d", n)
+	}
+	if left, _ := os.ReadDir(filepath.Join(runlevelsDir, "default")); len(left) != 0 {
+		t.Errorf("the others leave the runlevel: %v", left)
+	}
+}
+
+// Review finding (round 3, P1): stopping and disabling can be repeated. A retry finds the services stopped and out
+// of the runlevel (an older openrc-run even fails the stop of a stopped service): that passes.
+func TestResetOpenRCStopCanBeRepeated(t *testing.T) {
+	p, stub := openRCMachine(t, atomServices...)
+	os.WriteFile(filepath.Join(stub, "old-openrc"), nil, 0o644)
+	shortStopWait(t)
+	if err := stopForReset(p, &recLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := stopForReset(p, &recLogger{}); err != nil {
+		t.Fatalf("the retry of a reset whose services are stopped and disabled: %v", err)
+	}
+	// a stop that fails while the service still runs stays an error
+	os.WriteFile(filepath.Join(stub, "status-atom-dns"), []byte("0"), 0o644) // its stop still says "already stopped"
+	if err := stopForReset(p, &recLogger{}); err == nil || !strings.Contains(err.Error(), "停止失败") {
+		t.Errorf("a failed stop of a service that runs: %v", err)
+	}
+}
+
+// Review finding (round 3, P1): the cleanup after stopForReset only removes the service files; it does not stop
+// or disable again (the second `rc-update del` of the maintenance service failed).
+func TestResetStopsAndDisablesEachServiceOnce(t *testing.T) {
+	p, stub := openRCMachine(t, atomServices...)
+	if _, err := uninstallForReset(p, []string{"backup"}, &recLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range atomServices {
+		for _, line := range []string{"rc-service " + rcName(n) + " stop", "rc-update del " + rcName(n) + " default"} {
+			if got := calls(stub, line); got != 1 {
+				t.Errorf("OpenRC %q: %d calls", line, got)
+			}
+		}
+	}
+
+	p = Paths{Root: t.TempDir(), UnitDir: t.TempDir()}
+	installedWithServices(t, p)
+	stub = fakeSystemctl(t, "")
+	if _, err := uninstallForReset(p, []string{"backup"}, &recLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(filepath.Join(stub, "calls"))
+	for _, n := range []string{maintenanceUnitName, dnsUnitName, singBoxUnitName} {
+		got := 0
+		for _, l := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(l, "systemctl disable --now") && slices.Contains(strings.Fields(l), n) {
+				got++
+			}
+		}
+		if got != 1 {
+			t.Errorf("systemd %s: disabled %d times", n, got)
+		}
+	}
+}
+
+// Review finding (round 3, P2): only the exit codes of openrc-run status that mean stopped count as stopped; 1 is
+// a service rc-service does not know, stopped only when its script is really gone; any other code is an error.
+func TestOpenRCStatusCodes(t *testing.T) {
+	p := Paths{Root: t.TempDir(), UnitDir: t.TempDir(), OpenRC: true}
+	stub := fakeCommands(t, map[string]string{"rc-service": `exit "$(cat "$D/code")"`})
+	for _, c := range []struct {
+		code    string
+		script  bool
+		running bool
+		err     bool
+	}{
+		{"0", true, true, false}, {"4", true, true, false}, {"8", true, true, false},
+		{"3", true, false, false}, {"16", true, false, false}, {"32", true, false, false},
+		{"1", true, false, true}, {"2", true, false, true}, {"5", true, false, true}, {"127", true, false, true},
+		{"1", false, false, false}, {"3", false, false, false}, {"2", false, false, true},
+	} {
+		os.WriteFile(filepath.Join(stub, "code"), []byte(c.code), 0o644)
+		os.Remove(p.unitFile(dnsUnitName))
+		if c.script {
+			writeFileAtomic(p.unitFile(dnsUnitName), []byte("#!/sbin/openrc-run\n"), 0o755)
+		}
+		running, err := serviceRunning(context.Background(), p, dnsUnitName)
+		if running != c.running || (err != nil) != c.err {
+			t.Errorf("exit %s (script there: %v): running %v, error %v", c.code, c.script, running, err)
+		}
+	}
+}
+
+// Review finding (round 3, P2): the time limit holds the status queries too: a service manager that answers
+// slowly ends the wait at its deadline (an error, never "stopped"), and so does the check before ready.
+func TestStatusQueriesKeepTheDeadline(t *testing.T) {
+	const limit = time.Second // 4 queries of 400ms took 1.6s before; one query here takes 1.5s
+	check := func(name string, f func() error) {
+		t.Helper()
+		start := time.Now()
+		err := f()
+		if took := time.Since(start); took > limit {
+			t.Errorf("%s: %v past a deadline of 100ms", name, took)
+		}
+		if err == nil {
+			t.Errorf("%s: a service manager that does not answer in time is not an answer", name)
+		}
+	}
+
+	p := Paths{Root: t.TempDir(), UnitDir: t.TempDir()}
+	installedWithServices(t, p)
+	writeFileAtomic(p.MihomoUnit(), []byte("[Service]\n"), 0o644)
+	stub := fakeSystemctl(t, strings.Join(sysdNames(atomServices), "\n"))
+	os.WriteFile(filepath.Join(stub, "slow"), []byte("1.5"), 0o644)
+	setStopWait(t, 100*time.Millisecond)
+	check("systemd stopForReset", func() error { return stopForReset(p, &recLogger{}) })
+	check("systemd verifyPurged", func() error { return verifyPurged(Paths{Root: t.TempDir()}) })
+
+	p, stub = openRCMachine(t, atomServices...)
+	for _, n := range atomServices {
+		os.WriteFile(filepath.Join(stub, "status-"+rcName(n)), []byte("0"), 0o644)
+	}
+	os.WriteFile(filepath.Join(stub, "slow"), []byte("1.5"), 0o644)
+	check("OpenRC stopForReset", func() error { return stopForReset(p, &recLogger{}) })
+	check("OpenRC verifyPurged", func() error { return verifyPurged(Paths{Root: t.TempDir(), OpenRC: true}) })
 }

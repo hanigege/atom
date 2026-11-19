@@ -15,6 +15,7 @@ package main
 // network (topology, interfaces, panel port, panel login) and the default settings, so the LAN gets its DNS back.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -675,8 +676,10 @@ func verifyPurged(p Paths) error {
 	if len(found) > 0 {
 		return fmt.Errorf("仍然存在：%s", strings.Join(found, "、"))
 	}
-	// an old service still running would keep port 53 from the new installation
-	return checkStopped(p)
+	// an old service still running would keep port 53 from the new installation; the check is bounded too
+	ctx, cancel := context.WithTimeout(context.Background(), serviceStopWait)
+	defer cancel()
+	return checkStopped(ctx, p)
 }
 
 // backupForReset copies the data and the install records to backup/reset-<time>/. The name is not one that

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -56,17 +57,18 @@ func uninstall(p Paths, purge bool, log Logger) error {
 // takeBack undoes what the installer did outside /opt/atom: the maintenance service, the network (when the
 // record says it is the installer's), the units, resolved, resolv.conf and the services it stopped. The returned
 // record keeps what could not be put back (failed names it) and the packages the installer brought.
-// strict is the reset's removal: the service files go whatever the records say (an earlier attempt may have
-// removed install.json already), and one that cannot be removed is an error, so that nothing is deleted after it.
+// strict is the reset's removal: stopForReset has stopped and disabled every service already, so the service
+// files only go (whatever the records say: an earlier attempt may have removed install.json already), and one
+// that cannot be removed is an error, so that nothing is deleted after it.
 func takeBack(p Paths, strict bool, log Logger) (*Changes, []string, error) {
 	ch, err := loadChanges(p)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := p.removeMaintenance(log); err != nil {
+	if err := p.removeMaintenance(log, !strict); err != nil {
 		return nil, nil, err
 	}
-	teardownNetwork(p, ch, log)
+	teardownNetwork(p, ch, !strict, log)
 	units := []string{p.DNSUnit(), p.SingBoxUnit(), p.MihomoUnit()}
 	if strict {
 		for _, f := range units {
@@ -204,12 +206,15 @@ var atomServices = []string{maintenanceUnitName, dnsUnitName, singBoxUnitName, m
 // atomPrograms are the programs of the installation that run as its services.
 var atomPrograms = []string{"atomdns", "sing-box", "mihomo"}
 
-// serviceStopWait is how long the processes of a stopped service may take to go away; a variable for the tests.
+// serviceStopWait is how long the processes of a stopped service may take to go away, and the limit of one
+// round of status queries (a query that takes longer is an error); a variable for the tests.
 var serviceStopWait = 10 * time.Second
 
 // stopForReset stops atom's services and checks that they are stopped, before the reset deletes anything: a
 // stop or disable that fails, a service the service manager still reports running, or a process of atom's
-// programs that is still there is an error.
+// programs that is still there is an error. It can be repeated: what an earlier attempt stopped and disabled
+// passes. The stops have their own time limits (runCmd); the wait after them, every query in it included, ends
+// at one deadline.
 func stopForReset(p Paths, log Logger) error {
 	in := p.Init()
 	var failed []string
@@ -217,10 +222,15 @@ func stopForReset(p Paths, log Logger) error {
 		var err error
 		if _, statErr := os.Lstat(p.unitFile(n)); statErr == nil {
 			err = in.DisableNow(log, n)
-		} else if running, rerr := serviceRunning(p, n); rerr != nil {
-			err = rerr
-		} else if running { // its file went in an earlier attempt, the service did not
-			err = in.Stop(log, n)
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), serviceStopWait)
+			running, rerr := serviceRunning(ctx, p, n)
+			cancel()
+			if rerr != nil {
+				err = rerr
+			} else if running { // its file went in an earlier attempt, the service did not
+				err = in.Stop(log, n)
+			}
 		}
 		if err != nil {
 			failed = append(failed, fmt.Sprintf("%s（%v）", n, err))
@@ -229,17 +239,33 @@ func stopForReset(p Paths, log Logger) error {
 	if len(failed) > 0 {
 		return fmt.Errorf("停止失败：%s", strings.Join(failed, "；"))
 	}
-	for deadline := time.Now().Add(serviceStopWait); ; time.Sleep(200 * time.Millisecond) {
-		err := checkStopped(p)
-		if err == nil || time.Now().After(deadline) {
+	deadline := time.Now().Add(serviceStopWait)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	var last error
+	for {
+		err := checkStopped(ctx, p)
+		switch {
+		case err == nil:
+			return nil
+		case ctx.Err() != nil && last != nil:
+			return last // the deadline cut this round short: the last full answer says what still runs
+		case ctx.Err() != nil:
 			return err
 		}
+		last = err
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			return err
+		}
+		time.Sleep(min(wait, 200*time.Millisecond))
 	}
 }
 
-// checkStopped: none of atom's services runs, by the service manager's account and by the processes there.
-func checkStopped(p Paths) error {
-	left, err := stillRunning(p)
+// checkStopped: none of atom's services runs, by the service manager's account (asked within ctx) and by the
+// processes there.
+func checkStopped(ctx context.Context, p Paths) error {
+	left, err := stillRunning(ctx, p)
 	if err != nil {
 		return err
 	}
@@ -251,10 +277,10 @@ func checkStopped(p Paths) error {
 
 // stillRunning names atom's services that the service manager reports running and the processes of atom's
 // programs that are there; a service manager that does not answer is an error.
-func stillRunning(p Paths) ([]string, error) {
+func stillRunning(ctx context.Context, p Paths) ([]string, error) {
 	var left []string
 	for _, n := range atomServices {
-		running, err := serviceRunning(p, n)
+		running, err := serviceRunning(ctx, p, n)
 		if err != nil {
 			return nil, err
 		}
