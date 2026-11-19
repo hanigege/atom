@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -559,5 +561,132 @@ func TestContainerNetworkIsRenderedFromTheState(t *testing.T) {
 	}
 	if _, err := os.Stat(p.DNSUnit()); err == nil {
 		t.Error("a unit file was written")
+	}
+}
+
+func TestNothingStartsDuringShutdown(t *testing.T) {
+	p := containerPaths(t)
+	s, _ := testSup(t, p, shSpec("atom-dns", `exec sleep 30`))
+	s.shutdown()
+	for name, err := range map[string]error{"start": s.Start("atom-dns"), "restart": s.Restart("atom-dns"), "reload": s.Reload("atom-dns")} {
+		if !errors.Is(err, errClosing) {
+			t.Errorf("%s during shutdown: %v", name, err)
+		}
+	}
+	s.boot() // a boot that SIGTERM overtakes starts nothing
+	if s.list()[0].State != "stopped" {
+		t.Error("boot started a service after shutdown began")
+	}
+}
+
+func TestOnlyOneKernelRuns(t *testing.T) {
+	p := containerPaths(t)
+	sb, mh := shSpec("atom-sing-box", `exec sleep 30`), shSpec("atom-mihomo", `exec sleep 30`)
+	sb.Group, mh.Group = "kernel", "kernel"
+	s, _ := testSup(t, p, sb, mh)
+	if err := s.Start("atom-sing-box"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start("atom-mihomo"); err == nil || s.list()[1].State != "stopped" {
+		t.Errorf("a second kernel started: %v", err)
+	}
+	if err := s.Reload("atom-mihomo"); err == nil {
+		t.Error("a second kernel was reloaded into running")
+	}
+	// the switch of atomdns: the old one is stopped, then the new one reloaded
+	s.Stop("atom-sing-box")
+	if err := s.Reload("atom-mihomo"); err != nil {
+		t.Fatal(err)
+	}
+	// both marked running (hand edited, or a crash between the two writes): the selected one starts
+	s.shutdown()
+	p2 := containerPaths(t)
+	if err := os.MkdirAll(filepath.Join(p2.Data(), "webinfo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(p2.Data(), "webinfo", "atom_proxy.json"), []byte(`{"settings":{"backend":"mihomo"}}`), 0o600)
+	os.MkdirAll(p2.Etc(""), 0o755)
+	os.WriteFile(p2.Etc(servicesFile), []byte(`{"atom-sing-box":"running","atom-mihomo":"running"}`), 0o644)
+	s2, _ := testSup(t, p2, sb, mh)
+	s2.boot()
+	if got := s2.list(); got[0].State != "stopped" || got[1].State != "running" || got[0].Desired != "stopped" {
+		t.Errorf("after boot %+v", got)
+	}
+}
+
+func TestReloadDuringTheRetryWaitStartsNow(t *testing.T) {
+	p := containerPaths(t)
+	var mu sync.Mutex
+	ready := false
+	sp := shSpec("atom-sing-box", `exec sleep 30`)
+	sp.Delay = time.Hour // the loop would not try again by itself
+	sp.Pre = func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		if !ready {
+			return os.ErrNotExist
+		}
+		return nil
+	}
+	sp.Reload = func() error { return nil }
+	s, _ := testSup(t, p, sp)
+	os.MkdirAll(p.Etc(""), 0o755)
+	os.WriteFile(p.Etc(servicesFile), []byte(`{"atom-sing-box":"running"}`), 0o644)
+	s.boot()
+	if s.list()[0].State != "failed" {
+		t.Fatalf("state %s", s.list()[0].State)
+	}
+	mu.Lock()
+	ready = true
+	mu.Unlock()
+	if err := s.Reload("atom-sing-box"); err != nil || s.list()[0].State != "running" {
+		t.Errorf("reload in the wait: %v, %s", err, s.list()[0].State)
+	}
+}
+
+func TestServicesJSONProblems(t *testing.T) {
+	p := containerPaths(t)
+	s, _ := testSup(t, p, shSpec("atom-dns", `exec sleep 30`), shSpec("atom-sing-box", `exec sleep 30`))
+	os.MkdirAll(p.Etc(""), 0o755)
+	// unreadable content: counts as new, and the next change rewrites it
+	for _, bad := range []string{`{`, `{"atom-dns":"maybe"}`, `[1]`} {
+		os.WriteFile(p.Etc(servicesFile), []byte(bad), 0o644)
+		if _, err := s.loadDesired(); !errors.Is(err, errServicesCorrupt) {
+			t.Errorf("%s: %v", bad, err)
+		}
+		if err := s.Enable("atom-sing-box"); err != nil {
+			t.Errorf("%s: %v", bad, err)
+		}
+		var m map[string]string
+		if err := readJSON(p.Etc(servicesFile), &m); err != nil || m["atom-dns"] != "running" || m["atom-sing-box"] != "running" {
+			t.Errorf("rewritten: %v %v", m, err)
+		}
+	}
+	// a file that cannot be read or written is an error of the call, not a silent default
+	os.Remove(p.Etc(servicesFile))
+	os.MkdirAll(p.Etc(servicesFile), 0o755) // a directory where the file should be
+	if err := s.Stop("atom-dns"); err == nil {
+		t.Error("Stop did not report that services.json cannot be recorded")
+	}
+}
+
+func TestStopKillsWhatTheServiceStarted(t *testing.T) {
+	p := containerPaths(t)
+	child := filepath.Join(t.TempDir(), "child")
+	s, _ := testSup(t, p, shSpec("atom-dns", `sleep 30 & echo $! > `+child+`; wait`))
+	if err := s.Start("atom-dns"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "child", func() bool { d, _ := os.ReadFile(child); return len(d) > 0 })
+	d, _ := os.ReadFile(child)
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(d)))
+	s.Stop("atom-dns")
+	waitFor(t, "child gone", func() bool { return syscall.Kill(pid, 0) != nil })
+}
+
+func TestSetReloadCommandForTheContainerNeedsAllFourCommands(t *testing.T) {
+	yaml := "  reload: [systemctl, reload-or-restart, atom-sing-box.service]\n  stop: [systemctl, stop, atom-sing-box.service]\n"
+	if _, err := setReloadCommand(yaml, "/opt/atom/bin/atom-installer"); err == nil {
+		t.Error("rules without the mihomo commands were accepted")
 	}
 }

@@ -351,8 +351,11 @@ func setReloadCommand(yaml, cmd string) (string, error) {
 	if filepath.Base(cmd) == "atom-installer" {
 		for _, backend := range []string{"sing-box", "mihomo"} {
 			for _, a := range []struct{ yamlAction, action string }{{"reload-or-restart", "reload"}, {"stop", "stop"}} {
-				yaml = strings.ReplaceAll(yaml, "[systemctl, "+a.yamlAction+", atom-"+backend+".service]",
-					"["+cmd+", svc, "+a.action+", atom-"+backend+"]")
+				old := "[systemctl, " + a.yamlAction + ", atom-" + backend + ".service]"
+				if !strings.Contains(yaml, old) {
+					return "", fmt.Errorf("atom_rules.yaml has no %s", old)
+				}
+				yaml = strings.ReplaceAll(yaml, old, "["+cmd+", svc, "+a.action+", atom-"+backend+"]")
 			}
 		}
 		return yaml, nil

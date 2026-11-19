@@ -8,6 +8,8 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -40,6 +43,9 @@ type serviceSpec struct {
 	Args  []string
 	Env   []string
 	Delay time.Duration // RestartSec
+	// Group: of the services of one group (the proxy kernels, which share their ports and the nft sets) at most
+	// one runs.
+	Group string
 	// Pre is ExecStartPre (and ConditionPathExists): a start does not happen when it fails.
 	Pre func() error
 	// Reload is ExecReload before the SIGHUP; nil: the service has no reload and is restarted.
@@ -61,6 +67,7 @@ func containerSpecs(p Paths) []serviceSpec {
 		specs[i].Bin = p.Bin(backend)
 		specs[i].Args = append(strings.Fields(work), dir, cfgArg, path)
 		specs[i].Delay = time.Second
+		specs[i].Group = "kernel"
 		specs[i].Pre = func() error {
 			if _, err := os.Stat(path); err != nil {
 				return fmt.Errorf("没有 %s", path)
@@ -154,7 +161,10 @@ type supervisor struct {
 	outM sync.Mutex
 
 	stateMu sync.Mutex
+	closing atomic.Bool // the container is stopping: nothing starts any more
 }
+
+var errClosing = errors.New("容器正在停止")
 
 func newSupervisor(p Paths, specs []serviceSpec, out io.Writer) *supervisor {
 	s := &supervisor{p: p, out: out}
@@ -213,15 +223,36 @@ func (v *service) emit(line string) {
 	v.sup.line(v.spec.Name, line)
 }
 
-// desired reads services.json: the names that are to run. Without the file (a new installation) atomdns runs
-// and starts the kernel itself.
-func (s *supervisor) desired() map[string]bool {
+var errServicesCorrupt = errors.New("格式不对")
+
+// loadDesired reads services.json: the services that are to run when the container starts. Without the file (a
+// new installation) atomdns runs and starts the kernel itself.
+func (s *supervisor) loadDesired() (map[string]string, error) {
 	var m map[string]string
 	if err := readJSON(s.p.Etc(servicesFile), &m); err != nil {
-		if !os.IsNotExist(err) {
-			s.Logf("读取 %s：%v", servicesFile, err)
+		if os.IsNotExist(err) {
+			return map[string]string{"atom-dns": "running"}, nil
 		}
-		return map[string]bool{"atom-dns": true}
+		var se *json.SyntaxError
+		var te *json.UnmarshalTypeError
+		if errors.As(err, &se) || errors.As(err, &te) {
+			return nil, fmt.Errorf("%s %w", servicesFile, errServicesCorrupt)
+		}
+		return nil, err
+	}
+	for n, v := range m {
+		if v != "running" && v != "stopped" {
+			return nil, fmt.Errorf("%s %w：%s 的值是 %q", servicesFile, errServicesCorrupt, n, v)
+		}
+	}
+	return m, nil
+}
+
+// desired is loadDesired for the readers that can do without it: what cannot be read counts as a new installation.
+func (s *supervisor) desired() map[string]bool {
+	m, err := s.loadDesired()
+	if err != nil {
+		m = map[string]string{"atom-dns": "running"}
 	}
 	out := map[string]bool{}
 	for n, v := range m {
@@ -230,17 +261,22 @@ func (s *supervisor) desired() map[string]bool {
 	return out
 }
 
-func (s *supervisor) setDesired(name string, run bool) {
+func (s *supervisor) setDesired(name string, run bool) error {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	m := map[string]string{}
-	for n, v := range s.desired() {
-		m[n] = stateWord(v)
+	m, err := s.loadDesired()
+	if errors.Is(err, errServicesCorrupt) {
+		s.Logf("%v，按新安装处理并重写", err)
+		m, err = map[string]string{"atom-dns": "running"}, nil
+	}
+	if err != nil {
+		return fmt.Errorf("读取 %s：%w", servicesFile, err)
 	}
 	m[name] = stateWord(run)
 	if err := writeJSON(s.p.Etc(servicesFile), m); err != nil {
-		s.Logf("保存 %s：%v", servicesFile, err)
+		return fmt.Errorf("保存 %s：%w", servicesFile, err)
 	}
+	return nil
 }
 
 func stateWord(run bool) string {
@@ -293,14 +329,34 @@ func (v *service) spawnLocked() error {
 	return nil
 }
 
-// begin runs the start hook and the process; it fails when either does. With the loop already running it does
-// nothing. The caller holds v.op.
-func (v *service) begin() error {
+// active: a process, or a loop that is to start one again.
+func (v *service) active() bool {
 	v.mu.Lock()
-	running := v.stop != nil
+	defer v.mu.Unlock()
+	return v.cur != nil || v.stop != nil
+}
+
+// begin runs the start hook and the process; it fails when either does. With the process running it does
+// nothing; with the loop waiting to try again, the start is that try. The caller holds v.op.
+func (v *service) begin() error {
+	if v.sup.closing.Load() {
+		return errClosing
+	}
+	v.mu.Lock()
+	running, retrying := v.cur != nil, v.stop != nil
 	v.mu.Unlock()
 	if running {
 		return nil
+	}
+	if retrying {
+		v.end()
+	}
+	if v.spec.Group != "" {
+		for _, o := range v.sup.svcs {
+			if o != v && o.spec.Group == v.spec.Group && o.active() {
+				return fmt.Errorf("%s 在运行或等着重启，同时只能运行一个代理内核", o.spec.Name)
+			}
+		}
 	}
 	if v.spec.Pre != nil {
 		if err := v.spec.Pre(); err != nil {
@@ -331,6 +387,8 @@ func (v *service) loop(stop, done chan struct{}) {
 		v.mu.Unlock()
 		if cmd != nil {
 			err := cmd.Wait()
+			// what the process left behind (it was the leader of its group) goes with it, as with a systemd cgroup
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			v.mu.Lock()
 			v.cur = nil
 			select {
@@ -399,9 +457,10 @@ func (v *service) end() {
 	<-done
 }
 
+// signalGroup signals the process and what it started (it leads a process group of its own).
 func signalGroup(cmd *exec.Cmd, sig syscall.Signal) {
 	if cmd.Process != nil {
-		_ = cmd.Process.Signal(sig)
+		_ = syscall.Kill(-cmd.Process.Pid, sig)
 	}
 }
 
@@ -418,8 +477,7 @@ func (s *supervisor) Start(name string) error {
 	if err := v.begin(); err != nil {
 		return err
 	}
-	s.setDesired(v.spec.Name, true)
-	return nil
+	return s.setDesired(v.spec.Name, true)
 }
 
 func (s *supervisor) Stop(name string) error {
@@ -430,8 +488,7 @@ func (s *supervisor) Stop(name string) error {
 	v.op.Lock()
 	defer v.op.Unlock()
 	v.end()
-	s.setDesired(v.spec.Name, false)
-	return nil
+	return s.setDesired(v.spec.Name, false)
 }
 
 func (s *supervisor) Restart(name string) error {
@@ -441,12 +498,14 @@ func (s *supervisor) Restart(name string) error {
 	}
 	v.op.Lock()
 	defer v.op.Unlock()
+	if s.closing.Load() {
+		return errClosing
+	}
 	v.end()
 	if err := v.begin(); err != nil {
 		return err
 	}
-	s.setDesired(v.spec.Name, true)
-	return nil
+	return s.setDesired(v.spec.Name, true)
 }
 
 // Reload is `systemctl reload-or-restart`: the service runs, so it gets its hook and SIGHUP; else it starts.
@@ -460,6 +519,9 @@ func (s *supervisor) Reload(name string) error {
 	}
 	v.op.Lock()
 	defer v.op.Unlock()
+	if s.closing.Load() {
+		return errClosing
+	}
 	v.mu.Lock()
 	cmd := v.cur
 	v.mu.Unlock()
@@ -471,10 +533,13 @@ func (s *supervisor) Reload(name string) error {
 		if err := v.spec.Reload(); err != nil {
 			return err
 		}
-		signalGroup(cmd, syscall.SIGHUP)
+		// SIGHUP goes to the main process only (ExecReload=kill -HUP $MAINPID). One that has died on the way is
+		// started again by the loop, with the files the hook just wrote.
+		if err := cmd.Process.Signal(syscall.SIGHUP); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return err
+		}
 	}
-	s.setDesired(v.spec.Name, true)
-	return nil
+	return s.setDesired(v.spec.Name, true)
 }
 
 // Enable records that the service is to run when the container starts; it does not start it.
@@ -483,22 +548,37 @@ func (s *supervisor) Enable(name string) error {
 	if v == nil {
 		return fmt.Errorf("没有这个服务：%s", name)
 	}
-	s.setDesired(v.spec.Name, true)
-	return nil
+	return s.setDesired(v.spec.Name, true)
 }
 
 // boot starts what services.json says. A service that cannot start now is retried like one that died.
 func (s *supervisor) boot() {
+	if _, err := s.loadDesired(); err != nil {
+		s.Logf("%v，按新安装处理", err)
+	}
 	want := s.desired()
+	// the kernels share ports and rules: of two that are marked running only the selected one starts
+	if want["atom-sing-box"] && want["atom-mihomo"] {
+		backend, _, _ := s.p.proxyService()
+		other := "atom-mihomo"
+		if backend == "mihomo" {
+			other = "atom-sing-box"
+		}
+		s.Logf("%s 和 %s 都记为运行，只启动选中的内核", "atom-sing-box", "atom-mihomo")
+		want[other] = false
+		if err := s.setDesired(other, false); err != nil {
+			s.Logf("%v", err)
+		}
+	}
 	for _, v := range s.svcs {
-		if !want[v.spec.Name] {
+		if !want[v.spec.Name] || s.closing.Load() {
 			continue
 		}
 		v.op.Lock()
-		if err := v.begin(); err != nil {
+		if err := v.begin(); err != nil && !errors.Is(err, errClosing) {
 			s.Logf("%v，%s 后再试", err, v.spec.Delay)
 			v.mu.Lock()
-			if v.stop == nil {
+			if v.stop == nil && !s.closing.Load() {
 				v.startLoopLocked()
 			}
 			v.mu.Unlock()
@@ -507,14 +587,25 @@ func (s *supervisor) boot() {
 	}
 }
 
-// shutdown stops atomdns, then the kernels (the reverse of the start), and leaves services.json as it is.
+// shutdown stops atomdns first, then the kernels, and leaves services.json as it is. Nothing starts after it
+// has begun. Both steps are bounded by stopWait, so that `docker stop` (10 s) is enough.
 func (s *supervisor) shutdown() {
-	for i := len(s.svcs) - 1; i >= 0; i-- {
-		v := s.svcs[i]
+	s.closing.Store(true)
+	stop := func(v *service) {
 		v.op.Lock()
 		v.end()
 		v.op.Unlock()
 	}
+	stop(s.svcs[len(s.svcs)-1])
+	var wg sync.WaitGroup
+	for _, v := range s.svcs[:len(s.svcs)-1] {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			stop(v)
+		}()
+	}
+	wg.Wait()
 }
 
 func (s *supervisor) logs(name string, n int) ([]string, error) {
@@ -572,7 +663,7 @@ func cmdContainer([]string) int {
 		return 1
 	}
 	sup.Logf("atom %s 启动，面板端口 %d", st.Version, st.PanelPort)
-	sup.boot()
+	go sup.boot()
 
 	sig := <-sigs
 	sup.Logf("收到 %v，停止服务", sig)

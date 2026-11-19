@@ -5,7 +5,7 @@
 #   dev-container-seed.sh --package FILE|DIR --data DIR --lan IFACE [--port 80] [--backend sing-box|mihomo]
 #
 # --package  a package tar.gz of build-package.sh, or the unpacked directory (atom-<version>/)
-# --data     the directory that is mounted at /opt/atom/data (created; must be empty or not yet seeded)
+# --data     the directory that is mounted at /opt/atom/data (created; must be new or empty)
 # --lan      the network interface the container will have (the one macvlan gives it, normally eth0)
 set -euo pipefail
 PACKAGE="" DATA="" LAN="" PORT=80 BACKEND=sing-box
@@ -21,7 +21,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$PACKAGE" ] && [ -n "$DATA" ] && [ -n "$LAN" ] || { echo "--package, --data and --lan are required" >&2; exit 2; }
 [ "$BACKEND" = sing-box ] || [ "$BACKEND" = mihomo ] || { echo "--backend is sing-box or mihomo" >&2; exit 2; }
-[ ! -e "$DATA/.atom" ] || { echo "$DATA is seeded already" >&2; exit 2; }
+[ -z "$(ls -A "$DATA" 2>/dev/null)" ] || { echo "$DATA is not empty" >&2; exit 2; }
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

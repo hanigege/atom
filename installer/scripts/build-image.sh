@@ -77,6 +77,6 @@ $DOCKER build "${args[@]}" "$CTX"
 
 mkdir -p "$OUT"
 TAR="$OUT/atom-$VERSION-container-$ARCH.tar"
-rm -f "$TAR"
-$DOCKER save -o "$TAR" "$TAG"
+$DOCKER save -o "$TAR.part" "$TAG"
+mv -f "$TAR.part" "$TAR"
 echo "built image $TAG, wrote $TAR ($(du -h "$TAR" | cut -f1), sha256 $(sha256 "$TAR"))"

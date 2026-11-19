@@ -85,7 +85,10 @@ func listenUnix(path string) (net.Listener, error) {
 
 // serveContainerSockets serves the control socket and the maintenance socket; the returned function closes both.
 func serveContainerSockets(p Paths, sup *supervisor) (func(), error) {
-	if err := os.MkdirAll(p.Run(""), 0o755); err != nil {
+	if err := os.MkdirAll(p.Run(""), 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(p.Run(""), 0o700); err != nil {
 		return nil, err
 	}
 	// atomdns takes this lock shared before a write; it has to exist (maintenance.go serveMaintenance)
