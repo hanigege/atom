@@ -324,11 +324,31 @@ networks:
 - `go vet`、`go test ./...`：vm92，`/root/atom-build/atom-c2/installer`（Go 1.24.4，linux/amd64），全部通过。Mac 上 `TestStatusQueriesKeepTheDeadline`、`TestMaintenanceFollowsTheResetWizard`、`TestMaintenanceRestartWhileTheResetWizardStarts`、`TestResetStopsWhileAProgramOfAtomRuns` 在没有这次改动时也失败（计时和 `/proc`），vm92 上通过。
 - 实测：Docker 26.1.5，macvlan（网络 `atom-c3-net`，C3 建的，和我共用；parent `eth0`，10.0.0.0/24），容器 10.0.0.201，客户端 netns 10.0.0.202，镜像 `atom:0.2.1-c2`（0.2.1 包，换成新编的 atom-installer，基础镜像 `atom-base:trixie-slim`），向导的 JSON API 用 `/root/atom-build/atom-c2/drive.py` 按页面的调用顺序走。结果见下表。
 
-RESULTS_TABLE
+| 项目 | 结果 |
+|---|---|
+| 空数据目录起容器：日志里有向导地址和安装码，`curl` 取回页面 | 通过 |
+| 环境探测：有 `NET_ADMIN` 时四项都通过；没有 `NET_ADMIN` 时只列“缺少 NET_ADMIN”，`/api/install` 返回 400 | 通过 |
+| 按页面的调用顺序走 JSON API（state、validate、install、轮询 job）：sing-box，面板端口 80（和向导同端口，走临时端口交接），导入一个节点，五步全部通过；`/api/finish` 后面板在 80 上 200，`config_custom.yaml` 和 `install.json` 里都是 80 | 通过 |
+| 客户端 netns（10.0.0.202）向 10.0.0.201 查 `www.google.com` 得到 28.0.0.x（FakeIP），`www.baidu.com` 得到真实 IP | 通过 |
+| mihomo 内核装一遍（含“回包经主路由”，加了 sysctls）：同样通过；`ip rule` 里有 9234，表 234 有默认路由，`output_reply` 链在 | 通过 |
+| `docker restart` 后：规则、策略路由、回包规则重新加载，服务和面板恢复，DNS 正常 | 通过 |
+| `atom-installer reconfigure`（`docker exec`）：终端打印 `http://10.0.0.201:9996/` 和安装码；网络一步按 `install.json` 预填；面板端口 80 改 8081：成功，atomdns 在 8081 上 | 通过 |
+| 重新配置时打开“回包经主路由”但 compose 没加 sysctls：网络一步失败并列出要加的行，恢复备份，`install.json` 和 `config_custom.yaml` 和原来一字不差，服务正常，没有 9234 规则 | 通过 |
+| 第一次安装时打开“回包经主路由”但没加 sysctls：网络一步失败，`inet atom` 表和 233 规则都撤掉；回到向导改成不开，再装成功 | 通过 |
+| 面板维护接口触发重置（`POST /api/v1/atom/maintenance/reset`，经 atomdns 转发）：`job` 里有 `awaiting_browser`、`wizard_port`（9996）、`wizard_code`、`wizard_urls`；向导确认后备份到 `data/.atom/backup/reset-<时间>/`，三个服务停止，`inet atom` 表和 233 规则撤掉，`data/` 只剩 `.atom/backup`（含先前的两份 reconfigure 备份）；向导里“上一次的网络”是原来的面板端口 | 通过 |
+| 重置后在同一个向导里再装一遍（mihomo，面板端口 80，向导在 9996）：五步通过，面板在 80，DNS 正常；新面板的概览里没有旧的重置任务 | 通过 |
+| 探测只用 `nft -c`，不留表（装完后 `nft list tables` 只有 `ip nat` 和 `inet atom`） | 通过 |
+| 页面：用 `node` 加载 `index.html` 的脚本，`deployment: "container"` 时环境一步列出探测项和原因，网络一步没有拓扑、一块网卡自动选定、有“回包经主路由”和面板端口；脚本语法检查通过 | 通过（没有在浏览器里点过） |
+| 没有 `nft_tproxy` 等模块时的探测 | 只有单元测试（vm92 的内核有这些模块） |
+| 重置清空到一半被停掉，下次启动接着清 | 只有单元测试 |
+| 代理流量真的从节点出去 | 没测（用的是假节点） |
 
 **codex 审查**（`codex exec -s read-only`，静态审查）：
 
-CODEX_ROUNDS
+- 第一轮（对 3d1d046）：2 条阻断，7 条 should-fix。阻断：回包选项关着时回滚仍清空表 234（可能删掉不是安装器加的路由）；重置清空到一半入口进程被停掉，下次启动会起一个删了一半的安装。should-fix：重置备份丢软链接，备份时读数据目录的错误被当成“没有数据”；撤销网络的错误被忽略，重置可能带着旧规则报成功；失败的重新配置没有把 `accept_redirects` 写回；页面在交接时可能跳回向导；向导的位置在面板交接做完前就空出来；每次启动都把面板绑定地址改成 0.0.0.0；“重置后旧任务”的过滤用了会变的时间戳。**全部处理**（89286ed）：回滚只在规则正是安装器加的那一条时才删；`.reset-pending` 记录加启动时的 `resumeReset`；软链接按链接备份；`containerTeardown` 返回错误，重置不继续；`ins.redirectsBefore` 快照；`X-Atom-Wizard` 头和页面等待；`wizardHost.start` 的 `after` 回调在位置和操作锁还占着时做交接；`ensurePanelPort` 只在端口不同时改；概览里不再显示已开始的重置任务。补了测试。
+- 第二轮（对 89286ed）：2 条阻断，8 条 should-fix。阻断：探测的临时表在重新配置（有流量）时可能拦住真实报文，删除失败还被忽略；`data/.atom` 是软链接时清空会删到数据目录之外。**处理**（b9fbe42）：探测的规则以不存在的网卡名 `iifname` 开头；`requireRealDirs` 拒绝链接的 `.atom` 和备份目录；`syncBackup` 不跟软链接；表 234 的路由先于规则删除并在失败处停下；每次尝试单独快照、失败都写回 `accept_redirects`；`resumeReset` 放在打开 socket 之前，读不到记录是错误；第一个向导也持有操作锁；页面在面板一直不应答时不再跳转；普通启动遇到不认识的 `config_custom.yaml` 版式不改它。记为已知限制（不修）：表 233 整体清空（同 Linux 版）；停服务和写重置记录之间被停掉，服务记录留着“停止”；重新配置中途被停没有启动时回滚；重置任务的过滤；换面板端口时自定义的绑定地址被改回 0.0.0.0。
+- 第三轮（对 b9fbe42）：2 条阻断，5 条 should-fix。阻断：`data/` 本身是软链接（它是卷的挂载点，实际不会）；重置在“被取消的启动钩子还在跑”时清空数据（极端并发）。should-fix：探测表名可能和现有表重名、报文的接口名可以叫 `atom-probe0`；表 234 路由的归属靠规则推断；交接在进程启动时就放开位置；备份里的软链接可能让保留面板登录的默认安装找不到文件；失败回滚在服务停不下来时仍删规则。**处理**（91a7e9d）：`requireRealDirs` 也检查数据目录本身；`serviceInfo.Draining`，重置的“已停止”检查把正在启动或停止的服务算作没停（清空被拒绝，向导里可以重试）；探测改用 `nft -c`（内核检查后丢弃，什么都不加载，也不删任何表）；交接要等 atomdns 在面板端口应答才算完成。记为已知限制：表 234 路由的归属推断（容器的网络空间只有 atom 用）；备份里软链接指向 `data/` 内文件时的保留登录；服务停不下来时的回滚（`services.json` 写不了才会发生）。
+- **三轮后没有未处理的阻断项**（第三轮的两条阻断都改了）；第三轮的修复没有再送 codex 复审。
 
 **已知限制**：
 
