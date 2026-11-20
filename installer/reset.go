@@ -154,6 +154,9 @@ func runningWizard(p Paths) (listenInfo, bool) {
 	if err := readJSON(p.Run("installer.json"), &li); err != nil {
 		return li, false
 	}
+	if p.Container { // the wizard is a part of the entry process
+		return li, activeWizard(li)
+	}
 	return li, processAlive(li.PID)
 }
 
@@ -161,6 +164,9 @@ func runningWizard(p Paths) (listenInfo, bool) {
 func wizardRunning(p Paths) bool {
 	if _, ok := runningWizard(p); ok {
 		return true
+	}
+	if p.Container {
+		return false
 	}
 	if !p.OpenRC {
 		if _, err := quietCmd("systemctl", "is-active", "--quiet", "atom-installer.service"); err == nil {
@@ -227,21 +233,32 @@ func launchResetWizard(p Paths, pkg, id string, log Logger) error {
 func (m *maintenance) runReset(st *InstallState, operation *os.File) {
 	p := m.paths
 	log := stderrLogger{}
-	pkg, err := prepareResetPackage(p, st.Version)
-	if err != nil {
-		m.failed(err)
-		return
-	}
-	if err := m.change(func(job *maintenanceJob) { job.Package = pkg }); err != nil {
-		os.RemoveAll(pkg)
-		m.failed(err)
-		return
+	pkg := "" // the container installs from the image: no package to assemble
+	if !p.Container {
+		var err error
+		if pkg, err = prepareResetPackage(p, st.Version); err != nil {
+			m.failed(err)
+			return
+		}
+		if err := m.change(func(job *maintenanceJob) { job.Package = pkg }); err != nil {
+			os.RemoveAll(pkg)
+			m.failed(err)
+			return
+		}
 	}
 	id := m.snapshot().ID
 	os.Remove(p.Run("installer.json"))
 	operation.Close()
-	if err := launchResetWizard(p, pkg, id, log); err != nil {
-		os.RemoveAll(pkg)
+	var err error
+	if p.Container {
+		err = startContainerReset(p, id)
+	} else {
+		err = launchResetWizard(p, pkg, id, log)
+	}
+	if err != nil {
+		if pkg != "" {
+			os.RemoveAll(pkg)
+		}
 		m.failed(fmt.Errorf("启动安装向导：%w", err))
 		return
 	}
@@ -292,7 +309,7 @@ func (m *maintenance) watchReset() {
 			return
 		}
 		li, alive := runningWizard(m.paths)
-		if alive && li.PID != job.WizardPID {
+		if alive && (li.PID != job.WizardPID || (m.paths.Container && li.ResetJob != job.ID)) {
 			alive = false
 		}
 		var err error
@@ -683,6 +700,9 @@ func (s *Server) purgeForReset() {
 // (and its marker), the install record, the programs and the service definitions, and that none of its
 // services or programs still runs.
 func verifyPurged(p Paths) error {
+	if p.Container {
+		return verifyPurgedContainer(p)
+	}
 	left := []string{p.Data(), dataMarker(p), p.State(), filepath.Join(p.Root, "bin"), p.Shipped(), p.Lib("")}
 	if p.UnitDir != "" {
 		left = append(left, p.unitFile(maintenanceUnitName), p.DNSUnit(), p.SingBoxUnit(), p.MihomoUnit())
@@ -705,6 +725,10 @@ func verifyPurged(p Paths) error {
 // backupForReset copies the data and the install records to backup/reset-<time>/. The name is not one that
 // pruneBackups knows: the copy stays until the user removes it (or uninstalls).
 func backupForReset(p Paths, log Logger) (string, error) {
+	copyData := func(dir string) error { return copyTree(p.Data(), dir) }
+	if p.Container { // the backups are inside the data directory: not a part of what is copied
+		copyData = func(dir string) error { return copyTreeExcept(p.Data(), dir, keptByReset(p)) }
+	}
 	dir := filepath.Join(p.Backup(), "reset-"+time.Now().Format(backupTimeFormat))
 	if _, err := os.Stat(dir); err == nil {
 		dir += "-" + strconv.FormatInt(time.Now().UnixNano()%1e9, 10)
@@ -712,8 +736,17 @@ func backupForReset(p Paths, log Logger) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	if _, err := os.Stat(p.Data()); err == nil {
-		if err := copyTree(p.Data(), filepath.Join(dir, "data")); err != nil {
+	_, statErr := os.Stat(p.Data())
+	if p.Container && statErr != nil && !os.IsNotExist(statErr) {
+		return "", statErr // the data cannot be read: it is not deleted either
+	}
+	if p.Container {
+		if err := requireRealDirs(p); err != nil {
+			return "", err
+		}
+	}
+	if statErr == nil {
+		if err := copyData(filepath.Join(dir, "data")); err != nil {
 			return "", err
 		}
 	}
@@ -768,6 +801,9 @@ func fileExists(path string) bool {
 // freeForDefault frees port 53 again from what the previous installation had freed it from; anything else on
 // it stops the default installation.
 func freeForDefault(p Paths, plan resetPlan, log Logger) error {
+	if p.Container { // the container has no one else on port 53
+		return nil
+	}
 	occ, err := portOccupants(53)
 	if err != nil {
 		return err
@@ -844,7 +880,7 @@ func (s *Server) startDefaultInstall() {
 	}
 	s.mu.Lock()
 	plan := s.reset.plan
-	job := newJob(installSteps)
+	job := newJob(s.ins.stepNames())
 	s.job = job
 	s.mu.Unlock()
 	go func() {
@@ -854,8 +890,8 @@ func (s *Server) startDefaultInstall() {
 		// A reset installs the default settings, never the old ones; this runs only in resetReady, which
 		// purgeForReset reaches once the old installation was verified gone.
 		cfg.keepData = false
-		if probs := checkSystem().Problems; len(probs) > 0 {
-			job.finish(fmt.Errorf("%s", strings.Join(probs, "；")), 0)
+		if sys, _ := s.system(true); len(sys.Problems) > 0 {
+			job.finish(fmt.Errorf("%s", strings.Join(sys.Problems, "；")), 0)
 			return
 		}
 		if err := freeForDefault(s.ins.Paths, plan, job); err != nil {
@@ -863,7 +899,7 @@ func (s *Server) startDefaultInstall() {
 			job.finish(err, 0)
 			return
 		}
-		if errs := cfg.Validate(listInterfaces(), s.ins.InstallerPort, s.busy()); len(errs) > 0 {
+		if errs := s.validateConfig(&cfg); len(errs) > 0 {
 			err := fmt.Errorf("原来的网络设置不能用（%s）：%s", errs[0].Field, errs[0].Msg)
 			job.Logf("安装失败：%v", err)
 			job.finish(err, 0)

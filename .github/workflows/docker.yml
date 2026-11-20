@@ -1,0 +1,130 @@
+name: Docker
+
+# Builds the container image from the packages of an existing Release (docs/container.md section 4).
+# Nothing is compiled: the programs in the image are the ones in the glibc packages of that Release.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v0.3.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  DOCKERHUB_IMAGE: jasonxtt/atom
+  GHCR_IMAGE: ghcr.io/jasonxtt/atom
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read the version
+        id: meta
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "tag must look like v0.3.0" >&2
+            exit 1
+          fi
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download and verify the packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          mkdir -p pkg
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir pkg \
+            --pattern SHA256SUMS \
+            --pattern "atom-$VERSION-linux-amd64.tar.gz" \
+            --pattern "atom-$VERSION-linux-arm64.tar.gz"
+          cd pkg
+          grep -E " (atom-$VERSION-linux-(amd64|arm64)\.tar\.gz)$" SHA256SUMS > SHA256SUMS.glibc
+          test "$(wc -l < SHA256SUMS.glibc)" = 2
+          sha256sum -c SHA256SUMS.glibc
+
+      - uses: docker/setup-qemu-action@v3
+
+      # the docker driver keeps the images in the local daemon, where build-image.sh builds and saves them
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # one image per architecture, from the same Dockerfile and script as a local build; the tar is the pushed image
+      - name: Build and push the images
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          for arch in amd64 arm64; do
+            installer/scripts/build-image.sh --version "$VERSION" --package pkg --arch "$arch" \
+              --tag "$DOCKERHUB_IMAGE:$VERSION-$arch" --out out
+            docker tag "$DOCKERHUB_IMAGE:$VERSION-$arch" "$GHCR_IMAGE:$VERSION-$arch"
+            docker push "$DOCKERHUB_IMAGE:$VERSION-$arch"
+            docker push "$GHCR_IMAGE:$VERSION-$arch"
+          done
+
+      - name: Publish the multi-architecture tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          # latest follows the latest Release, so re-running an old tag does not move it back
+          tags=("$VERSION" "v$VERSION")
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" = "$TAG" ]; then
+            tags+=(latest)
+          fi
+          for image in "$DOCKERHUB_IMAGE" "$GHCR_IMAGE"; do
+            args=()
+            for t in "${tags[@]}"; do
+              args+=(--tag "$image:$t")
+            done
+            docker buildx imagetools create "${args[@]}" "$image:$VERSION-amd64" "$image:$VERSION-arm64"
+            docker buildx imagetools inspect "$image:$VERSION"
+          done
+
+      - name: Upload the tars to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          cd out
+          for arch in amd64 arm64; do
+            sha256sum "atom-$VERSION-container-$arch.tar" > "atom-$VERSION-container-$arch.tar.sha256"
+          done
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            "atom-$VERSION-container-amd64.tar" "atom-$VERSION-container-amd64.tar.sha256" \
+            "atom-$VERSION-container-arm64.tar" "atom-$VERSION-container-arm64.tar.sha256"
+
+      - name: Update the Docker Hub description
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: jasonxtt/atom
+          short-description: Transparent gateway of atom (DNS and sing-box or mihomo) as a container
+          readme-filepath: installer/container/DOCKERHUB.md

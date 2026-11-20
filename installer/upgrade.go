@@ -131,7 +131,11 @@ func (ins *Installer) checkUpgradeConfig(panelPort int, log Logger) error {
 	if err := ins.refreshConfig(root, panelPort); err != nil {
 		return fmt.Errorf("准备升级检查：%w", err)
 	}
-	if err := runCmd(log, 2*time.Minute, filepath.Join(ins.PkgDir, "bin", "atomdns"), "check", "-d", root, "-c", "config_custom.yaml"); err != nil {
+	atomdns := filepath.Join(ins.PkgDir, "bin", "atomdns")
+	if ins.Paths.Container { // the programs are in the image, not in the shipped files
+		atomdns = ins.Paths.Bin("atomdns")
+	}
+	if err := runCmd(log, 2*time.Minute, atomdns, "check", "-d", root, "-c", "config_custom.yaml"); err != nil {
 		return fmt.Errorf("候选版本无法读取现有配置，当前服务继续运行：%w", err)
 	}
 	return nil
@@ -218,6 +222,9 @@ type backupItem struct {
 // and the copy of the shipped package a reset installs from.
 func (ins *Installer) backupItems() []backupItem {
 	p := ins.Paths
+	if p.Container {
+		return ins.containerBackupItems()
+	}
 	items := []backupItem{
 		{path: filepath.Join(p.Root, "bin"), name: "bin"},
 		{path: filepath.Join(p.Root, "etc"), name: "etc"},
@@ -275,6 +282,46 @@ func (ins *Installer) makeBackup(dir string) error {
 }
 
 func (ins *Installer) restoreBackup(dir string, panelPort int, log Logger) error {
+	if err := ins.restoreBackupFiles(dir); err != nil {
+		return err
+	}
+	absent := map[string]bool{}
+	if data, err := os.ReadFile(filepath.Join(dir, absentList)); err == nil {
+		for _, n := range strings.Fields(string(data)) {
+			absent[n] = true
+		}
+	}
+	if absent["gateway/atom-wan.nft"] {
+		if _, err := quietCmd("nft", "list", "table", "inet", "atom_wan"); err == nil {
+			if err := runCmd(log, 15*time.Second, "nft", "delete", "table", "inet", "atom_wan"); err != nil {
+				return err
+			}
+		}
+	}
+	init := ins.Paths.Init()
+	if err := init.Reload(log); err != nil {
+		return err
+	}
+	// Bring the backed-up generated proxy config up before DNS reconciles it.
+	_, unit, config := ins.Paths.proxyService()
+	if _, err := os.Stat(config); err == nil {
+		if err := init.Restart(log, unit); err != nil {
+			return err
+		}
+	}
+	if err := init.Restart(log, dnsUnitName); err != nil {
+		return err
+	}
+	if _, err := newAPIClient(panelPort, ins.Paths.Data()).waitStatus(60*time.Second, func(s *apiStatus) bool { return s.SingBox.Running && s.SingBox.InSync }); err != nil {
+		return fmt.Errorf("恢复后服务没有起来: %w", err)
+	}
+	log.Logf("已恢复，服务正常")
+	return nil
+}
+
+// restoreBackupFiles puts the backed-up files back; the services are not touched (the container version
+// restores while nothing runs).
+func (ins *Installer) restoreBackupFiles(dir string) error {
 	absent := map[string]bool{}
 	if data, err := os.ReadFile(filepath.Join(dir, absentList)); err == nil {
 		for _, n := range strings.Fields(string(data)) {
@@ -316,31 +363,6 @@ func (ins *Installer) restoreBackup(dir string, panelPort int, log Logger) error
 			return err
 		}
 	}
-	if absent["gateway/atom-wan.nft"] {
-		if _, err := quietCmd("nft", "list", "table", "inet", "atom_wan"); err == nil {
-			if err := runCmd(log, 15*time.Second, "nft", "delete", "table", "inet", "atom_wan"); err != nil {
-				return err
-			}
-		}
-	}
-	init := ins.Paths.Init()
-	if err := init.Reload(log); err != nil {
-		return err
-	}
-	// Bring the backed-up generated proxy config up before DNS reconciles it.
-	_, unit, config := ins.Paths.proxyService()
-	if _, err := os.Stat(config); err == nil {
-		if err := init.Restart(log, unit); err != nil {
-			return err
-		}
-	}
-	if err := init.Restart(log, dnsUnitName); err != nil {
-		return err
-	}
-	if _, err := newAPIClient(panelPort, ins.Paths.Data()).waitStatus(60*time.Second, func(s *apiStatus) bool { return s.SingBox.Running && s.SingBox.InSync }); err != nil {
-		return fmt.Errorf("恢复后服务没有起来: %w", err)
-	}
-	log.Logf("已恢复，服务正常")
 	return nil
 }
 

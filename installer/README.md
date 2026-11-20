@@ -4,7 +4,7 @@
 
 ## 用户怎么装
 
-支持 Debian 12+ / Ubuntu 22.04+（systemd）和 Alpine 3.19+（OpenRC），x86_64 或 aarch64，不支持 Docker/LXC 容器。脚本按架构和系统选包。
+支持 Debian 12+ / Ubuntu 22.04+（systemd）和 Alpine 3.19+（OpenRC），x86_64 或 aarch64，不支持 Docker/LXC 容器（容器版见 [../docs/container.md](../docs/container.md)）。脚本按架构和系统选包。
 
 ```bash
 curl -fsSL <install.sh 的地址> | sudo bash

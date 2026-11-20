@@ -27,6 +27,9 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage: atom-installer <command>
   serve [--pkg DIR] [--port N] [--reconfigure]   start the installation wizard (--reconfigure: on an installed machine;
                                  the maintenance service adds --reset JOB for the panel's reset)
+  container                      the entry process of the container image (docs/container.md)
+  svc <action> <service>         start, stop, restart or reload a service of the container (is-active: its state)
+  reconfigure                    in the container: open the wizard to change the network settings
   urls                           print the wizard's addresses
   upgrade [--pkg DIR] [--force] [--keep-pkg]  upgrade an installed atom from an unpacked package
   uninstall [--purge] [--yes]    remove atom (the data stays unless --purge)
@@ -42,6 +45,12 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		os.Exit(cmdServe(args))
+	case "container":
+		os.Exit(cmdContainer(args))
+	case "svc":
+		os.Exit(cmdSvc(args))
+	case "reconfigure":
+		os.Exit(cmdReconfigure(args))
 	case "urls":
 		os.Exit(cmdURLs())
 	case "sync-nft", "protect-wan":

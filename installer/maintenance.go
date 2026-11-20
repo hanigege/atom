@@ -50,6 +50,9 @@ func exclusiveLock(path string, nonblocking bool) (*os.File, error) {
 func operationLock(p Paths) (*os.File, error) {
 	// The inode stays in place across uninstall/reinstall, so racing commands
 	// cannot lock different inodes when the installation root is removed.
+	if p.Container { // /opt is the image: the lock lives with the other runtime files
+		return exclusiveLock(p.Run("operation.lock"), true)
+	}
 	return exclusiveLock(p.Root+".lock", true)
 }
 

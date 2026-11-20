@@ -46,6 +46,9 @@ start_pre() {
 }
 
 func (p Paths) enableMaintenance(log Logger) error {
+	if p.Container { // the entry process is the maintenance service
+		return nil
+	}
 	if err := p.writeMaintenanceService(log); err != nil {
 		return err
 	}
@@ -69,6 +72,9 @@ func (p Paths) managedPackage(pkg string) bool {
 // removeMaintenance takes the maintenance service off: stopped and disabled when disable (the reset has done that
 // in stopForReset already, and a second disable is not repeated), then its file removed.
 func (p Paths) removeMaintenance(log Logger, disable bool) error {
+	if p.Container {
+		return nil
+	}
 	unit := p.unitFile(maintenanceUnitName)
 	if _, err := os.Stat(unit); err != nil {
 		if os.IsNotExist(err) {

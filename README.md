@@ -49,7 +49,7 @@ atomdns 每次返回 FakeIP 时，都会通过 EDNS0 选项把这个域名该走
 
 ## 快速开始
 
-需要一台 Debian 12+、Ubuntu 22.04+ 或 Alpine 3.19+ 的机器（x86_64 或 aarch64，物理机或虚拟机，不支持 Docker、LXC 容器），用 root 运行：
+需要一台 Debian 12+、Ubuntu 22.04+ 或 Alpine 3.19+ 的机器（x86_64 或 aarch64，物理机或虚拟机），用 root 运行：
 
 ```bash
 curl -fsSL https://github.com/jasonxtt/atom/releases/latest/download/install.sh | sudo bash
@@ -63,6 +63,10 @@ curl -fsSL https://github.com/jasonxtt/atom/releases/latest/download/install.sh 
 2. 把客户端的 DNS 设为 atom 的 LAN IP，一般在 DHCP 设置里改。
 
 单网卡旁路由和双网卡网关这两种接法，详见 [安装和接入](docs/guide/install.md)。
+
+### Docker 和 RouterOS
+
+也可以用容器部署单网卡旁路由：Docker（macvlan）用镜像 [`jasonxtt/atom`](https://hub.docker.com/r/jasonxtt/atom)，RouterOS 用 Release 里的 `atom-<版本>-container-{amd64,arm64}.tar`。启动后看容器日志里的向导地址和安装码，其余同上。compose 示例和 RouterOS 的接法见 [容器版](docs/container.md) 第 7 节。
 
 ## 面板
 
@@ -78,6 +82,7 @@ curl -fsSL https://github.com/jasonxtt/atom/releases/latest/download/install.sh 
 | [规则](docs/guide/rules.md) | 规则表怎么匹配、条件和动作、规则集、改动后多久生效 |
 | [DNS 和域名学习](docs/guide/dns.md) | 一次查询怎么走、域名学习和有效期、定期刷新、缓存、上游组、统计 |
 | [节点、节点组和订阅](docs/guide/proxy.md) | 导入节点、各类节点组、兜底分组、mihomo 订阅、切换内核 |
+| [容器版](docs/container.md) | Docker、RouterOS 部署，升级和限制 |
 | [升级和维护](docs/guide/maintenance.md) | 面板升级、修改网络、卸载、应急恢复、文件位置 |
 | [常见问题](docs/guide/faq.md) | 部分设备不走代理、改了规则没生效、DoH 和 IPv6 |
 | [开发和构建](docs/development.md) | 仓库结构、从源码构建、发布流程、设计文档 |
