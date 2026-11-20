@@ -504,3 +504,5 @@ networks:
 **命令行的差异（已改 7.2 节）**：7.23.8 里 `/container mounts add` 的参数是 `list=`（不是 `name=`），`/container add` 里引用它用 `mountlists=`；`mount=` 是内联写法（`src=…,dst=…`），写成列表名会报“expected value of dst-mode”。`/container add` 在 `name=` 之后才碰到错的 `mount=`，所以 `name=` 是被接受的；实测时没带 `name=`（默认名是 tar 文件名），用 `/container set` 改的名。`/file add name=… type=directory` 能建数据目录；删容器会连 `root-dir` 一起删。ROS 默认的 srcnat masquerade 没有出接口限制，容器不用另加 NAT 就能上网。
 
 **清理**：容器、挂载列表、veth、网桥端口、地址、路由、dst-nat、DNS 静态项、`sata1/atom-c6`、`sata1/atom-0.3.0-container-amd64.tar` 都已删除，`/container print`、`/interface veth print`、`/ip route print`、`/ip firewall nat print`、`/file print` 和测前一致（别人的对象还在）。
+
+**发布后发现的问题**（2026-11-20）：v0.3.0 首次跑工作流时，GitHub 构建机的 `docker build` 默认附带构建来源证明（provenance），`docker save` 出的 tar 里 `index.json` 先指向一个二级索引，RouterOS 导入报 `no config found in manifest`（用户在 arm64 的 AX2 上遇到，ros-test 上复现）。去掉二级索引后同样的 gzip 层能正常导入。工作流设 `BUILDX_NO_DEFAULT_ATTESTATIONS=1` 后重跑 v0.3.0，替换了 Release 上的两个 tar。

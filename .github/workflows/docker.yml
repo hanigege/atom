@@ -15,6 +15,9 @@ permissions:
   packages: write
 
 env:
+  # no provenance attestation: it nests the image under a second index in the saved tar, which RouterOS
+  # cannot import ("no config found in manifest")
+  BUILDX_NO_DEFAULT_ATTESTATIONS: 1
   DOCKERHUB_IMAGE: jasonxtt/atom
   GHCR_IMAGE: ghcr.io/jasonxtt/atom
 
