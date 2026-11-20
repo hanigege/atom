@@ -55,6 +55,16 @@ jobs:
           test "$(wc -l < SHA256SUMS.glibc)" = 2
           sha256sum -c SHA256SUMS.glibc
 
+      # the classic image store: its `docker save` writes an OCI manifest with plain tar layers, the tar tested on
+      # RouterOS; the containerd store writes a Docker manifest with gzip layers, which RouterOS cannot load
+      - name: Use the classic image store
+        run: |
+          f=/etc/docker/daemon.json
+          { [ -s "$f" ] && sudo cat "$f" || echo '{}'; } | jq '.features["containerd-snapshotter"] = false' > "$RUNNER_TEMP/daemon.json"
+          sudo cp "$RUNNER_TEMP/daemon.json" "$f"
+          sudo systemctl restart docker
+          docker info -f '{{.Driver}} {{.DriverStatus}}'
+
       - uses: docker/setup-qemu-action@v3
 
       # the docker driver keeps the images in the local daemon, where build-image.sh builds and saves them

@@ -505,4 +505,4 @@ networks:
 
 **清理**：容器、挂载列表、veth、网桥端口、地址、路由、dst-nat、DNS 静态项、`sata1/atom-c6`、`sata1/atom-0.3.0-container-amd64.tar` 都已删除，`/container print`、`/interface veth print`、`/ip route print`、`/ip firewall nat print`、`/file print` 和测前一致（别人的对象还在）。
 
-**发布后发现的问题**（2026-11-20）：v0.3.0 首次跑工作流时，GitHub 构建机的 `docker build` 默认附带构建来源证明（provenance），`docker save` 出的 tar 里 `index.json` 先指向一个二级索引，RouterOS 导入报 `no config found in manifest`（用户在 arm64 的 AX2 上遇到，ros-test 上复现）。去掉二级索引后同样的 gzip 层能正常导入。工作流设 `BUILDX_NO_DEFAULT_ATTESTATIONS=1` 后重跑 v0.3.0，替换了 Release 上的两个 tar。
+**发布后发现的问题**（2026-11-20）：v0.3.0 首次跑工作流时，GitHub 构建机的 `docker build` 默认附带构建来源证明（provenance），`docker save` 出的 tar 里 `index.json` 先指向一个二级索引，RouterOS 导入报 `no config found in manifest`（用户在 arm64 的 AX2 上遇到，ros-test 上复现）。去掉二级索引后同样的 gzip 层能正常导入。工作流设 `BUILDX_NO_DEFAULT_ATTESTATIONS=1` 后重跑，清单变成 Docker v2 格式加 gzip 层，RouterOS 又报 `could not load next layer`：构建机的 Docker 用的是 containerd 镜像存储。能导入的两种 tar 都是 OCI 清单（vm92 上 Docker 26 经典存储导出的不压缩层；手工改的 gzip 层），所以工作流在构建前把 Docker 切回经典存储，导出格式和 C6 实测的相同，再重跑 v0.3.0。
