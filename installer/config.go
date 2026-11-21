@@ -47,7 +47,7 @@ type Config struct {
 const (
 	defaultDomestic = "udp://223.5.5.5\nhttps://dns.alidns.com/dns-query 223.5.5.5"
 	defaultForeign  = "https://dns.google/dns-query 8.8.8.8\nhttps://1.1.1.1/dns-query"
-	defaultFakeIP   = "28.0.0.0/8"
+	defaultFakeIP   = "198.18.0.0/15"
 	defaultMixed    = 7890
 	defaultPanel    = 80
 )
@@ -222,7 +222,7 @@ func checkRouter(router, lan string, ifaces []Iface) string {
 func checkFakeIPRange(s string) error {
 	ip, n, err := net.ParseCIDR(strings.TrimSpace(s))
 	if err != nil || ip.To4() == nil {
-		return fmt.Errorf("需要 IPv4 网段，例如 28.0.0.0/8")
+		return fmt.Errorf("需要 IPv4 网段，例如 198.18.0.0/15")
 	}
 	ones, _ := n.Mask.Size()
 	if ones < 8 || ones > 24 {
