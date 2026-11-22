@@ -55,7 +55,7 @@ cat > "$DATA/webinfo/atom_proxy.json" <<JSON
   "nodes": [],
   "groups": [{"id": "g-default", "name": "默认代理", "type": "selector", "members": []}],
   "final": {"members": ["g-default"], "selected": "g-default"},
-  "settings": {"backend": "$BACKEND", "fakeip_range": "28.0.0.0/8", "mixed_port": 7890}
+  "settings": {"backend": "$BACKEND", "fakeip_range": "198.18.0.0/15", "mixed_port": 7890}
 }
 JSON
 chmod 600 "$DATA/webinfo/atom_proxy.json"

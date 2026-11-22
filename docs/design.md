@@ -327,7 +327,7 @@ sing-box 的绑定只在收到 DNS 查询时更新，而客户端会缓存 DNS �
 | 段 | 内容 |
 |---|---|
 | `inbounds` | `dns-in`：direct，127.0.0.1:6666 UDP/TCP，用于 FakeIP DNS；`redirect-in`：TCP；`tproxy-in`：UDP；`mixed-in`：0.0.0.0:7890（端口可改）**[定]** |
-| `dns.servers` | `fakeip`：inet4 网段，默认 `28.0.0.0/8`，可配置 **[定]**；`resolver`：解析节点域名用的普通上游 |
+| `dns.servers` | `fakeip`：inet4 网段，默认 `198.18.0.0/15`（v0.4.0 起由 `28.0.0.0/8` 统一为 RFC 2544 保留段，存量安装沿用已保存值），可配置 **[定]**；`resolver`：解析节点域名用的普通上游 |
 | `dns.rules` | A/AAAA → fakeip |
 | `outbounds` | 节点 `n-*`、节点组 `g-*`、`direct` |
 | `route.rules` | `dns-in` → hijack-dns；`mixed-in` → resolve（AtomDNS）→ FakeIP 地址走绑定或 Final，其他走 direct；IP、端口、网络规则（4.6）→ 对应的组，只对真实 IP 的连接生效。FakeIP 连接（三个入口）在路由规则之前按绑定或 Final 走（3.3） |
@@ -336,7 +336,7 @@ sing-box 的绑定只在收到 DNS 查询时更新，而客户端会缓存 DNS �
 | `experimental.clash_api` | 只监听 127.0.0.1，带随机生成的密钥 |
 
 - **节点域名的解析**不能经过 AtomDNS，否则国外节点域名会拿到 FakeIP，形成回环。`resolver` 默认用 AtomDNS 设置里的国内上游地址，由 sing-box 直接去问；用户也可以自己指定。**[定]**
-- **FakeIP 网段 `28.0.0.0/8`**：这是已分配的公网地址段（美国国防部），公网上实际不路由，社区常用来做 FakeIP。代价是真要访问这个段的真实地址时会被当成 FakeIP。**[定]**
+- **FakeIP 网段 `198.18.0.0/15`**（2026-11-22 起统一；此前为 `28.0.0.0/8`）：RFC 2544 基准测试保留网段，不与公网实际地址冲突，安装器、`atomdns` 默认值（`DEFAULT_FAKEIP_RANGE`）与开发容器脚本保持一致；存量安装因 `webinfo/atom_proxy.json` 已显式记录 `fakeip_range`，升级不会改变既有网段。**[定]**
 - **mixed 入站（7890）也按规则分流。** **[定]** 浏览器通过 7890 发来的是域名，sing-box 先用 `resolve` 动作（`server` 指向本机 AtomDNS 53 端口）问 AtomDNS，再按回答走：
   - 返回 FakeIP：按域名查绑定，有绑定走对应的组，没有走 Final，目标保留域名，由代理服务器远端解析；
   - 返回真实 IP：先过 IP、端口、网络规则（4.6），没命中走 direct；
@@ -636,3 +636,29 @@ atom/          jasonxtt/atom
 - 没有单独提到的 **[建议]** 项，用户都认可，按建议执行。
 - 国外 DNS 走 SOCKS（mixed 7890），见 7.1；7890 的流量也按规则分流，见第 6 节，在第 3 步实现。**[定]**
 - 目前没有等待确认的项。
+
+## 13. v0.4.0 增量决策（2026-11-23）
+
+以下功能与规范在 v0.3.2 基线之上新增，涉及 `atomdns`（`0.6.7`）与 WebUI，未改动 `sing-box` / `mihomo` 二进制补丁：
+
+1. **完整配置导入与导出** **[定]**：
+   - 接口：`GET /api/v1/atom/config/export`（下载 JSON 文件，带 `Content-Disposition` 与 `Cache-Control: no-store`）、`POST /api/v1/atom/config/import`（上限 32 MiB；超过 1 MiB 须先鉴权再缓冲，限制单并发槽位与 30 秒读超时）。
+   - 范围：包含代理状态（节点、节点组、订阅、Final、代理设置与排序，并记录 `proxy_follows_mixed_port` 以区分跟随本地 mixed 端口与显式外部/空 `main_proxy`）、规则表、自定义规则集（本地规则集含完整条目；远程与目录规则集仅存定义）、已移除的内置规则集、所有单源内置规则集下载设置（`builtin_sources`；导入时跳过未变化项，仅 URL 变动才触发后台刷新）、DNS 设置、重写规则、定期刷新计划与查询日志容量。排除机器拓扑（`etc/install.json`）、面板登录凭据（`webinfo/atom_auth.json`）及运行态缓存/已学名单。
+   - 事务与恢复：导入前经共用编译预检（`config::preview_settings`）校验配置并推导代理默认 `resolver`；持导入锁与 `ManagementFence` 暂停管理面写入（DNS 查询不停服），先应用代理内核再经 `webinfo/.atom_import_stage/COMMITTED.json` 原子暂存并热重载；回滚时先恢复原快照再清理提交标记与新建列表，确保任意时刻崩溃重启一致。来源未变的远程/目录规则集在导入时复用既有 revision 与规则文件，新下载完成后清空全局缓存。
+   - 入口：与「重置所有设置」同行置于「设置 → 系统 → 配置管理」卡片。
+
+2. **手动节点链式代理（`dialer_proxy`）** **[定]**：
+   - 手动节点可配置 `dialer_proxy` 指向另一个手动节点或非 Final 节点组（sing-box 生成 `detour`，mihomo 生成 `dialer-proxy`），支持在单节点添加/编辑、批量导入节点时指定；校验拒绝环路、引用不存在目标或引用 Final，并沿链传播内核不兼容失效状态；规则页 `dry-run` 展开完整链路。
+   - 降级兼容：`Node.dialer_proxy` 使用 `skip_serializing_if = "Option::is_none"`，未设置时不写入 `webinfo/atom_proxy.json`；配置过链式代理的机器降级回 v0.3.2 前需先清除前置代理（见 `docs/guide/maintenance.md`）。
+
+3. **切换节点时自动断开连接（`auto_disconnect`）** **[定]**：
+   - 用户拍板：**默认关闭（`DEFAULT_AUTO_DISCONNECT = false`）**，新安装与从 v0.3.2 升级均默认关闭，保留显式设置，用户可在「设置 → 代理」手动开启。
+   - 降级兼容：`Settings.auto_disconnect` 使用 `skip_serializing_if = "is_false"`，保持默认关闭时不写入 `webinfo/atom_proxy.json`，保证 v0.4.0 未改此项时可直接降级回 v0.3.2；开启过的机器降级前需在面板关掉开关或清理该字段（见 `docs/guide/maintenance.md`）。仅修改此开关时直接保存版本化状态，不触发代理内核重载。
+   - 执行与可观测性：切换前在应用锁内通过运行态 `GET /proxies` 的 `now` 识别无变更切换与真实生效的链式代理，并捕获旧连接 ID（确保新节点上的新建连接不被误断）；切换提交后以独立 3 秒预算逐条关闭旧连接（Clash API HTTP 交换统一按绝对截止时间约束读写）；若捕获或关闭超时/部分失败，记录告警日志并在 `POST /groups/{id}/select`、`PUT /final` 的可选 `warning` 字段与面板 toast 中提示用户。
+
+4. **节点组与规则快捷创建、概览与宽屏布局** **[定]**：
+   - 节点组页支持从「+ 添加节点组」下拉进入「自定义」「按地区快捷创建」「按服务快捷创建」，规则页支持「按服务快捷创建」；按地区基于内置正则预设筛选手动与订阅节点，按服务基于内置目录规则集自动联动规则。
+   - WebUI 宽屏下主容器居中，概览页四宫格卡片与粘性侧栏对齐；正式 UI 保持精简，不堆砌说明性段落文字。
+
+5. **FakeIP 默认网段统一** **[定]**：
+   - 安装器、`atomdns`（`DEFAULT_FAKEIP_RANGE`）、`dev-container-seed.sh` 与文档统一采用 `198.18.0.0/15`；存量安装沿用 `atom_proxy.json` 中已保存的网段。
