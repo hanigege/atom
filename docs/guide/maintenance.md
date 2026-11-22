@@ -31,36 +31,46 @@ curl -fsSL https://github.com/jasonxtt/atom/releases/latest/download/install.sh 
 
 ### 从 v0.4.0 降级到 v0.3.2 的兼容性说明
 
-v0.3.2 读取 `webinfo/atom_proxy.json` 时会拒绝未知字段（`deny_unknown_fields`）。v0.4.0 的两个新字段（`settings.auto_disconnect` 与 `nodes[].dialer_proxy`）在保持默认关闭且未配置链式代理时**不会写入文件**，此时可直接带 `--force` 降级。
+v0.3.2 读取 `webinfo/atom_proxy.json` 时会拒绝未知字段（`deny_unknown_fields`）。v0.4.0 的两个新字段（`settings.auto_disconnect` 与 `nodes[].dialer_proxy`）在保持默认关闭且未配置链式代理时**不会写入文件**，此时可直接运行下面的 v0.3.2 降级命令（需指向固定版本 `v0.3.2` 的脚本，不能用 `latest`）：
+
+```bash
+curl -fsSL https://github.com/jasonxtt/atom/releases/download/v0.3.2/install.sh | sudo bash -s -- --force
+```
+
+如果没有清理这两个字段就直接降级，v0.3.2 的安装器在替换文件前运行 `atomdns check` 检查时会报错并停下来，不会装坏当前服务。
 
 如果你在 v0.4.0 上**开启过「切换节点时自动断开连接」**或**给任意节点设置过「前置代理」**，降级到 v0.3.2 之前请先按下面任一方式清理新字段（建议先在「设置 → 系统」导出一份配置备份）：
 
 1. **在面板中清理（推荐）**：
    - 进入「设置 → 代理」，关闭「切换节点时自动断开连接」并保存；
    - 进入「节点」，编辑所有配置了「前置代理」的节点，将前置代理改为「无（直连）」并保存；
-   - 然后执行 v0.3.2 的 `--force` 降级命令。
-2. **命令行离线清理**（适合面板已不可用或已先降级后 `atom-dns` 启动失败的情况）：
+   - 然后执行上面的 v0.3.2 `--force` 降级命令。
+2. **命令行离线清理**（适合面板已不可用或需直接离线修改文件的情况）：
+   先备份原文件（数据目录为 `/opt/atom/data`，`python3` 与 `jq` 两种方式均依赖这份备份）：
    ```bash
-   # 先备份再去掉 v0.3.2 不认识的两个字段（数据目录为 /opt/atom/data）
    cp -a /opt/atom/data/webinfo/atom_proxy.json /opt/atom/data/webinfo/atom_proxy.json.v040.bak
-   python3 -c '
-   import json, pathlib
-   p = pathlib.Path("/opt/atom/data/webinfo/atom_proxy.json")
-   d = json.loads(p.read_text())
-   d.get("settings", {}).pop("auto_disconnect", None)
-   for n in d.get("nodes", []):
-       n.pop("dialer_proxy", None)
-   p.write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\n")
-   '
-   chmod 600 /opt/atom/data/webinfo/atom_proxy.json
    ```
-   > Alpine 默认不带 `python3`，优先使用上面的「在面板中清理」；如面板已不可用，可先 `apk add jq` 后用 `jq` 清理：
-   > ```bash
-   > jq 'del(.settings.auto_disconnect) | .nodes |= map(del(.dialer_proxy))' \
-   >   /opt/atom/data/webinfo/atom_proxy.json.v040.bak > /opt/atom/data/webinfo/atom_proxy.json
-   > chmod 600 /opt/atom/data/webinfo/atom_proxy.json
-   > ```
-   清理完成后再执行 v0.3.2 降级命令，或直接重启 `atom-dns` 服务（systemd：`systemctl restart atom-dns`；Alpine：`rc-service atom-dns restart`）。
+   然后按系统环境任选一种方式移除这两个字段：
+   - **Debian / Ubuntu / Armbian（使用 `python3`）**：
+     ```bash
+     python3 -c '
+     import json, pathlib
+     p = pathlib.Path("/opt/atom/data/webinfo/atom_proxy.json")
+     d = json.loads(p.read_text())
+     d.get("settings", {}).pop("auto_disconnect", None)
+     for n in d.get("nodes", []):
+         n.pop("dialer_proxy", None)
+     p.write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\n")
+     '
+     chmod 600 /opt/atom/data/webinfo/atom_proxy.json
+     ```
+   - **Alpine（默认不带 `python3`，优先用面板清理；离线清理可先 `apk add jq` 后执行）**：
+     ```bash
+     jq 'del(.settings.auto_disconnect) | .nodes |= map(del(.dialer_proxy))' \
+       /opt/atom/data/webinfo/atom_proxy.json.v040.bak > /opt/atom/data/webinfo/atom_proxy.json
+     chmod 600 /opt/atom/data/webinfo/atom_proxy.json
+     ```
+   清理完成后再执行上面的 v0.3.2 `--force` 降级命令（若已手动替换了二进制，也可直接重启 `atom-dns`：systemd 用 `systemctl restart atom-dns`；Alpine 用 `rc-service atom-dns restart`）。
 
 ## 配置导出与导入
 
@@ -68,7 +78,7 @@ v0.3.2 读取 `webinfo/atom_proxy.json` 时会拒绝未知字段（`deny_unknown
 
 - 导出为单个 JSON 文件，包含代理节点、节点组、订阅、分流规则、自定义规则集（本地规则集含完整条目；远程/目录规则集仅存定义）、内置规则集来源、DNS 设置、重写规则、定期刷新计划与查询日志容量；
 - 不包含机器网络拓扑（`etc/install.json`）、面板登录密码（`webinfo/atom_auth.json`）与运行态缓存/已学域名名单；
-- 导入前会展示内容摘要与内核切换提醒；来源未变的远程/目录规则集直接复用本地缓存，新增或改址的规则集在后台自动下载。
+- 导入前会展示内容摘要，以及内核切换和 FakeIP 网段变更提醒；若备份与本机的 FakeIP 网段不同，导入后主路由的静态路由（或通过 DHCP option 121 下发给客户端的路由）要同步调整为新网段；来源未变的远程/目录规则集直接复用本地缓存，新增或改址的规则集在后台自动下载。
 
 ## 修改网络
 
