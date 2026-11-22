@@ -207,6 +207,7 @@ networks:
 /container add name=atom file=sata1/atom-0.3.0-container-amd64.tar interface=atom \
     root-dir=sata1/atom mountlists=atom logging=yes start-on-boot=yes
 /container start atom
+# 按安装向导显示的 FakeIP 网段配置（新安装默认 198.18.0.0/15）
 /ip route add dst-address=198.18.0.0/15 gateway=172.31.233.2
 /ip dhcp-server network set [find] dns-server=172.31.233.2
 ```
