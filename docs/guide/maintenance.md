@@ -41,7 +41,7 @@ v0.3.2 读取 `webinfo/atom_proxy.json` 时会拒绝未知字段（`deny_unknown
    - 然后执行 v0.3.2 的 `--force` 降级命令。
 2. **命令行离线清理**（适合面板已不可用或已先降级后 `atom-dns` 启动失败的情况）：
    ```bash
-   # 先备份再去掉 v0.3.2 不认识的两个字段（systemd 与 Alpine 通用；数据目录为 /opt/atom/data）
+   # 先备份再去掉 v0.3.2 不认识的两个字段（数据目录为 /opt/atom/data）
    cp -a /opt/atom/data/webinfo/atom_proxy.json /opt/atom/data/webinfo/atom_proxy.json.v040.bak
    python3 -c '
    import json, pathlib
@@ -54,6 +54,12 @@ v0.3.2 读取 `webinfo/atom_proxy.json` 时会拒绝未知字段（`deny_unknown
    '
    chmod 600 /opt/atom/data/webinfo/atom_proxy.json
    ```
+   > Alpine 默认不带 `python3`，优先使用上面的「在面板中清理」；如面板已不可用，可先 `apk add jq` 后用 `jq` 清理：
+   > ```bash
+   > jq 'del(.settings.auto_disconnect) | .nodes |= map(del(.dialer_proxy))' \
+   >   /opt/atom/data/webinfo/atom_proxy.json.v040.bak > /opt/atom/data/webinfo/atom_proxy.json
+   > chmod 600 /opt/atom/data/webinfo/atom_proxy.json
+   > ```
    清理完成后再执行 v0.3.2 降级命令，或直接重启 `atom-dns` 服务（systemd：`systemctl restart atom-dns`；Alpine：`rc-service atom-dns restart`）。
 
 ## 配置导出与导入
