@@ -59,7 +59,7 @@ curl -fsSL https://github.com/jasonxtt/atom/releases/latest/download/install.sh 
 
 装完后还要在**主路由**上做两件事：
 
-1. 把 FakeIP 网段（默认 `28.0.0.0/8`）和要走代理的网段路由到 atom 的 LAN IP。
+1. 把 FakeIP 网段（默认 `198.18.0.0/15`）和要走代理的网段路由到 atom 的 LAN IP。
 2. 把客户端的 DNS 设为 atom 的 LAN IP，一般在 DHCP 设置里改。
 
 单网卡旁路由和双网卡网关这两种接法，详见 [安装和接入](docs/guide/install.md)。

@@ -61,7 +61,7 @@ The script downloads and verifies the package, then starts a web wizard and prin
 
 Then, on your **main router**:
 
-1. Route the FakeIP range (default `28.0.0.0/8`) and any ranges you want proxied to atom's LAN IP.
+1. Route the FakeIP range (default `198.18.0.0/15`) and any ranges you want proxied to atom's LAN IP.
 2. Set the clients' DNS server to atom's LAN IP, usually in the router's DHCP settings.
 
 ### Docker and RouterOS
