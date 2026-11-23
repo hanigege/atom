@@ -36,7 +36,11 @@ curl -fsSL https://github.com/jasonxtt/atom/releases/latest/download/install.sh 
 - v0.4.0 及更早版本的 atomdns 会将带 `client` 条件的代理规则视作非法（400）并拒绝加载；
 - 旧版 sing-box 严格校验 JSON，会因不认识 `route.atom_fakeip_clients` 字段而无法启动。
 
-如果没有配置纯客户端代理规则，生成的代理配置中不会写入该字段，不受影响。
+如果没有配置纯客户端代理规则，生成的代理配置中不会写入该字段，不受影响。清理后可用固定版本的脚本降级到 v0.4.0：
+
+```bash
+curl -fsSL https://github.com/jasonxtt/atom/releases/download/v0.4.0/install.sh | sudo bash -s -- --force
+```
 
 ### 从 v0.4.0 降级到 v0.3.2 的兼容性说明
 
