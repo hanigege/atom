@@ -129,14 +129,21 @@ Rule {
 
 粘贴 sing-box 规则：做过（规则编辑页粘贴一条无头规则 JSON，在前端拆成条件），用户看过界面后觉得碍眼，2026-11-12 去掉了。不开嗅探，不加需要嗅探的条件。
 
-客户端条件取反（第 6 步，用户定的）**[定]**：`match.client_invert` 为 true 时，"客户端不在 `client` 列表内"才算命中。只能和 `client` 一起用，单独给返回 400；和域名条件之间仍然是"与"；动作仍然只能是直连或屏蔽。一条规则一个动作，不命中就继续往下匹配；不做"全部代理"。AtomDNS 原来的两种客户端分流模式用规则写：
+客户端条件取反（第 6 步，用户定的）**[定]**：`match.client_invert` 为 true 时，"客户端不在 `client` 列表内"才算命中。只能和 `client` 一起用，单独给返回 400；和域名条件之间仍然是"与"；同时带域名条件时动作仍只能是直连或屏蔽。一条规则一个动作，不命中就继续往下匹配。AtomDNS 原来的两种客户端分流模式用规则写：
 
 - "名单内客户端不走代理"（`listed_direct`）= "client ∈ 名单 → 直连"；
 - "仅名单内客户端走代理"（`only_listed_proxy`）= "client ∉ 名单 → 直连"（`client_invert: true`）。
 
-这条规则放在规则表最前面，这些客户端就完全不分流（连屏蔽规则也不生效）；放在某条屏蔽规则下面，那条屏蔽对它们仍然有效。没有客户端地址的查询（绑定账本的重算；进程内的查询，即 requery 和重写目标的解析，原来带的是伪造的 127.0.0.1，codex 第 4 轮后改成不带客户端）任何客户端条件都不命中，取反的也一样：没有客户端时谈不上"不在名单内"，而且这类规则只能直连或屏蔽，不影响 sing-box 的绑定（4.5.1）。`rules/test` 的 `client` 参数照样能测出取反的效果。
+这条规则放在规则表最前面，这些客户端就完全不分流（连屏蔽规则也不生效）；放在某条屏蔽规则下面，那条屏蔽对它们仍然有效。没有客户端地址的查询（绑定账本的重算；进程内的查询，即 requery 和重写目标的解析，原来带的是伪造的 127.0.0.1，codex 第 4 轮后改成不带客户端）任何客户端条件都不命中，取反的也一样：没有客户端时谈不上"不在名单内"，不影响 sing-box 的绑定（4.5.1）。`rules/test` 的 `client` 参数照样能测出取反的效果。
 
-带 `client` 条件的规则，动作只能是直连或屏蔽，不能是代理。**[定]** 原因：sing-box 只按域名绑定出站组，不区分客户端。比如"客户端 A 的 foo.com → 组 X"：A 一查就发 SET X，于是别的客户端拿到 foo.com 的 FakeIP 后也走 X。别的客户端从缓存拿到 FakeIP 时不发 CLEAR；不走缓存时，A 的 SET 和别人的 CLEAR 会来回覆盖。所以代理规则对所有客户端都一样，客户端条件只用来决定这个客户端能不能走代理（直连或屏蔽）。sing-box 不增加按客户端分流的功能。API 新建或修改这种规则时返回 400。
+同时带 `client` 和域名条件的规则，动作只能是直连或屏蔽，不能是代理（API 返回 400）。**[定]** 原因：代理核心按域名保存绑定、不区分客户端，不能按"客户端 + 域名"独立绑定出站组。
+
+纯客户端代理规则（2026-11-23，用户定）**[定]**：只有 `client` 条件（无域名、IP、端口、网络条件，支持 `client_invert`）的规则允许选择「代理」（可选任意节点组或 `final`，需要配置 `singbox` 段）：
+
+- **位置要求**：必须排在所有域名代理规则之上（上方仍可放局域网域名直连、广告屏蔽等直连/屏蔽规则）。新建未指定 `before_id`/`after_id` 时自动插在第一条域名代理规则之前；「按服务创建」插在已有客户端代理规则之后；修改、移动或导入时落到域名代理规则下方返回 400。
+- **AtomDNS 侧**：命中时走 FakeIP 路径（不进全局缓存），但发往 `nocnfake` 时剥离客户端自带 65001 后**不附带任何 65001 指令**（`KEEP`，保留域名原有绑定），且**不写入绑定账本**；客户端代理规则同时跳过回环来源（`127.0.0.0/8`、`::1`），避免 7890 mixed 入站本机回查误命中取反规则。
+- **代理核心侧**：仅在存在启用的客户端代理规则时，生成配置写入 `route.atom_fakeip_clients`（sing-box）或 `dns.atom-fake-ip-clients`（mihomo）；没有启用规则时不写该字段、运行时零开销。代理核心在还原 FakeIP 选出站时优先按连接源 IP 匹配该列表，命中直接覆写出口（仍跳过 `route.rules`/`rules`）。增删改、启停或调整顺序时和 IP 规则一样走代理配置应用事务。
+- **限制**：7890 mixed 入站由代理核心本机回查 AtomDNS，AtomDNS 看不到真实客户端 IP，本功能主要面向旁路 FakeIP 透明代理（redirect / TProxy）。
 
 ### 4.3 拖动排序
 
@@ -429,13 +436,13 @@ sing-box 的绑定只在收到 DNS 查询时更新，而客户端会缓存 DNS �
   - `POST rules/move {id, before_id | after_id, version}` 拖动，`version` 必填。其他写操作的 `version` 可选，带了就检查。版本不对时返回 409，错误体里带当前 `version`。每次规则变化，版本加 1。
   - `POST rules/test {domain, client?}` 返回命中的规则（`matched`、`index`、`action`、`group_id`、`rule`），没命中时返回 `{matched: false, fallthrough: "original"}`，即交给原判断。只看规则表，不模拟系统固定项和原判断。规则页原来用它测试域名，2026-11-12 改用 `rules/dryrun`；接口保留，界面不再调用（它算内置规则集标记时读学习结果，会给学到的条目记一次命中，没改）。
   - `POST rules/dryrun {domain, client?, qtype?: A|AAAA}`（2026-11-12，`rust/native-host/src/atom_dryrun.rs`）**[定]**：推演"现在重新判断一次会怎样"，不留痕迹。做法：用运行中这一代配置编译好的入口序列（`sequence_6666`）和真实的状态机跑一遍，匹配器、fixture（mapper、规则表、`fast_mark` 等）都是真的，顺序就是 YAML 的顺序；只替换主机侧对外部操作的处理：缓存一律跳过（不读不写，记下会经过哪些缓存）；`route_learn` 只算"会学什么"，不学；`top_domains` 不记；重写照插件的规矩（IP 目标同族给地址、否则空应答；域名目标经它的序列 `$sequence_local_in` 照样不留痕迹地解析，固定服务器的直接去问）；FakeIP 上游（sing-box）不问，不发 SET/CLEAR、不进绑定账本，按空 NOERROR 继续；其他上游照真实流程发出去（探测、直连的上游，ECS 一样，时限和前台查询一样），绕过缓存，用私有的尝试记录和私有的一份上游轮转计数（从当前值起，照常前进；真实查询的轮转不动），不进查询日志、统计和上游计数；状态机运行期间 route_learner 的查找是只读的（不记命中、不删过期条目，`route_learner::peeking`）。`prefer_ipv4` 照 `run_preference`：AAAA 时先看记住的证据，没有就再推演一次 A（这次的步骤不显示；真实流程两支并发、原分支结束后再等 500ms，推演里先后跑，A 那支限时"原分支的耗时 + 500ms"），A 有记录或会拿到 FakeIP 就是空应答，什么都不记住。规则表逐条的结果在规则表 fixture 运行的同一步里算，和它用的是同一张表。为了列步骤，`sequence-core` 的 `StepTrace` 加了一个默认空的 `rule(sequence, pc, matched)` 回调。
-    - 返回：`steps`（重写、类型屏蔽、IPv6 屏蔽、AAAA 时的 IPv4 优先、规则表（到命中那条为止逐条的 `hit/miss/off/singbox`）、原判断各支（A 只列无 V4，AAAA 只列无 V6）、探测（上游、ECS、应答的 IP、"探测结果，未学习"、`would_learn`）），每步 `hit/miss` 和简短原因（第一个不成立的条件：开关关、查询类型不符、不在名单、没有记录）；`branch`：决定结果的原判断分支（和 `original.ts` 的 key 一致）；`conclusion`：`direct`（上游组、应答的上游、ECS、地址、会经过的缓存）、`proxy`（`SET 组` 或 `CLEAR`，AAAA 时 sing-box 不读指令，不对照绑定；用 Clash API 的 `now` 把出口展开到节点，`chain`）、`block`、`empty`（rcode），以及上游失败时的 `fail`；`binding`：绑定账本里这个域名的记录、这次判断会发的指令（直连、屏蔽规则按账本重算的规矩是 SET direct / SET block，带客户端条件的规则不算；原判断的直连和空应答不发；账本里没有记录时，只有代理到组才算不一致），不一致时 `match: false`。
+    - 返回：`steps`（重写、类型屏蔽、IPv6 屏蔽、AAAA 时的 IPv4 优先、规则表（到命中那条为止逐条的 `hit/miss/off/singbox`）、原判断各支（A 只列无 V4，AAAA 只列无 V6）、探测（上游、ECS、应答的 IP、"探测结果，未学习"、`would_learn`）），每步 `hit/miss` 和简短原因（第一个不成立的条件：开关关、查询类型不符、不在名单、没有记录）；`branch`：决定结果的原判断分支（和 `original.ts` 的 key 一致）；`conclusion`：`direct`（上游组、应答的上游、ECS、地址、会经过的缓存）、`proxy`（`SET 组`、`CLEAR` 或 `KEEP`——纯客户端代理规则不改域名绑定，由代理核心按客户端 IP 覆写，不对照账本绑定、`match: true`；AAAA 时 sing-box 不读指令，不对照绑定；用 Clash API 的 `now` 把出口展开到节点，`chain`）、`block`、`empty`（rcode），以及上游失败时的 `fail`；`binding`：绑定账本里这个域名的记录、这次判断会发的指令（直连、屏蔽规则按账本重算的规矩是 SET direct / SET block，带客户端条件的规则不算；原判断的直连和空应答不发；账本里没有记录时，只有代理到组才算不一致），不一致时 `match: false`。
     - 和真实流程的出入（已知）：探测和直连查询每次都真的问上游，和真实查询可能拿到不同的应答（上游本身的变化、多个上游里先答的那个）；主机名上游（地址写域名、没有 `dial_addr`）的引导解析结果和到上游的连接，推演和真实查询共用，不隔离（2026-11-13，用户定，记为已知限制）：共用的是上游服务器本身的地址和连接，不是被测域名的 DNS 应答，不影响判断结果。不支持 `fallback`（atom 的配置里没有），遇到就报错。
     - 一致性测试 `atom_dryrun_tests.rs`：用仓库里实际的 `config_custom.yaml`、`process_*.yaml`、`forward_1.yaml`、`route_learner.yaml`、`flags.yaml`、`cache.yaml`，数据集合和上游换成本机假服务，对规则代理、规则直连（含指定上游组、不缓存）、客户端规则、geosite 国内外、探测（国内 IP、`direct_ip`、国外 IP、无 IP）、学到以后的记忆代理/直连、AAAA、重写、安全模式（ECS）、IPv6 屏蔽逐个先推演再真实查询，结论和真实结果（地址、sing-box 收到的指令）一致；推演前后缓存条目数、学习条目和命中数、热门域名、绑定账本、sing-box 收到的查询都不变。
     - 规则页的测试框：域名、客户端 IP（可选）、A/AAAA；结果是结论卡片（直连/代理/屏蔽/空应答、上游或出口链"兜底分组 → 默认代理 → 节点"、缓存、绑定，不一致时标"和推演不一致 · 客户端还没重新查询"）加步骤列表（规则表只展开命中那条，其余折叠）；命中规则时标亮规则行，交给原判断时自动展开底部原判断一行并标亮对应分支（第 11 节第 10 条）。
   - `GET rulesets` 列出内置集合（`type: builtin`）和自定义规则集；`GET rulesets/{id}` 带上列表内容。`POST rulesets` 的请求体是 `{name, type: remote, url, format?, category?}` 或 `{name, type: local, rules}`。`PUT rulesets/{id}` 改名、改地址或替换本地列表。`DELETE rulesets/{id}` 删除。`POST rulesets/{id}/refresh` 重新下载。
   - 错误体都是 AtomDNS 现有的 `{"error": "..."}`。写操作和 `rulesets` 的下载都占用管理租约，和设置、配置重载互斥（租约只防配置重载，不让写操作排队）。
-  - 带 `client` 的代理规则返回 400（4.2）。下载期间规则集的来源被改掉，或者之后又开始了一次下载，返回 409，这次结果丢弃。修改已生效但缓存没清干净时返回 500（4.7）。
+  - 同时带 `client` 和域名条件的代理规则，或排在域名代理规则下方的客户端代理规则返回 400（4.2）。下载期间规则集的来源被改掉，或者之后又开始了一次下载，返回 409，这次结果丢弃。修改已生效但缓存没清干净时返回 500（4.7）。
 - 节点、组、Final、设置、`status`、`apply`（第 3 步实现，`rust/native-host/src/atom_proxy_api.rs`）：
   - `GET nodes` 返回 `{version, nodes}`，每个节点带 `id`、`name`、`type`、`server`、`server_port`、去掉凭据的 `outbound`（5.1）和所在的组 `groups`。`POST nodes {format, content}` 导入，`content` 是字符串（`json` 格式也可以直接给 JSON 值），返回 201 和新节点。`PUT nodes/{id} {name?, format?, content?}`（`format` 和 `content` 要一起给，整体替换连接），`DELETE nodes/{id}?version=N`，`POST nodes/{id}/delay {url?, timeout?}` 返回 `{id, delay}`。
   - `GET groups` 的每个组带 `empty`、`builtin`，selector 带当前选中 `now`。`POST groups {name, type: selector|urltest, members, selected?, url?, interval?, tolerance?}` 新建，`PUT groups/{id}` 整组替换，`DELETE groups/{id}?confirm=true`（见 5.3），`POST groups/{id}/select {name}`，`POST groups/{id}/delay {url?, timeout?}`（毫秒，默认 5000）返回 `{delays: {成员: 毫秒}}`。

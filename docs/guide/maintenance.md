@@ -29,6 +29,15 @@ curl -fsSL https://github.com/jasonxtt/atom/releases/latest/download/install.sh 
 
 升级会覆盖程序和自带的配置模板，保留规则、节点、节点组、订阅、DNS 上游、面板设置和缓存。每次升级前都会备份到 `/opt/atom/backup/`，保留最近 3 份。
 
+### 降级到 v0.4.0 及更早版本的兼容性说明
+
+若当前配置了**纯客户端代理规则**（只有客户端条件且动作为代理），降级到 v0.4.0 或更早版本之前，请先在「规则」页将所有纯客户端代理规则**删除或改为直连/屏蔽**并保存（建议先在「设置 → 系统」导出一份配置备份）：
+
+- v0.4.0 及更早版本的 atomdns 会将带 `client` 条件的代理规则视作非法（400）并拒绝加载；
+- 旧版 sing-box 严格校验 JSON，会因不认识 `route.atom_fakeip_clients` 字段而无法启动。
+
+如果没有配置纯客户端代理规则，生成的代理配置中不会写入该字段，不受影响。
+
 ### 从 v0.4.0 降级到 v0.3.2 的兼容性说明
 
 v0.3.2 读取 `webinfo/atom_proxy.json` 时会拒绝未知字段（`deny_unknown_fields`）。v0.4.0 的两个新字段（`settings.auto_disconnect` 与 `nodes[].dialer_proxy`）在保持默认关闭且未配置链式代理时**不会写入文件**，此时可直接运行下面的 v0.3.2 降级命令（需指向固定版本 `v0.3.2` 的脚本，不能用 `latest`）：
