@@ -66,6 +66,8 @@ curl -fsSL https://github.com/jasonxtt/atom/releases/latest/download/install.sh 
 
 ### Docker 和 RouterOS
 
+Docker Hub：<https://hub.docker.com/r/jasonxtt/atom>
+
 也可以用容器部署单网卡旁路由：Docker（macvlan）用镜像 [`jasonxtt/atom`](https://hub.docker.com/r/jasonxtt/atom)，RouterOS 用 Release 里的 `atom-<版本>-container-{amd64,arm64}.tar`。启动后看容器日志里的向导地址和安装码，其余同上。compose 示例和 RouterOS 的接法见 [容器版](docs/container.md) 第 7 节。
 
 ## 面板
