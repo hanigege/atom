@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -161,6 +162,27 @@ func applyUpdatePackage(p Paths, pkg string, operation *os.File) error {
 	return nil
 }
 
+func adoptOperationLock(p Paths, fd uintptr) (*os.File, error) {
+	lock := os.NewFile(fd, "maintenance operation")
+	if lock == nil {
+		return nil, fmt.Errorf("没有维护操作锁")
+	}
+	// Mark close-on-exec so services started during apply-panel-upgrade (such as
+	// OpenRC supervise-daemon children) do not inherit the lock fd and keep it held.
+	syscall.CloseOnExec(int(fd))
+	inherited, err := lock.Stat()
+	if err != nil {
+		lock.Close()
+		return nil, err
+	}
+	onDisk, err := os.Stat(p.Root + ".lock")
+	if err != nil || !os.SameFile(inherited, onDisk) {
+		lock.Close()
+		return nil, fmt.Errorf("无效的维护操作锁")
+	}
+	return lock, nil
+}
+
 func cmdApplyPanelUpgrade(args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("没有候选安装包")
@@ -170,19 +192,11 @@ func cmdApplyPanelUpgrade(args []string) error {
 	if err := readJSON(p.Run(maintenanceRecord), &job); err != nil || job.Kind != "upgrade" || job.Phase != "applying" {
 		return fmt.Errorf("没有进行中的升级事务")
 	}
-	lock := os.NewFile(3, "maintenance operation")
-	if lock == nil {
-		return fmt.Errorf("没有维护操作锁")
-	}
-	defer lock.Close()
-	inherited, err := lock.Stat()
+	lock, err := adoptOperationLock(p, 3)
 	if err != nil {
 		return err
 	}
-	onDisk, err := os.Stat(p.Root + ".lock")
-	if err != nil || !os.SameFile(inherited, onDisk) {
-		return fmt.Errorf("无效的维护操作锁")
-	}
+	defer lock.Close()
 	st, err := loadState(p)
 	if err != nil {
 		return err

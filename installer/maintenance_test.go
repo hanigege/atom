@@ -13,10 +13,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -325,4 +327,61 @@ echo 'udp UNCONN 0 0 0.0.0.0:53 0.0.0.0:* users:(("atomdns",pid=123,fd=4))'`,
 			}
 		})
 	}
+}
+
+func TestAdoptOperationLockSetsCloseOnExec(t *testing.T) {
+	if root := os.Getenv("ATOM_TEST_ADOPT_LOCK_ROOT"); root != "" {
+		p := Paths{Root: root}
+		lock, err := adoptOperationLock(p, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lock.Close()
+		grandchild := exec.Command("sleep", "30")
+		if err := grandchild.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(os.Getenv("ATOM_TEST_ADOPT_LOCK_PID"), []byte(strconv.Itoa(grandchild.Process.Pid)), 0o600); err != nil {
+			_ = grandchild.Process.Kill()
+			t.Fatal(err)
+		}
+		return
+	}
+
+	p := Paths{Root: filepath.Join(t.TempDir(), "atom")}
+	lock, err := operationLock(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pidFile := filepath.Join(t.TempDir(), "grandchild.pid")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAdoptOperationLockSetsCloseOnExec$")
+	cmd.Env = append(os.Environ(), "ATOM_TEST_ADOPT_LOCK_ROOT="+p.Root, "ATOM_TEST_ADOPT_LOCK_PID="+pidFile)
+	cmd.ExtraFiles = []*os.File{lock}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		lock.Close()
+		t.Fatalf("helper failed: %v\n%s", err, out)
+	}
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		lock.Close()
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		lock.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+
+	// Once the parent releases its copy, a surviving grandchild must not still hold the flock.
+	lock.Close()
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("expected grandchild %d to still be running: %v", pid, err)
+	}
+	next, err := operationLock(p)
+	if err != nil {
+		t.Fatalf("operation lock leaked to grandchild: %v", err)
+	}
+	next.Close()
 }
