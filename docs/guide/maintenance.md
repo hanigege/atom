@@ -29,6 +29,14 @@ curl -fsSL https://github.com/jasonxtt/atom/releases/latest/download/install.sh 
 
 升级会覆盖程序和自带的配置模板，保留规则、节点、节点组、订阅、DNS 上游、面板设置和缓存。每次升级前都会备份到 `/opt/atom/backup/`，保留最近 3 份。
 
+### 降级到 v0.4.1 的兼容性说明
+
+若在规则的客户端 IP 或目标 IP 条件中使用了 `起始IP-结束IP` 范围写法，降级到 v0.4.1 之前请先将其改为单个 IP 或 CIDR 并保存（未使用的规则不受影响；「污染域名识别」开关在旧版本中会被忽略）。清理后可用固定版本的脚本降级到 v0.4.1：
+
+```bash
+curl -fsSL https://github.com/jasonxtt/atom/releases/download/v0.4.1/install.sh | sudo bash -s -- --force
+```
+
 ### 降级到 v0.4.0 及更早版本的兼容性说明
 
 若当前配置了**纯客户端代理规则**（只有客户端条件且动作为代理），降级到 v0.4.0 或更早版本之前，请先在「规则」页将所有纯客户端代理规则**删除或改为直连/屏蔽**并保存（建议先在「设置 → 系统」导出一份配置备份）：
